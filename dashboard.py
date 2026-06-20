@@ -58,8 +58,8 @@ def _arrow(value: float) -> str:
 
 @st.cache_resource
 def get_clients():
-    key    = os.getenv("ALPACA_API_KEY", "")
-    secret = os.getenv("ALPACA_API_SECRET", "")
+    key    = st.secrets.get("ALPACA_API_KEY",    os.getenv("ALPACA_API_KEY",    ""))
+    secret = st.secrets.get("ALPACA_API_SECRET", os.getenv("ALPACA_API_SECRET", ""))
     if not key or not secret:
         return None, None, None
     trading     = TradingClient(key, secret, paper=True)
