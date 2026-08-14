@@ -165,6 +165,24 @@ with st.sidebar:
     is_crypto = all_symbols[selected_symbol]
 
     st.divider()
+    st.subheader("Market scanner")
+    scan_enabled     = st.checkbox("Show scanner", value=True)
+    scan_top_n       = st.slider("Shortlist size",      3,  25,  8)
+    scan_min_price   = st.number_input("Min price ($)", 0.0, 1000.0, 5.0, step=1.0)
+    scan_min_dvol    = st.number_input(
+        "Min dollar volume ($)", 0.0, 1e9, 1e6, step=1e5, format="%.0f"
+    )
+    scan_max_atr     = st.slider("Max ATR (% of price)", 1.0, 50.0, 15.0)
+    scan_uptrend     = st.checkbox("Require uptrend (long only)", value=False)
+    scan_lookback    = st.slider("Momentum lookback (bars)", 3, 48, 12)
+
+    with st.expander("Score weights"):
+        w_volume     = st.slider("Volume surge",  0.0, 1.0, 0.30)
+        w_momentum   = st.slider("Momentum",      0.0, 1.0, 0.40)
+        w_volatility = st.slider("Volatility",    0.0, 1.0, 0.15)
+        w_trend      = st.slider("Trend",         0.0, 1.0, 0.15)
+
+    st.divider()
     st.subheader("Indicator settings")
     sma_fast       = st.slider("Fast SMA period",   5,  50, 10)
     sma_slow       = st.slider("Slow SMA period",  10, 100, 30)
@@ -302,6 +320,139 @@ except Exception as e:
     st.error(f"Could not load positions: {e}")
 
 st.divider()
+
+# ── Market scanner ────────────────────────────────────────────────────────────
+
+if scan_enabled:
+    st.subheader("🔍 Market Scanner — Ranked Candidates")
+
+    st.markdown(
+        """
+        The scanner screens a broad universe down to the names most worth a
+        closer look, then the bot's strategy decides whether any of them
+        actually trigger a trade. **A high score is not a buy signal** — it
+        means the symbol earned a place on the shortlist the strategy
+        evaluates.
+
+        - **Score** — composite 0–1 rank across the four weighted metrics below.
+        - **Vol ×** — latest volume vs its 20-bar average. Above 1.0 = unusual activity.
+        - **Momentum** — % price change over the lookback window.
+        - **ATR %** — volatility as a share of price. Higher = wider swings.
+        - **Trend** — whether price sits above its slow moving average.
+        """
+    )
+
+    @st.cache_data(ttl=900, show_spinner="Scanning market…")
+    def run_market_scan(
+        top_n, min_price, min_dvol, max_atr, require_uptrend,
+        lookback, weights, sma_slow_p, atr_p, vol_sma_p, bars_to_load,
+    ):
+        from scanner import (
+            AlpacaMarketScanner, DEFAULT_STOCK_UNIVERSE, DEFAULT_CRYPTO_UNIVERSE,
+        )
+        from trading_bot import BotConfig
+
+        cfg = BotConfig(
+            scan_universe=list(DEFAULT_STOCK_UNIVERSE),
+            scan_crypto_universe=list(DEFAULT_CRYPTO_UNIVERSE),
+            scan_top_n=top_n,
+            scan_min_price=min_price,
+            scan_min_dollar_volume=min_dvol,
+            scan_max_atr_pct=max_atr,
+            scan_require_uptrend=require_uptrend,
+            scan_momentum_lookback=lookback,
+            scan_weights=dict(weights),
+            sma_slow=sma_slow_p,
+            atr_period=atr_p,
+            volume_sma_period=vol_sma_p,
+            bar_limit=bars_to_load,
+        )
+
+        def _multi(symbols, is_crypto):
+            frames = []
+            for i in range(0, len(symbols), 200):
+                chunk = symbols[i:i + 200]
+                try:
+                    if is_crypto:
+                        req = CryptoBarsRequest(symbol_or_symbols=chunk,
+                                                timeframe=TimeFrame.Hour,
+                                                limit=bars_to_load)
+                        b = crypto_data_client.get_crypto_bars(req)
+                    else:
+                        req = StockBarsRequest(symbol_or_symbols=chunk,
+                                               timeframe=TimeFrame.Hour,
+                                               limit=bars_to_load)
+                        b = stock_data_client.get_stock_bars(req)
+                    d = b.df if hasattr(b, "df") else pd.DataFrame()
+                    if not d.empty:
+                        frames.append(d)
+                except Exception:
+                    continue
+            return pd.concat(frames) if frames else pd.DataFrame()
+
+        results = AlpacaMarketScanner().scan(
+            _multi(cfg.scan_universe, False),
+            _multi(cfg.scan_crypto_universe, True),
+            cfg,
+        )
+        return pd.DataFrame([{
+            "Symbol": r.symbol,
+            "Class": r.asset_class,
+            "Score": round(r.score, 3),
+            "Price": round(r.price, 2),
+            "Vol ×": round(r.volume_ratio, 2),
+            "Momentum %": round(r.momentum_pct, 2),
+            "ATR %": round(r.atr_pct, 2),
+            "Trend": "up" if r.trend_ok else "down",
+            "Why": "; ".join(r.reasons),
+        } for r in results])
+
+    try:
+        weights = {
+            "volume": w_volume, "momentum": w_momentum,
+            "volatility": w_volatility, "trend": w_trend,
+        }
+        scan_df = run_market_scan(
+            scan_top_n, scan_min_price, scan_min_dvol, scan_max_atr,
+            scan_uptrend, scan_lookback, tuple(sorted(weights.items())),
+            sma_slow, atr_period, vol_sma_period, max(bar_limit, 60),
+        )
+
+        if scan_df.empty:
+            st.info("No symbols passed the current filters. Try loosening them in the sidebar.")
+        else:
+            shortlist = scan_df.head(scan_top_n)
+            st.caption(
+                f"{len(scan_df)} symbols passed filtering • "
+                f"showing top {len(shortlist)} • cached 15 min"
+            )
+
+            cols = st.columns(min(4, len(shortlist)))
+            for col, (_, row) in zip(cols, shortlist.head(4).iterrows()):
+                col.metric(
+                    label=f"{row['Symbol']}  ({row['Class']})",
+                    value=f"{row['Score']:.3f}",
+                    delta=f"{row['Momentum %']:+.2f}%",
+                )
+
+            st.dataframe(
+                shortlist,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Score": st.column_config.ProgressColumn(
+                        "Score", min_value=0.0, max_value=1.0, format="%.3f",
+                    ),
+                },
+            )
+
+            with st.expander(f"Full ranked list ({len(scan_df)} symbols)"):
+                st.dataframe(scan_df, use_container_width=True, hide_index=True)
+
+    except Exception as e:
+        st.error(f"Scanner failed: {e}")
+
+    st.divider()
 
 # ── Symbol chart ──────────────────────────────────────────────────────────────
 

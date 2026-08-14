@@ -7,12 +7,21 @@ Architecture:
   BotConfig              → all settings and API credentials
   AlpacaClient           → authenticated alpaca-py wrapper
   MarketDataFetcher      → hourly OHLCV bars for stocks and crypto
+  AlpacaMarketScanner    → ranks a broad universe → shortlist  (scanner.py)
   BaseStrategy           → ABC — subclass to add new strategies
   EnhancedSMAStrategy    → SMA crossover + RSI + volume + ATR sizing (default)
   SMAcrossoverStrategy   → original SMA-only strategy (kept for reference)
   RiskManager            → ATR-scaled position sizing and exposure guards
   OrderManager           → signal → Alpaca market order
   TradingBot             → main poll loop orchestrator
+
+Cycle flow:
+  scanner ranks universe → shortlist (+ held positions) → strategy generates
+  signals → risk manager sizes/vetoes → order manager executes
+
+  The scanner only decides WHAT TO LOOK AT. Whether a trade actually fires is
+  still entirely the strategy's call, so behaviour stays deterministic and
+  every entry remains explainable from the indicator rules alone.
 
 Signal confirmation logic (EnhancedSMAStrategy):
   BUY  = SMA golden cross  AND  RSI < rsi_overbought  AND  volume > 20-bar avg
@@ -34,12 +43,21 @@ import os
 import time
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from dotenv import load_dotenv
+
+from scanner import (
+    BaseScanner,
+    AlpacaMarketScanner,
+    ScanResult,
+    DEFAULT_STOCK_UNIVERSE,
+    DEFAULT_CRYPTO_UNIVERSE,
+)
+
 load_dotenv()
 
 try:
@@ -113,6 +131,40 @@ class BotConfig:
     poll_interval_seconds: int = 60   # how often the bot cycles
     bar_limit: int = 60               # must cover sma_slow + atr/rsi periods
 
+    # ── Market scanner ────────────────────────────────────────────────────────
+    # The scanner narrows a broad universe to a ranked shortlist each refresh;
+    # the strategy still has to fire before any order is placed. Set
+    # use_scanner=False to fall back to the fixed stock/crypto_symbols lists.
+    use_scanner: bool = True
+
+    scan_universe: List[str] = field(
+        default_factory=lambda: list(DEFAULT_STOCK_UNIVERSE)
+    )
+    scan_crypto_universe: List[str] = field(
+        default_factory=lambda: list(DEFAULT_CRYPTO_UNIVERSE)
+    )
+
+    scan_top_n: int = 8          # shortlist size handed to the strategy
+    scan_refresh_cycles: int = 15  # rescan every N cycles (bars are hourly)
+
+    # Hard filters — a symbol failing any of these is dropped, never scored
+    scan_min_price: float = 5.0             # skip penny stocks
+    scan_min_dollar_volume: float = 1e6     # skip illiquid names
+    scan_max_atr_pct: float = 15.0          # skip anything wildly volatile
+    scan_require_uptrend: bool = False      # True = long-only, above slow SMA
+
+    scan_momentum_lookback: int = 12        # bars for the momentum metric
+
+    # Composite score weights (normalised internally, so they need not sum to 1)
+    scan_weights: Dict[str, float] = field(
+        default_factory=lambda: {
+            "volume": 0.30,
+            "momentum": 0.40,
+            "volatility": 0.15,
+            "trend": 0.15,
+        }
+    )
+
 
 # ── Signal data type ──────────────────────────────────────────────────────────
 
@@ -125,6 +177,29 @@ class Signal:
     reason: str = ""
     atr: float = 0.0           # current ATR value (used for position sizing)
     current_price: float = 0.0 # last close price (used for sizing math)
+
+
+# ── Symbol helpers ────────────────────────────────────────────────────────────
+
+def norm_symbol(symbol: str) -> str:
+    """
+    Canonical form for symbol comparison.
+
+    Alpaca reports crypto *positions* as "BTCUSD" but accepts and returns
+    crypto *bars* as "BTC/USD". Comparing the two raw forms silently fails,
+    which would leave held crypto unsellable and let duplicate buys through.
+    Always compare via this helper rather than by raw string.
+    """
+    return symbol.replace("/", "").upper()
+
+
+def resolve_position_key(symbol: str, positions: Dict) -> Optional[str]:
+    """Find the actual positions-dict key matching a signal symbol, or None."""
+    target = norm_symbol(symbol)
+    for key in positions:
+        if norm_symbol(key) == target:
+            return key
+    return None
 
 
 # ── Alpaca client ─────────────────────────────────────────────────────────────
@@ -195,33 +270,75 @@ class AlpacaClient:
 # ── Market data fetcher ───────────────────────────────────────────────────────
 
 class MarketDataFetcher:
-    """Fetches hourly OHLCV bars for stocks and crypto."""
+    """
+    Fetches hourly OHLCV bars for stocks and crypto.
+
+    Both getters take an optional explicit symbol list so the scanner can pull
+    a wide universe while the strategy pulls only its shortlist. Passing None
+    falls back to the configured watchlists.
+
+    Requests are chunked because a scanner universe can run to hundreds of
+    symbols, which is more than one request should carry.
+    """
+
+    CHUNK_SIZE = 200
 
     def __init__(self, client: AlpacaClient, config: BotConfig):
         self.client = client
         self.config = config
 
-    def get_stock_bars(self) -> pd.DataFrame:
-        if not self.config.stock_symbols:
-            return pd.DataFrame()
-        req = StockBarsRequest(
-            symbol_or_symbols=self.config.stock_symbols,
-            timeframe=TimeFrame.Hour,
-            limit=self.config.bar_limit,
-        )
-        bars = self.client.stock_data.get_stock_bars(req)
-        return bars.df if hasattr(bars, "df") else pd.DataFrame()
+    @staticmethod
+    def _chunks(symbols: List[str], size: int):
+        for i in range(0, len(symbols), size):
+            yield symbols[i:i + size]
 
-    def get_crypto_bars(self) -> pd.DataFrame:
-        if not self.config.crypto_symbols:
+    def _fetch(self, symbols: List[str], is_crypto: bool) -> pd.DataFrame:
+        if not symbols:
             return pd.DataFrame()
-        req = CryptoBarsRequest(
-            symbol_or_symbols=self.config.crypto_symbols,
-            timeframe=TimeFrame.Hour,
-            limit=self.config.bar_limit,
+
+        frames: List[pd.DataFrame] = []
+        for chunk in self._chunks(list(symbols), self.CHUNK_SIZE):
+            try:
+                if is_crypto:
+                    req = CryptoBarsRequest(
+                        symbol_or_symbols=chunk,
+                        timeframe=TimeFrame.Hour,
+                        limit=self.config.bar_limit,
+                    )
+                    bars = self.client.crypto_data.get_crypto_bars(req)
+                else:
+                    req = StockBarsRequest(
+                        symbol_or_symbols=chunk,
+                        timeframe=TimeFrame.Hour,
+                        limit=self.config.bar_limit,
+                    )
+                    bars = self.client.stock_data.get_stock_bars(req)
+
+                df = bars.df if hasattr(bars, "df") else pd.DataFrame()
+                if not df.empty:
+                    frames.append(df)
+            except Exception as exc:
+                # One bad chunk shouldn't blind the whole cycle.
+                log.warning(
+                    "Bar fetch failed for %d %s symbols: %s",
+                    len(chunk), "crypto" if is_crypto else "stock", exc,
+                )
+
+        if not frames:
+            return pd.DataFrame()
+        return frames[0] if len(frames) == 1 else pd.concat(frames)
+
+    def get_stock_bars(self, symbols: Optional[List[str]] = None) -> pd.DataFrame:
+        return self._fetch(
+            self.config.stock_symbols if symbols is None else symbols,
+            is_crypto=False,
         )
-        bars = self.client.crypto_data.get_crypto_bars(req)
-        return bars.df if hasattr(bars, "df") else pd.DataFrame()
+
+    def get_crypto_bars(self, symbols: Optional[List[str]] = None) -> pd.DataFrame:
+        return self._fetch(
+            self.config.crypto_symbols if symbols is None else symbols,
+            is_crypto=True,
+        )
 
 
 # ── Strategy base class ───────────────────────────────────────────────────────
@@ -463,8 +580,10 @@ class RiskManager:
         if signal.action == "HOLD":
             return False, 0.0
 
+        # Symbol matching goes through norm_symbol so crypto ("BTC/USD" in
+        # signals vs "BTCUSD" in positions) compares correctly.
         if signal.action == "SELL":
-            return signal.symbol in positions, 0.0
+            return resolve_position_key(signal.symbol, positions) is not None, 0.0
 
         # BUY checks
         total_invested = sum(float(p.market_value) for p in positions.values())
@@ -477,7 +596,7 @@ class RiskManager:
             )
             return False, 0.0
 
-        if signal.symbol in positions:
+        if resolve_position_key(signal.symbol, positions) is not None:
             log.info("Risk block (duplicate): already holding %s", signal.symbol)
             return False, 0.0
 
@@ -499,8 +618,16 @@ class OrderManager:
                 self.client.place_market_order(
                     signal.symbol, OrderSide.BUY, notional=notional
                 )
-            elif signal.action == "SELL" and signal.symbol in positions:
-                self.client.close_position(signal.symbol)
+            elif signal.action == "SELL":
+                # Close using the broker's own key for the position, which for
+                # crypto differs from the signal symbol ("BTCUSD" vs "BTC/USD").
+                key = resolve_position_key(signal.symbol, positions)
+                if key:
+                    self.client.close_position(key)
+                else:
+                    log.warning(
+                        "SELL for %s but no matching position found", signal.symbol
+                    )
         except Exception as exc:
             log.error("Order failed for %s: %s", signal.symbol, exc)
 
@@ -522,13 +649,84 @@ class TradingBot:
         • "Add backtesting mode using get_stock_bars(start=..., end=...)"
     """
 
-    def __init__(self, config: BotConfig, strategy: Optional[BaseStrategy] = None):
+    def __init__(
+        self,
+        config: BotConfig,
+        strategy: Optional[BaseStrategy] = None,
+        scanner: Optional[BaseScanner] = None,
+    ):
         self.config = config
         self.client = AlpacaClient(config)
         self.data = MarketDataFetcher(self.client, config)
-        self.strategy = strategy or SMAcrossoverStrategy()
+        self.strategy = strategy or EnhancedSMAStrategy()
         self.risk = RiskManager(config)
         self.orders = OrderManager(self.client)
+
+        self.scanner: Optional[BaseScanner] = None
+        if config.use_scanner:
+            self.scanner = scanner or AlpacaMarketScanner()
+
+        self.shortlist: List[ScanResult] = []
+        self._cycle = 0
+
+    # ── Scanner plumbing ─────────────────────────────────────────────────────
+
+    def refresh_shortlist(self) -> List[ScanResult]:
+        """Pull the full universe, rank it, and cache the top candidates."""
+        if not self.scanner:
+            return []
+
+        log.info(
+            "Scanning universe: %d stocks, %d crypto",
+            len(self.config.scan_universe), len(self.config.scan_crypto_universe),
+        )
+        universe_stock = self.data.get_stock_bars(self.config.scan_universe)
+        universe_crypto = self.data.get_crypto_bars(self.config.scan_crypto_universe)
+
+        ranked = self.scanner.scan(universe_stock, universe_crypto, self.config)
+        self.shortlist = ranked[: self.config.scan_top_n]
+
+        for res in self.shortlist:
+            log.info("  shortlist  %s  — %s", res.summary(), "; ".join(res.reasons))
+        return self.shortlist
+
+    def _active_symbols(self, positions: Dict) -> Tuple[List[str], List[str]]:
+        """
+        Symbols the strategy evaluates this cycle:
+        the scanner shortlist PLUS everything currently held.
+
+        Held positions are non-negotiable. If a symbol rotates out of the
+        shortlist while we still own it, dropping it here would mean its SELL
+        signal never gets generated and the position is stranded with no exit.
+        """
+        if self.scanner:
+            stocks = [r.symbol for r in self.shortlist if r.asset_class == "stock"]
+            crypto = [r.symbol for r in self.shortlist if r.asset_class == "crypto"]
+        else:
+            stocks = list(self.config.stock_symbols)
+            crypto = list(self.config.crypto_symbols)
+
+        # Re-attach held positions, restoring the slashed form for crypto.
+        crypto_lookup = {
+            norm_symbol(s): s
+            for s in (*self.config.scan_crypto_universe, *self.config.crypto_symbols)
+        }
+        held_stock = {norm_symbol(s) for s in stocks}
+        held_crypto = {norm_symbol(s) for s in crypto}
+
+        for key in positions:
+            n = norm_symbol(key)
+            if n in crypto_lookup:
+                if n not in held_crypto:
+                    crypto.append(crypto_lookup[n])
+                    held_crypto.add(n)
+            elif n not in held_stock:
+                stocks.append(key)
+                held_stock.add(n)
+
+        return stocks, crypto
+
+    # ── Main cycle ───────────────────────────────────────────────────────────
 
     def run_once(self):
         log.info("── cycle ──────────────────────")
@@ -539,31 +737,73 @@ class TradingBot:
             portfolio_value, len(positions),
         )
 
-        stock_bars = self.data.get_stock_bars()
-        crypto_bars = self.data.get_crypto_bars()
+        # Rescan periodically rather than every cycle — bars are hourly, so a
+        # 60s rescan would re-rank identical data at real API cost.
+        if self.scanner and (
+            not self.shortlist or self._cycle % self.config.scan_refresh_cycles == 0
+        ):
+            self.refresh_shortlist()
+        self._cycle += 1
 
-        signals = self.strategy.generate_signals(stock_bars, crypto_bars, self.config)
+        stock_symbols, crypto_symbols = self._active_symbols(positions)
+        if not stock_symbols and not crypto_symbols:
+            log.info("Nothing to evaluate this cycle.")
+            return
+
+        log.info(
+            "Evaluating %d symbols: %s",
+            len(stock_symbols) + len(crypto_symbols),
+            ", ".join([*stock_symbols, *crypto_symbols]),
+        )
+
+        stock_bars = self.data.get_stock_bars(stock_symbols)
+        crypto_bars = self.data.get_crypto_bars(crypto_symbols)
+
+        # Hand the strategy a config view scoped to this cycle's symbols, so
+        # BaseStrategy's documented signature stays unchanged.
+        cycle_config = replace(
+            self.config,
+            stock_symbols=stock_symbols,
+            crypto_symbols=crypto_symbols,
+        )
+
+        signals = self.strategy.generate_signals(stock_bars, crypto_bars, cycle_config)
         action_signals = [s for s in signals if s.action != "HOLD"]
         if action_signals:
             log.info("Active signals: %s", [(s.symbol, s.action) for s in action_signals])
 
+        scores = {norm_symbol(r.symbol): r.score for r in self.shortlist}
+
         for signal in signals:
             approved, notional = self.risk.evaluate(signal, portfolio_value, positions)
             if approved:
+                score = scores.get(norm_symbol(signal.symbol))
                 log.info(
-                    "Executing: %s %s  $%.2f  (%s)",
+                    "Executing: %s %s  $%.2f  (%s)%s",
                     signal.action, signal.symbol, notional, signal.reason,
+                    f"  [scan {score:.3f}]" if score is not None else "",
                 )
                 self.orders.execute(signal, notional, positions)
 
     def run(self):
-        log.info(
-            "Bot starting  paper=%s  interval=%ds  stocks=%s  crypto=%s",
-            self.config.paper,
-            self.config.poll_interval_seconds,
-            self.config.stock_symbols,
-            self.config.crypto_symbols,
-        )
+        if self.scanner:
+            log.info(
+                "Bot starting  paper=%s  interval=%ds  scanner=%s  "
+                "universe=%d  top_n=%d",
+                self.config.paper,
+                self.config.poll_interval_seconds,
+                type(self.scanner).__name__,
+                len(self.config.scan_universe) + len(self.config.scan_crypto_universe),
+                self.config.scan_top_n,
+            )
+        else:
+            log.info(
+                "Bot starting  paper=%s  interval=%ds  stocks=%s  crypto=%s",
+                self.config.paper,
+                self.config.poll_interval_seconds,
+                self.config.stock_symbols,
+                self.config.crypto_symbols,
+            )
         while True:
             try:
                 self.run_once()
@@ -580,8 +820,13 @@ class TradingBot:
 if __name__ == "__main__":
     config = BotConfig(
         paper=True,
+        # Fallback watchlists — used only when use_scanner=False
         stock_symbols=["AAPL", "MSFT", "NVDA", "SPY", "QQQ"],
         crypto_symbols=["BTC/USD", "ETH/USD", "SOL/USD"],
+        # Market scanner — narrows the universe to a ranked shortlist
+        use_scanner=True,
+        scan_top_n=8,
+        scan_refresh_cycles=15,
         # SMA
         sma_fast=10,
         sma_slow=30,
