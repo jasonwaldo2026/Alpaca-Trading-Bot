@@ -676,12 +676,17 @@ class TradingBot:
         if not self.scanner:
             return []
 
-        log.info(
-            "Scanning universe: %d stocks, %d crypto",
-            len(self.config.scan_universe), len(self.config.scan_crypto_universe),
-        )
-        universe_stock = self.data.get_stock_bars(self.config.scan_universe)
-        universe_crypto = self.data.get_crypto_bars(self.config.scan_crypto_universe)
+        if getattr(self.scanner, "needs_bars", True):
+            log.info(
+                "Scanning universe: %d stocks, %d crypto",
+                len(self.config.scan_universe), len(self.config.scan_crypto_universe),
+            )
+            universe_stock = self.data.get_stock_bars(self.config.scan_universe)
+            universe_crypto = self.data.get_crypto_bars(self.config.scan_crypto_universe)
+        else:
+            # Scanner sources its own data — don't pay for bars it will discard.
+            log.info("Querying %s", type(self.scanner).__name__)
+            universe_stock = universe_crypto = pd.DataFrame()
 
         ranked = self.scanner.scan(universe_stock, universe_crypto, self.config)
         self.shortlist = ranked[: self.config.scan_top_n]

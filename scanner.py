@@ -55,12 +55,16 @@ class ScanResult:
     symbol: str
     asset_class: str          # "stock" | "crypto"
     score: float              # 0.0 – 1.0 composite rank
-    price: float
-    volume_ratio: float       # latest volume ÷ rolling average volume
-    momentum_pct: float       # % price change over the lookback window
-    atr_pct: float            # ATR as % of price (normalised volatility)
-    dollar_volume: float      # latest volume × price
-    trend_ok: bool            # price above the slow SMA
+
+    # Metrics below are optional: an external scanner may only supply a symbol
+    # and a score. The strategy computes its own indicators regardless, so
+    # these are for display and logging rather than for trading decisions.
+    price: float = 0.0
+    volume_ratio: float = 0.0     # latest volume ÷ rolling average volume
+    momentum_pct: float = 0.0     # % price change over the lookback window
+    atr_pct: float = 0.0          # ATR as % of price (normalised volatility)
+    dollar_volume: float = 0.0    # latest volume × price
+    trend_ok: bool = False        # price above the slow SMA
     reasons: List[str] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -75,6 +79,11 @@ class ScanResult:
 
 class BaseScanner(ABC):
     """Subclass to plug in any candidate source (external app, API, CSV)."""
+
+    # Whether scan() actually reads the bars it is handed. Scanners sourcing
+    # their own data (see external_scanner.py) set this False so the bot skips
+    # fetching a whole universe of bars only to discard them.
+    needs_bars: bool = True
 
     @abstractmethod
     def scan(

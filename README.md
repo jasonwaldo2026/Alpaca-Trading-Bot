@@ -86,18 +86,71 @@ shortlist just because the rest of the universe looks worse:
 - `scan_max_atr_pct` (default 15%) — skip anything wildly volatile
 - `scan_require_uptrend` (default off) — set `True` for long-only
 
-### Plugging in a different scanner
+### Connecting your own scanner app
 
-Subclass `BaseScanner`, return `List[ScanResult]`, and pass it in:
+`external_scanner.py` adapts a scanner living outside this repo. Pick the
+adapter matching how yours exposes results — no rewrite needed:
+
+```python
+from external_scanner import FileScanner, CallableScanner, HttpScanner
+
+# It writes a JSON or CSV file (works across machines via a synced folder)
+scanner = FileScanner("~/scanner/out/latest.json")
+
+# It's importable Python on the same machine
+from my_scanner import run_scan
+scanner = CallableScanner(run_scan)
+
+# It serves JSON over HTTP (LAN, tunnel, anywhere reachable)
+scanner = HttpScanner("http://localhost:8000/scan")
+
+bot = TradingBot(config, strategy=EnhancedSMAStrategy(), scanner=scanner)
+```
+
+**Field mapping** is automatic for common names — `symbol`/`ticker`,
+`score`/`rank`/`rating`, `price`/`last`/`close`, `reason`/`why`. Only a symbol
+is required. Anything unusual can be named explicitly:
+
+```python
+FileScanner("out.json", fields={"symbol": ("instrument",), "score": ("edge",)})
+```
+
+Accepted shapes: a list of records, a wrapper object with the list under
+`results`/`symbols`/`candidates`/`data`, a plain list of ticker strings, or a
+pandas DataFrame.
+
+**Where things run.** The bot calls the scanner every cycle, so a scanner that
+only exists on your desktop means the bot must run there too. `FileScanner`
+pointed at a synced folder is the way to decouple them; `HttpScanner` works if
+the machine is reachable.
+
+**Safety.** An external scanner is an input the bot trades on, so it is
+treated as untrusted:
+
+- **Staleness** — results older than `max_age_minutes` (default 120) are
+  refused. A scanner that silently stopped updating would otherwise have the
+  bot trading yesterday's shortlist indefinitely.
+- **Size cap** — `max_symbols` (default 200) bounds a malformed or runaway file.
+- **Per-record isolation** — one bad row is skipped, not fatal.
+- **Fails closed** — an unreachable scanner yields an empty shortlist and the
+  bot simply trades nothing new. No data must never imply "buy anything". Set
+  `fail_open=True` to reuse the last good shortlist instead.
+
+None of this lets the external scanner place a trade. It proposes what to look
+at; entries still require the strategy to fire and the risk manager to approve.
+
+### Plugging in something custom
+
+Subclass `BaseScanner` directly:
 
 ```python
 from scanner import BaseScanner, ScanResult
 
 class MyScanner(BaseScanner):
+    needs_bars = False   # True if you use the bars passed in
+
     def scan(self, stock_bars, crypto_bars, config) -> list[ScanResult]:
         ...
-
-bot = TradingBot(config, strategy=EnhancedSMAStrategy(), scanner=MyScanner())
 ```
 
 To disable scanning entirely and go back to the fixed watchlists, set
@@ -106,8 +159,11 @@ To disable scanning entirely and go back to the fixed watchlists, set
 ### Tests
 
 ```bash
-python test_scanner.py    # synthetic bars, no API calls
+python test_scanner.py           # ranking, filters, held-position logic
+python test_external_scanner.py  # adapters, field mapping, staleness guard
 ```
+
+Both use synthetic data and temp files — no API calls, no network.
 
 ---
 
