@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    # alpaca-py pulls in a deprecated websockets shim; not actionable here.
+    "ignore:websockets.legacy is deprecated:DeprecationWarning",
+]

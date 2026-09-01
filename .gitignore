@@ -1,5 +1,6 @@
-# API credentials — NEVER commit this
+# API credentials — NEVER commit these
 .env
+.streamlit/secrets.toml
 
 # Python
 __pycache__/
@@ -20,6 +21,13 @@ env/
 # Logs
 bot.log
 *.log
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# Scanner run state (see docs/specs/scanner/scheduled-runs.md)
+.scanner-state.json
 
 # OS
 .DS_Store

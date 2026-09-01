@@ -1,0 +1,18 @@
+{
+  "name": "crypto momentum",
+  "description": "Trend continuation on major pairs — price above both SMAs, RSI not yet stretched.",
+  "universe": "major_crypto",
+  "conditions": [
+    {"field": "close", "op": ">", "field2": "sma_fast"},
+    {"field": "sma_fast", "op": ">", "field2": "sma_slow"},
+    {"field": "rsi", "op": "<", "value": 70},
+    {"field": "rsi", "op": ">", "value": 50}
+  ],
+  "params": {
+    "sma_fast": 10,
+    "sma_slow": 30,
+    "rsi_period": 14,
+    "volume_sma_period": 20,
+    "atr_period": 14
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "oversold bounce",
+  "description": "RSI washout with a volume-confirmed golden cross.",
+  "universe": "sp500_liquid",
+  "conditions": [
+    {"field": "rsi", "op": "<", "value": 35},
+    {"field": "volume", "op": ">", "field2": "vol_sma"},
+    {"field": "sma_fast", "op": "crosses_above", "field2": "sma_slow"}
+  ],
+  "params": {
+    "sma_fast": 10,
+    "sma_slow": 30,
+    "rsi_period": 14,
+    "volume_sma_period": 20,
+    "atr_period": 14
+  }
+}

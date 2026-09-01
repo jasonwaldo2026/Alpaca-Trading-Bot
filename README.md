@@ -1,127 +1,164 @@
-# Alpaca AI Trading Bot
+# Alpaca Trading Platform
 
-Paper-trades US equities and crypto using Alpaca's API. Designed to be extended by **Jules** (Google's AI coding agent).
+Four apps over one shared core. **Paper trading and educational use only.**
+
+| App | What it does | Run |
+|---|---|---|
+| **Bot** | Trades a watchlist on SMA + RSI + volume confirmation, with ATR-scaled sizing | `python trading_bot.py` |
+| **Dashboard** | Read-only view of account, positions, orders, and indicator charts | `streamlit run dashboard.py` |
+| **Scanner** | Runs saved rules across a symbol universe and reports matches | `python -m scanner.cli` |
+| **Studio** | Visual rule builder — authors the rules the Scanner runs | `streamlit run studio/app.py` |
+
+All four share `core/`, which owns credentials, bar fetching, indicator math,
+and the scan-rule model. Indicator math exists in exactly one place, so the
+chart, the signal, and the scan can never disagree.
 
 ---
 
 ## Quick start
 
 ### 1. Get Alpaca paper trading keys
-Log into [app.alpaca.markets](https://app.alpaca.markets) → **Settings** → **API Keys** → create a **Paper** key pair.
+[app.alpaca.markets](https://app.alpaca.markets) → **Settings** → **API Keys**
+→ create a **Paper** key pair.
 
-### 2. Set up the project
+### 2. Set up
 ```bash
 pip install -r requirements.txt
-cp .env.example .env   # then paste your keys into .env
+cp .env.example .env   # paste your keys in
 ```
 
-### 3. Run
+### 3. Run whichever app you want
 ```bash
-python trading_bot.py
-```
-
-The bot polls every 60 seconds. It fetches hourly bars, runs the SMA crossover strategy, checks risk limits, and executes market orders — all in paper mode.
-
----
-
-## Architecture
-
-| Component | Role |
-|---|---|
-| `BotConfig` | All settings and credentials |
-| `AlpacaClient` | Authenticated alpaca-py wrapper |
-| `MarketDataFetcher` | Hourly OHLCV bars — stocks + crypto |
-| `BaseStrategy` | Abstract base class — subclass to add strategies |
-| `SMAcrossoverStrategy` | Default: SMA(10) / SMA(30) crossover |
-| `RiskManager` | Position sizing, exposure caps |
-| `OrderManager` | Signal → Alpaca market order |
-| `TradingBot` | Main poll loop |
-
-**Default watchlists**
-- Stocks: AAPL, MSFT, NVDA, SPY, QQQ
-- Crypto: BTC/USD, ETH/USD, SOL/USD
-
----
-
-## Integrating Jules
-
-[Jules](https://jules.google.com) is Google's AI coding agent. You give it a GitHub repo and GitHub issues — it writes the code and opens PRs.
-
-### Setup
-1. Push this repo to GitHub
-2. Go to [jules.google.com](https://jules.google.com) → connect your repo
-3. Create issues using the prompts below — Jules handles the rest
-
-### Ready-made Jules issues
-
-**Add an RSI strategy**
-```
-Add an RSIStrategy class to trading_bot.py that subclasses BaseStrategy.
-- Use RSI(14) computed from hourly close prices
-- BUY signal when RSI crosses below 30 (oversold)
-- SELL signal when RSI crosses above 70 (overbought)
-- Add rsi_period: int = 14 to BotConfig
-- Make it selectable via a strategy_type field in BotConfig
-```
-
-**Add a drawdown circuit breaker**
-```
-Add a daily drawdown guard to RiskManager.evaluate() in trading_bot.py.
-- Record portfolio value at the start of each trading day
-- Block all BUY signals if daily PnL < -3% (make threshold configurable)
-- Log a WARNING when the breaker trips
-- Reset at midnight UTC
-```
-
-**Add Slack trade alerts**
-```
-Add Slack notifications to TradingBot.run_once() in trading_bot.py.
-- Send a message when a BUY or SELL order executes
-- Include: symbol, action, notional value, reason, timestamp
-- Read SLACK_WEBHOOK_URL from environment variables
-- Fail silently (log error, don't crash the bot) if webhook fails
-```
-
-**Add a portfolio status endpoint**
-```
-Add a FastAPI REST API to trading_bot.py that runs alongside the bot.
-- GET /positions → current open positions as JSON
-- GET /account  → portfolio value and buying power
-- Run the API server in a background thread (uvicorn)
-- Add fastapi and uvicorn to requirements.txt
-```
-
-**Add backtesting mode**
-```
-Add a backtest() method to TradingBot in trading_bot.py.
-- Accept start_date and end_date parameters
-- Fetch historical hourly bars for that range
-- Run the strategy on each bar in sequence (no lookahead)
-- Track simulated PnL, win rate, and max drawdown
-- Print a summary report at the end
+python trading_bot.py            # the bot
+streamlit run dashboard.py       # the dashboard
+python -m scanner.cli            # scan with rules/*.json
+streamlit run studio/app.py      # build a new rule
 ```
 
 ---
 
-## Configuration reference
+## Layout
 
+```
+core/                 shared by everything — no app imports allowed
+  client.py           Credentials + AlpacaClient
+  data.py             MarketDataFetcher, bar-shape normalization
+  indicators.py       SMA / RSI / ATR — single source of truth
+  universe.py         symbol lists, stock-vs-crypto routing
+  rules.py            scan rule model (Studio writes it, Scanner reads it)
+
+bot/                  config, strategies, risk, orders, poll loop
+dashboard.py          Streamlit account + chart view
+scanner/              engine.py (pure logic) + cli.py
+studio/               app.py — rule builder
+rules/                saved scan rules (JSON)
+docs/specs/           one file per planned feature
+tests/                pytest, no network required
+```
+
+---
+
+## Scanner and Studio
+
+Studio and Scanner are two halves of one workflow:
+
+1. **Studio** — build a rule visually: pick fields (`rsi`, `volume`,
+   `sma_fast`, …), operators (`<`, `>`, `crosses_above`, …), and either a
+   literal threshold or another field to compare against. Preview it live
+   against the market, then save.
+2. **Scanner** — reads those saved JSON files and sweeps a universe.
+
+The saved file *is* the contract:
+
+```json
+{
+  "name": "oversold bounce",
+  "universe": "sp500_liquid",
+  "conditions": [
+    {"field": "rsi", "op": "<", "value": 35},
+    {"field": "volume", "op": ">", "field2": "vol_sma"},
+    {"field": "sma_fast", "op": "crosses_above", "field2": "sma_slow"}
+  ],
+  "params": {"sma_fast": 10, "sma_slow": 30, "rsi_period": 14,
+             "volume_sma_period": 20, "atr_period": 14}
+}
+```
+
+Indicator periods travel *with* the rule, so a scan reproduces exactly what
+you previewed in Studio.
+
+```bash
+python -m scanner.cli                       # every rule in rules/
+python -m scanner.cli rules/oversold-bounce.json
+python -m scanner.cli --symbols AAPL,MSFT   # override the universe
+```
+
+---
+
+## Bot strategy
+
+**EnhancedSMAStrategy** (default) needs three confirmations to fire:
+
+- **BUY** — SMA golden cross **and** RSI < `rsi_overbought` **and** volume > 20-bar average
+- **SELL** — SMA death cross **and** RSI > `rsi_oversold` **and** volume > 20-bar average
+
+Position sizing is ATR-scaled, so volatile assets get smaller positions:
+
+```
+dollar_risk = portfolio × risk_per_trade_pct     (default 1%)
+stop_dist   = ATR × atr_risk_multiplier          (default 1.5×)
+notional    = (dollar_risk / stop_dist) × price  capped at max_position_pct
+```
+
+`SMAcrossoverStrategy` (SMA only) is kept for A/B comparison:
+```python
+TradingBot(config, strategy=SMAcrossoverStrategy()).run()
+```
+
+### Configuration
 ```python
 BotConfig(
-    paper=True,                    # paper mode — no real money
-    stock_symbols=["AAPL", ...],   # US equities to watch
-    crypto_symbols=["BTC/USD",...],# crypto pairs (format: "XXX/USD")
-    max_position_pct=0.05,         # 5% max per position
-    max_total_exposure=0.80,       # 80% max portfolio allocation
-    stop_loss_pct=0.03,            # 3% stop loss
-    sma_fast=10,                   # fast SMA period (bars)
-    sma_slow=30,                   # slow SMA period (bars)
-    bar_limit=50,                  # bars to fetch per symbol
-    poll_interval_seconds=60,      # polling frequency
+    paper=True,                     # paper mode — no real money
+    stock_symbols=["AAPL", ...],
+    crypto_symbols=["BTC/USD", ...],
+    max_position_pct=0.05,          # 5% max per position
+    max_total_exposure=0.80,        # 80% max portfolio allocation
+    risk_per_trade_pct=0.01,        # ATR sizing: risk 1% per trade
+    atr_risk_multiplier=1.5,
+    sma_fast=10, sma_slow=30,
+    rsi_period=14, rsi_overbought=70.0, rsi_oversold=30.0,
+    volume_sma_period=20,
+    atr_period=14,
+    bar_limit=60,
+    poll_interval_seconds=60,
 )
 ```
 
 ---
 
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests need no credentials and make no network calls. Alongside the unit
+tests, `tests/test_architecture.py` enforces the structural rules: `core/`
+never imports an app, no app re-implements indicator math, and nothing sets
+`paper=False`.
+
+Planned features live in `docs/specs/` — one markdown file per feature, with
+acceptance criteria. Write the spec first; it survives where a chat message
+does not.
+
+See `CLAUDE.md` for the conventions and invariants that apply when working
+in this repo.
+
+---
+
 ## Disclaimer
 
-This bot is for **paper trading and educational purposes only**. SMA crossover is a simple baseline strategy — not a recommendation. Do not trade real money without fully understanding the risks.
+For **paper trading and educational purposes only**. These strategies are
+simple baselines, not recommendations. Do not trade real money without fully
+understanding the risks.
