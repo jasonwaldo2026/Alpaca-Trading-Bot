@@ -9,6 +9,7 @@ Streamlit page, or a cron job without change.
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
@@ -17,6 +18,14 @@ from core import universe
 from core.data import MarketDataFetcher
 from core.indicators import add_indicators
 from core.rules import Rule
+from core.sessions import (
+    DEFAULT_CALENDAR,
+    SessionCalendar,
+    SessionConfig,
+    is_tradable,
+    session_at,
+    session_series,
+)
 
 log = logging.getLogger(__name__)
 
@@ -56,9 +65,21 @@ _REPORTED = ("rsi", "atr", "sma_fast", "sma_slow", "vol_sma")
 class Scanner:
     """Evaluates rules across a universe of symbols."""
 
-    def __init__(self, fetcher: MarketDataFetcher, bar_limit: int = 120):
+    def __init__(
+        self,
+        fetcher: MarketDataFetcher,
+        bar_limit: int = 120,
+        sessions: Optional[SessionConfig] = None,
+        calendar: SessionCalendar = DEFAULT_CALENDAR,
+        skip_closed: bool = True,
+    ):
         self.fetcher = fetcher
         self.bar_limit = bar_limit
+        self.sessions = sessions or SessionConfig()
+        self.calendar = calendar
+        # Backtests and Studio previews scan regardless of the clock; a
+        # scheduled sweep should not waste calls on a closed market.
+        self.skip_closed = skip_closed
 
     def scan(
         self,
@@ -89,6 +110,20 @@ class Scanner:
         if not wanted or not rules:
             return result
 
+        if self.skip_closed:
+            now = datetime.now(timezone.utc)
+            still_open = []
+            for sym in wanted:
+                if is_tradable(now, sym, self.sessions, self.calendar):
+                    still_open.append(sym)
+                else:
+                    result.skipped[sym] = (
+                        f"market closed ({session_at(now, sym, self.calendar)} session)"
+                    )
+            wanted = still_open
+            if not wanted:
+                return result
+
         bars = self.fetcher.get_bars(wanted, limit=self.bar_limit)
 
         # Cache enriched frames per (symbol, params) so two rules sharing
@@ -110,7 +145,12 @@ class Scanner:
                             f"only {len(df)} bars, need {rule.params.min_bars()}"
                         )
                         continue
-                    enriched_cache[key] = add_indicators(df, rule.params)
+                    sessions = None
+                    if self.sessions.requires_extended_hours_orders() and isinstance(
+                        df.index, pd.DatetimeIndex
+                    ):
+                        sessions = session_series(df.index, sym, self.calendar)
+                    enriched_cache[key] = add_indicators(df, rule.params, sessions)
 
                 enriched = enriched_cache.get(key)
                 if enriched is None:

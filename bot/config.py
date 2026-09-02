@@ -6,6 +6,7 @@ from typing import List
 
 from core.indicators import IndicatorParams
 from core.client import Credentials
+from core.sessions import SessionCalendar, SessionConfig
 from core import universe
 
 
@@ -46,6 +47,20 @@ class BotConfig:
 
     # ATR (volatility-based sizing)
     atr_period: int = 14
+
+    # Market sessions
+    #
+    # Defaults to regular hours only (09:30–16:00 ET). Enable extended hours
+    # with SessionConfig.after_hours() or .extended() — read
+    # docs/specs/core/market-sessions.md first: extended hours changes how
+    # orders must be placed (limit-only, whole shares) and makes the volume
+    # baseline session-relative.
+    sessions: SessionConfig = field(default_factory=SessionConfig)
+    calendar: SessionCalendar = field(default_factory=SessionCalendar)
+
+    # How far through the reference price to place an extended-hours limit,
+    # so it fills against the thin book without unbounded slippage.
+    extended_hours_limit_offset_pct: float = 0.002
 
     # Polling
     poll_interval_seconds: int = 60   # how often the bot cycles

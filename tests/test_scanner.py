@@ -9,6 +9,13 @@ from core.rules import Condition, Rule
 from scanner.engine import Scanner
 
 
+def _scanner(fetcher, **kw):
+    """Scanner with session gating off — these tests are about rule
+    evaluation, not market hours, and must not depend on when they run."""
+    kw.setdefault("skip_closed", False)
+    return Scanner(fetcher, **kw)
+
+
 def _bars(n=120, start=100.0, drift=0.0, seed=1) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     close = start + np.cumsum(rng.normal(drift, 1.0, n))
@@ -42,7 +49,7 @@ def fetcher():
 def test_matches_are_reported_with_values(fetcher):
     rule = Rule(name="always", universe=["AAPL"],
                 conditions=[Condition("close", ">", value=-1e9)])
-    result = Scanner(fetcher).scan([rule])
+    result = _scanner(fetcher).scan([rule])
 
     assert result.scanned == 1
     assert len(result.matches) == 1
@@ -57,7 +64,7 @@ def test_matches_are_reported_with_values(fetcher):
 def test_non_matching_rule_yields_nothing(fetcher):
     rule = Rule(name="never", universe=["AAPL"],
                 conditions=[Condition("close", "<", value=-1e9)])
-    assert Scanner(fetcher).scan([rule]).matches == []
+    assert _scanner(fetcher).scan([rule]).matches == []
 
 
 def test_symbols_are_fetched_once_across_rules(fetcher):
@@ -67,7 +74,7 @@ def test_symbols_are_fetched_once_across_rules(fetcher):
         Rule(name="a", universe=common, conditions=[Condition("close", ">", value=-1e9)]),
         Rule(name="b", universe=common, conditions=[Condition("close", ">", value=-1e9)]),
     ]
-    result = Scanner(fetcher).scan(rules)
+    result = _scanner(fetcher).scan(rules)
 
     assert len(fetcher.requests) == 1
     assert sorted(fetcher.requests[0]) == common
@@ -78,14 +85,14 @@ def test_symbols_are_fetched_once_across_rules(fetcher):
 def test_explicit_symbols_override_rule_universe(fetcher):
     rule = Rule(name="a", universe=["NVDA"],
                 conditions=[Condition("close", ">", value=-1e9)])
-    result = Scanner(fetcher).scan([rule], symbols=["AAPL"])
+    result = _scanner(fetcher).scan([rule], symbols=["AAPL"])
     assert [m.symbol for m in result.matches] == ["AAPL"]
 
 
 def test_missing_data_is_skipped_not_fatal(fetcher):
     rule = Rule(name="a", universe=["AAPL", "NOPE"],
                 conditions=[Condition("close", ">", value=-1e9)])
-    result = Scanner(fetcher).scan([rule])
+    result = _scanner(fetcher).scan([rule])
     assert result.scanned == 1
     assert "NOPE" in result.skipped
 
@@ -94,14 +101,14 @@ def test_short_history_is_skipped(fetcher):
     fetcher.frames["TINY"] = _bars(n=5)
     rule = Rule(name="a", universe=["TINY"],
                 conditions=[Condition("close", ">", value=-1e9)])
-    result = Scanner(fetcher).scan([rule])
+    result = _scanner(fetcher).scan([rule])
     assert result.matches == []
     assert "TINY" in result.skipped
 
 
 def test_invalid_rule_is_rejected_before_any_fetch(fetcher):
     with pytest.raises(Exception):
-        Scanner(fetcher).scan([Rule(name="empty", universe=["AAPL"])])
+        _scanner(fetcher).scan([Rule(name="empty", universe=["AAPL"])])
     assert fetcher.requests == []
 
 
@@ -110,14 +117,14 @@ def test_by_rule_groups_matches(fetcher):
         Rule(name="a", universe=["AAPL"], conditions=[Condition("close", ">", value=-1e9)]),
         Rule(name="b", universe=["MSFT"], conditions=[Condition("close", ">", value=-1e9)]),
     ]
-    grouped = Scanner(fetcher).scan(rules).by_rule()
+    grouped = _scanner(fetcher).scan(rules).by_rule()
     assert set(grouped) == {"a", "b"}
 
 
 def test_empty_inputs_are_safe(fetcher):
-    assert Scanner(fetcher).scan([]).matches == []
+    assert _scanner(fetcher).scan([]).matches == []
     rule = Rule(name="a", universe=[], conditions=[Condition("close", ">", value=0)])
-    assert Scanner(fetcher).scan([rule]).matches == []
+    assert _scanner(fetcher).scan([rule]).matches == []
 
 
 def test_shared_params_reuse_enriched_frame(fetcher):

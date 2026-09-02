@@ -10,6 +10,7 @@ All functions are pure: DataFrame/Series in, Series out, no I/O.
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 import pandas as pd
 
@@ -96,7 +97,36 @@ def atr(df: pd.DataFrame, period: int) -> pd.Series:
     return true_range.ewm(com=period - 1, min_periods=period).mean()
 
 
-def add_indicators(df: pd.DataFrame, params: IndicatorParams) -> pd.DataFrame:
+def volume_sma_by_session(
+    volume: pd.Series, sessions: pd.Series, period: int
+) -> pd.Series:
+    """
+    Rolling average volume computed *within* each session.
+
+    Pre-market and after-hours volume is a small fraction of regular-hours
+    volume. A single rolling average across all sessions makes
+    `volume > vol_sma` fire on essentially every regular-hours bar and
+    essentially no extended-hours bar — it stops measuring "unusual volume"
+    and starts measuring "is it 09:30 yet".
+
+    Grouping by session compares each bar against its own session's
+    baseline, so an unusually busy after-hours bar is detectable as such.
+    """
+    if not volume.index.equals(sessions.index):
+        raise ValueError(
+            "volume and sessions must share an index; got "
+            f"{len(volume)} and {len(sessions)} rows."
+        )
+    return volume.groupby(sessions, sort=False).transform(
+        lambda g: g.rolling(period).mean()
+    )
+
+
+def add_indicators(
+    df: pd.DataFrame,
+    params: IndicatorParams,
+    sessions: Optional[pd.Series] = None,
+) -> pd.DataFrame:
     """
     Return a copy of `df` with every indicator column added.
 
@@ -104,6 +134,10 @@ def add_indicators(df: pd.DataFrame, params: IndicatorParams) -> pd.DataFrame:
     that need complete rows should dropna() afterwards, which is why this
     does not drop them itself (the dashboard wants the NaN prefix so charts
     keep their full x-axis).
+
+    Pass `sessions` (from `core.sessions.session_series`) when the frame spans
+    extended hours, so the volume baseline is computed per session rather
+    than across sessions of wildly different typical volume.
     """
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
@@ -116,7 +150,12 @@ def add_indicators(df: pd.DataFrame, params: IndicatorParams) -> pd.DataFrame:
     out[COL_SMA_FAST] = sma(out["close"], params.sma_fast)
     out[COL_SMA_SLOW] = sma(out["close"], params.sma_slow)
     out[COL_RSI] = rsi(out["close"], params.rsi_period)
-    out[COL_VOL_SMA] = sma(out["volume"], params.volume_sma_period)
+    if sessions is None:
+        out[COL_VOL_SMA] = sma(out["volume"], params.volume_sma_period)
+    else:
+        out[COL_VOL_SMA] = volume_sma_by_session(
+            out["volume"], sessions, params.volume_sma_period
+        )
     out[COL_ATR] = atr(out, params.atr_period)
     return out
 

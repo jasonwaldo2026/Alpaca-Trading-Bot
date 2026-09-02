@@ -4,7 +4,7 @@ Four apps over one shared core. Paper trading only.
 
 | Directory | What it is | Run it with |
 |---|---|---|
-| `core/` | Shared library. Credentials, bar fetching, indicator math, scan-rule model. | — (imported) |
+| `core/` | Shared library. Credentials, bar fetching, indicator math, scan-rule model, market sessions. | — (imported) |
 | `bot/` | Live trading bot — strategies, risk, orders, poll loop. | `python trading_bot.py` |
 | `dashboard/` → `dashboard.py` | Streamlit read-only view of account, positions, charts. | `streamlit run dashboard.py` |
 | `scanner/` | Runs saved rules across a symbol universe. | `python -m scanner.cli` |
@@ -25,6 +25,14 @@ Four apps over one shared core. Paper trading only.
    logic — both call `Rule.matches()`.
 5. **Asset-class routing goes through `core/universe.py:is_crypto()`.**
    Never test for `"/" in symbol` inline.
+6. **Horizons are wall-clock, never bar counts.** A bar is not a duration:
+   "+20 bars" is ~20 hours for crypto and ~3 trading days for a
+   regular-hours equity. Resolve with
+   `core/sessions.py:horizon_to_bars()`, and label outcome columns with
+   `describe_horizon()` so both units are visible.
+7. **Session boundaries come from `core/sessions.py`.** Never hardcode
+   09:30/16:00, never assume a fixed UTC offset (Eastern shifts with DST),
+   and never treat a naive timestamp as local time — Alpaca returns UTC.
 
 ## Conventions
 
@@ -38,6 +46,17 @@ Four apps over one shared core. Paper trading only.
 - Credentials are resolved by `core/client.py:Credentials` — `.from_env()`
   for CLI apps, `.from_streamlit(st.secrets)` for Streamlit ones. Do not read
   `os.getenv("ALPACA_...")` directly in an app.
+- **Extended hours changes the order path.** Outside 09:30–16:00 ET, Alpaca
+  requires a limit order with `TimeInForce.DAY` and `extended_hours=True`,
+  and rejects fractional/notional quantities. A market order sent then is
+  silently queued to the next open. `OrderManager` routes on session; do not
+  bypass it. See `docs/specs/core/market-sessions.md`.
+- **When extended hours are enabled, volume baselines must be per session.**
+  Pass `core.sessions.session_series(...)` to `add_indicators()`. A flat
+  rolling average across sessions turns `volume > vol_sma` into "is it
+  regular hours".
+- Cadence is one scan per *completed* bar — 7/day regular hours, 11 with
+  after-hours, 24 for crypto. `core/sessions.py:scan_times()` generates them.
 
 ## Testing
 

@@ -41,11 +41,12 @@ streamlit run studio/app.py      # build a new rule
 
 ```
 core/                 shared by everything — no app imports allowed
-  client.py           Credentials + AlpacaClient
+  client.py           Credentials + AlpacaClient (incl. extended-hours orders)
   data.py             MarketDataFetcher, bar-shape normalization
   indicators.py       SMA / RSI / ATR — single source of truth
   universe.py         symbol lists, stock-vs-crypto routing
   rules.py            scan rule model (Studio writes it, Scanner reads it)
+  sessions.py         market sessions, scan cadence, horizon conversion
 
 bot/                  config, strategies, risk, orders, poll loop
 dashboard.py          Streamlit account + chart view
@@ -92,6 +93,48 @@ python -m scanner.cli                       # every rule in rules/
 python -m scanner.cli rules/oversold-bounce.json
 python -m scanner.cli --symbols AAPL,MSFT   # override the universe
 ```
+
+---
+
+## Market sessions and extended hours
+
+Sessions are regular-hours-only by default. Enable extended hours on
+`BotConfig`:
+
+```python
+from core.sessions import SessionConfig
+
+BotConfig(
+    sessions=SessionConfig.after_hours(),   # 09:30–20:00 ET
+    # or SessionConfig.extended()           # 04:00–20:00 ET
+)
+```
+
+Turning this on changes three things automatically:
+
+- **Orders** switch to whole-share marketable limit orders with
+  `extended_hours=True`. Alpaca rejects market orders and fractional
+  quantities outside regular hours — a market order sent then is queued to
+  the next open and fills at an unknown price.
+- **Volume baselines** become session-relative, so `volume > vol_sma`
+  compares an after-hours bar against after-hours volume rather than against
+  a regular-hours average it could never exceed.
+- **Cadence** changes: 7 hourly bars/day regular hours, 11 with after-hours,
+  16 fully extended, 24 for crypto.
+
+| Session | Hours (ET) | Hourly bars |
+|---|---|---|
+| Pre-market | 04:00 – 09:30 | 6 |
+| Regular | 09:30 – 16:00 | 7 |
+| After-hours | 16:00 – 20:00 | 4 |
+| Crypto | 24/7 | 24 |
+
+Scan once per *completed* bar, about two minutes after it closes —
+`core.sessions.scan_times()` generates the schedule. Holidays and early
+closes are not hardcoded; supply them from Alpaca's calendar endpoint via
+`SessionCalendar`.
+
+Full detail: `docs/specs/core/market-sessions.md`.
 
 ---
 

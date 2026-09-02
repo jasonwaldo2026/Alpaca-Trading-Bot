@@ -24,6 +24,7 @@ from core.indicators import (
     crossed_down,
     crossed_up,
 )
+from core.sessions import session_series
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +45,24 @@ def _frame_for(bars: pd.DataFrame, symbol: str) -> pd.DataFrame:
     if isinstance(bars.index, pd.MultiIndex):
         return bars.xs(symbol, level="symbol").copy()
     return bars.copy()
+
+
+def _sessions_for(df: pd.DataFrame, symbol: str, config: BotConfig):
+    """
+    Session labels for a bar frame, or None when they are not needed.
+
+    Only worth computing when extended hours are enabled: with regular hours
+    only, every bar is in the same session and grouping changes nothing.
+    Returns None if the frame is not timestamp-indexed, so a caller passing
+    a reset-index frame degrades to the flat volume baseline rather than
+    raising.
+    """
+    if not config.sessions.requires_extended_hours_orders():
+        return None
+    if not isinstance(df.index, pd.DatetimeIndex):
+        log.debug("No DatetimeIndex for %s — using flat volume baseline.", symbol)
+        return None
+    return session_series(df.index, symbol, config.calendar)
 
 
 class BaseStrategy(ABC):
@@ -108,7 +127,7 @@ class EnhancedSMAStrategy(BaseStrategy):
                     log.debug("Not enough bars for %s (%d < %d)", sym, len(df), min_bars)
                     continue
 
-                df = add_indicators(df, params)
+                df = add_indicators(df, params, _sessions_for(df, sym, config))
                 df.dropna(inplace=True)
 
                 if len(df) < 2:
@@ -169,7 +188,7 @@ class SMAcrossoverStrategy(BaseStrategy):
                 df = _frame_for(bars, sym)
                 if len(df) < config.sma_slow + 2:
                     continue
-                df = add_indicators(df, params)
+                df = add_indicators(df, params, _sessions_for(df, sym, config))
                 df.dropna(subset=[COL_SMA_FAST, COL_SMA_SLOW], inplace=True)
                 if len(df) < 2:
                     continue

@@ -12,7 +12,7 @@ from typing import Dict, Optional
 
 try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
     from alpaca.trading.enums import OrderSide, TimeInForce
     from alpaca.data.historical import (
         StockHistoricalDataClient,
@@ -125,6 +125,68 @@ class AlpacaClient:
         )
         return order
 
+    def place_extended_hours_order(
+        self,
+        symbol: str,
+        side: OrderSide,
+        qty: float,
+        reference_price: float,
+        limit_offset_pct: float = 0.002,
+    ):
+        """
+        Place an order valid in pre-market or after-hours.
+
+        Alpaca will not accept a market order outside regular hours — it is
+        queued to the next open and fills at an unknown price, which silently
+        invalidates any sizing computed from the signal-time price. Extended
+        hours requires all three of: a **limit** order, `TimeInForce.DAY`,
+        and `extended_hours=True`.
+
+        The limit is placed marketably — slightly through the reference price
+        in the direction of the trade — so it fills against the thin extended
+        book while still capping slippage. Extended-hours liquidity is a small
+        fraction of regular-hours liquidity, so a plain mid-price limit
+        frequently will not fill at all.
+
+        Fractional and notional orders are regular-hours only, so `qty` must
+        be a whole number of shares here.
+        """
+        whole_qty = int(qty)
+        if whole_qty < 1:
+            raise ValueError(
+                f"Extended-hours orders must be whole shares; computed qty "
+                f"{qty:.4f} for {symbol} rounds to zero. Increase position "
+                f"size or trade this symbol during regular hours."
+            )
+
+        direction = 1 if side == OrderSide.BUY else -1
+        limit_price = round(reference_price * (1 + direction * limit_offset_pct), 2)
+
+        req = LimitOrderRequest(
+            symbol=symbol,
+            qty=whole_qty,
+            side=side,
+            time_in_force=TimeInForce.DAY,
+            limit_price=limit_price,
+            extended_hours=True,
+        )
+        order = self.trading.submit_order(req)
+        log.info(
+            "Extended-hours order ▶ %s %s  qty=%d  limit=$%.2f  (ref $%.2f)",
+            side, symbol, whole_qty, limit_price, reference_price,
+        )
+        return order
+
     def close_position(self, symbol: str):
+        """
+        Close a position at market. Regular hours only — Alpaca rejects
+        market orders outside them. Use place_extended_hours_order() with a
+        SELL side to exit during pre-market or after-hours.
+        """
         self.trading.close_position(symbol)
         log.info("Position closed: %s", symbol)
+
+    def get_position_qty(self, symbol: str) -> float:
+        """Shares currently held, or 0.0 when flat."""
+        position = self.get_positions().get(symbol)
+        return float(position.qty) if position else 0.0

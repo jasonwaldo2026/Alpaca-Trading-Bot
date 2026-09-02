@@ -1,0 +1,132 @@
+# Market sessions, cadence, and horizons
+
+**Status:** done — implemented in `core/sessions.py`
+**Touches:** `core/sessions.py`, `core/indicators.py`, `core/client.py`, `bot/`, `scanner/`
+
+## Why
+
+Three separate problems all reduced to "nothing in this repo knew what time
+it was":
+
+1. The bot polled every 60 seconds against hourly bars — roughly 200x more
+   often than a signal can change.
+2. `volume > vol_sma` compared extended-hours volume against a rolling
+   average dominated by regular-hours volume, so it measured *"is it
+   09:30 yet"* rather than *"is volume unusual"*.
+3. Outcome horizons were expressed in bars, and a bar is not a duration.
+
+## Session boundaries (US Eastern)
+
+| Session | Hours | Hourly bars |
+|---|---|---|
+| Pre-market | 04:00 – 09:30 | 6 |
+| Regular | 09:30 – 16:00 | 7 |
+| After-hours | 16:00 – 20:00 | 4 |
+| **Regular only** | | **7 / day** |
+| **Regular + after** | 09:30 – 20:00 | **11 / day** |
+| **Full extended** | 04:00 – 20:00 | **16 / day** |
+| **Crypto** | 24/7 | **24 / day** |
+
+Enabling pre-market adds 5 bars, not 6: Alpaca aligns bars to the clock hour,
+so 09:00–09:30 and 09:30–10:00 merge into a single 09:00 bar.
+`_clock_hours_spanned()` returns an hour *set* rather than a count for
+exactly this reason.
+
+## Cadence — how many cycles per day
+
+**Scan once per completed bar, ~2 minutes after it closes.** The bar interval
+is the ceiling: a signal computed on hourly bars cannot change more than
+once an hour, so anything faster is wasted API budget.
+
+- Equities, regular hours: **7 scans/day** — 10:02, 11:02, … 16:02 ET
+- Equities, regular + after-hours: **11 scans/day** — through 20:02 ET
+- Crypto: **24 scans/day**, every hour
+
+`core.sessions.scan_times()` generates these. The *delay* matters as much as
+the count: evaluating the in-progress bar produces signals that appear
+mid-hour and vanish before the hour closes. See
+`docs/specs/bot/closed-bar-signals.md`.
+
+## Horizons — the outcomes-table fix
+
+"+20 bars" is a row count, not a duration:
+
+| Config | +20 bars means |
+|---|---|
+| Crypto | ~20 hours |
+| Equity, regular hours only | ~3 trading days |
+| Equity, full extended hours | ~1.3 days |
+
+An outcomes table with a shared "+20 bars" column compares a 20-hour result
+against a 3-day one — and across a weekend, a 5-calendar-day one.
+
+**Rule: horizons are wall-clock, resolved to bars per symbol.**
+`core.sessions.horizon_to_bars(horizon, symbol, config)` does the conversion.
+Valid horizons are `1h`, `2h`, `4h`, `1d`, `5d`, `20d`, where a "day" means
+one *session* — 7 bars for a regular-hours equity, 24 for crypto. Unknown
+horizons raise rather than guessing.
+
+Outcome table columns must be labelled with both, via `describe_horizon()`:
+`1d (7 bars)`. Never label a column with a bare bar count.
+
+## Volume baselines
+
+When extended hours are enabled, pass a session series to `add_indicators()`:
+
+```python
+from core.sessions import session_series
+sessions = session_series(df.index, symbol, calendar)
+df = add_indicators(df, params, sessions)
+```
+
+This computes `vol_sma` *within* each session. Without it, an after-hours bar
+essentially never clears an average containing regular-hours bars — a real
+after-hours volume spike is invisible. `tests/test_sessions.py::
+test_session_baseline_detects_an_unusual_after_hours_bar` pins this.
+
+With regular hours only, pass nothing — every bar is in one session and
+grouping changes nothing.
+
+## Order placement outside regular hours
+
+Alpaca will not accept a market order outside 09:30–16:00. It is queued to
+the next open and fills at an unknown price, which silently invalidates ATR
+sizing computed from the signal-time price. Extended hours requires **all
+three** of:
+
+- a **limit** order (not market)
+- `TimeInForce.DAY` (not GTC)
+- `extended_hours=True`
+
+Fractional and notional orders are regular-hours only, so extended-hours
+orders must be **whole shares**. `OrderManager` routes on session
+automatically; `AlpacaClient.place_extended_hours_order()` places a
+*marketable* limit — slightly through the reference price in the direction
+of the trade — because extended-hours liquidity is thin enough that a
+mid-price limit often will not fill at all.
+
+Consequences the bot handles explicitly rather than silently:
+- A buy sized below one share is skipped and logged.
+- A fractional holding cannot be sold after hours; it is skipped and logged.
+- A signal with no reference price is skipped — there is no safe default limit.
+
+## Holidays
+
+Weekends are handled in `SessionCalendar`. Holidays and early closes are
+**not hardcoded** — they move year to year, and Alpaca's `/v2/calendar`
+endpoint is authoritative. Fetch them at startup and pass them in:
+
+```python
+SessionCalendar(holidays=frozenset(...), early_closes=frozenset(...))
+```
+
+An empty calendar treats every weekday as a full session, which is wrong on
+roughly nine days a year. Wiring the calendar fetch is not yet done — see
+"Open" below.
+
+## Open
+
+- [ ] Fetch the Alpaca calendar at startup and populate `SessionCalendar`.
+      Until then, holiday scans return stale bars rather than being skipped.
+- [ ] Scheduled runs (`docs/specs/scanner/scheduled-runs.md`) should drive
+      off `scan_times()` rather than a fixed interval.
