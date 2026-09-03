@@ -8,23 +8,80 @@ is solved once here: get_bars() always returns {symbol: flat DataFrame}.
 """
 
 import logging
-from typing import Dict, Iterable, List
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 
 try:
     from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
-    from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 except ImportError:  # pragma: no cover - environment guard
     raise SystemExit("Run:  pip install -r requirements.txt")
 
 from core import universe
 from core.client import AlpacaClient
+from core.sessions import DEFAULT_BAR_MINUTES
 
 log = logging.getLogger(__name__)
 
 # Alpaca rejects very large symbol batches; sweep in chunks this size.
 MAX_SYMBOLS_PER_REQUEST = 100
+
+
+def alpaca_timeframe(bar_minutes: int) -> TimeFrame:
+    """Map a bar size in minutes onto an Alpaca TimeFrame."""
+    if bar_minutes <= 0 or 1440 % bar_minutes:
+        raise ValueError(
+            f"bar_minutes must divide evenly into 1440; got {bar_minutes}."
+        )
+    if bar_minutes % 60 == 0:
+        return TimeFrame(bar_minutes // 60, TimeFrameUnit.Hour)
+    return TimeFrame(bar_minutes, TimeFrameUnit.Minute)
+
+
+def drop_forming_bars(
+    df: pd.DataFrame,
+    bar_minutes: int = DEFAULT_BAR_MINUTES,
+    now: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """
+    Drop the bar that is still forming.
+
+    Alpaca stamps each bar with its **start** time and, for a `limit=N`
+    request with no end timestamp, includes the period currently in progress.
+    Evaluating that partial bar is how a crossover appears mid-period, fires
+    an order, and then reverses before the bar closes — the signal never
+    existed on the completed series, but the trade is already placed.
+
+    A bar starting at T covers [T, T + bar_minutes) and is closed once
+    `now >= T + bar_minutes`.
+    """
+    if df is None or df.empty:
+        return df
+
+    now = now or datetime.now(timezone.utc)
+    interval = timedelta(minutes=bar_minutes)
+
+    if isinstance(df.index, pd.MultiIndex):
+        if "timestamp" not in df.index.names:
+            log.debug("No timestamp level on MultiIndex — cannot drop forming bars.")
+            return df
+        stamps = df.index.get_level_values("timestamp")
+    elif isinstance(df.index, pd.DatetimeIndex):
+        stamps = df.index
+    else:
+        log.debug("Bar frame is not timestamp-indexed — cannot drop forming bars.")
+        return df
+
+    # Compare in UTC; a tz-naive Alpaca frame is already UTC.
+    stamps = pd.DatetimeIndex(stamps)
+    if stamps.tz is None:
+        cutoff = pd.Timestamp(now).tz_convert("UTC").tz_localize(None) - interval
+    else:
+        cutoff = pd.Timestamp(now).tz_convert("UTC") - interval
+
+    return df[stamps <= cutoff]
 
 
 def split_frame_by_symbol(df: pd.DataFrame, symbols: Iterable[str]) -> Dict[str, pd.DataFrame]:
@@ -57,10 +114,32 @@ def _chunked(items: List[str], size: int):
 
 
 class MarketDataFetcher:
-    """Fetches OHLCV bars, routing each symbol to the right Alpaca client."""
+    """
+    Fetches OHLCV bars, routing each symbol to the right Alpaca client.
 
-    def __init__(self, client: AlpacaClient):
+    By default the still-forming bar is dropped, so callers always see closed
+    bars only. Backtests that supply an explicit end timestamp have no
+    forming bar and can turn this off.
+    """
+
+    def __init__(
+        self,
+        client: AlpacaClient,
+        bar_minutes: int = DEFAULT_BAR_MINUTES,
+        drop_forming: bool = True,
+    ):
         self.client = client
+        self.bar_minutes = bar_minutes
+        self.drop_forming = drop_forming
+
+    @property
+    def timeframe(self) -> TimeFrame:
+        return alpaca_timeframe(self.bar_minutes)
+
+    def _finalize(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not self.drop_forming:
+            return df
+        return drop_forming_bars(df, self.bar_minutes)
 
     def _fetch_stocks(self, symbols: List[str], timeframe, limit: int) -> pd.DataFrame:
         if not symbols:
@@ -93,7 +172,7 @@ class MarketDataFetcher:
         from the result rather than mapped to an empty frame, so callers can
         use a plain `for sym, df in bars.items()`.
         """
-        timeframe = timeframe or TimeFrame.Hour
+        timeframe = timeframe or self.timeframe
         stocks, crypto = universe.split_by_asset_class(symbols)
         out: Dict[str, pd.DataFrame] = {}
 
@@ -101,7 +180,8 @@ class MarketDataFetcher:
             try:
                 out.update(
                     split_frame_by_symbol(
-                        self._fetch_stocks(batch, timeframe, limit), batch
+                        self._finalize(self._fetch_stocks(batch, timeframe, limit)),
+                        batch,
                     )
                 )
             except Exception as exc:
@@ -111,7 +191,8 @@ class MarketDataFetcher:
             try:
                 out.update(
                     split_frame_by_symbol(
-                        self._fetch_crypto(batch, timeframe, limit), batch
+                        self._finalize(self._fetch_crypto(batch, timeframe, limit)),
+                        batch,
                     )
                 )
             except Exception as exc:
@@ -121,8 +202,8 @@ class MarketDataFetcher:
 
     def get_stock_bars(self, symbols: List[str], limit: int = 60) -> pd.DataFrame:
         """Raw MultiIndex frame — used by strategies that slice it themselves."""
-        return self._fetch_stocks(symbols, TimeFrame.Hour, limit)
+        return self._finalize(self._fetch_stocks(symbols, self.timeframe, limit))
 
     def get_crypto_bars(self, symbols: List[str], limit: int = 60) -> pd.DataFrame:
         """Raw MultiIndex frame — used by strategies that slice it themselves."""
-        return self._fetch_crypto(symbols, TimeFrame.Hour, limit)
+        return self._finalize(self._fetch_crypto(symbols, self.timeframe, limit))

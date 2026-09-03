@@ -27,6 +27,10 @@ def main(argv=None) -> int:
     parser.add_argument("rules", nargs="*", help=f"Rule JSON files (default: {DEFAULT_RULE_GLOB})")
     parser.add_argument("--symbols", help="Comma-separated symbols, overriding rule universes")
     parser.add_argument("--bars", type=int, default=120, help="Bars to fetch per symbol")
+    parser.add_argument(
+        "--bar-minutes", type=int, default=60,
+        help="Bar size in minutes (5, 15, 30, 60). Must divide into 1440.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -51,7 +55,11 @@ def main(argv=None) -> int:
         print("Missing ALPACA_API_KEY / ALPACA_API_SECRET.", file=sys.stderr)
         return 1
 
-    scanner = Scanner(MarketDataFetcher(AlpacaClient(creds)), bar_limit=args.bars)
+    scanner = Scanner(
+        MarketDataFetcher(AlpacaClient(creds), args.bar_minutes),
+        bar_limit=args.bars,
+        bar_minutes=args.bar_minutes,
+    )
     symbols = args.symbols.split(",") if args.symbols else None
     result = scanner.scan(rules, symbols)
 

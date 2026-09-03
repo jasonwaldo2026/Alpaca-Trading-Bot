@@ -32,20 +32,52 @@ so 09:00–09:30 and 09:30–10:00 merge into a single 09:00 bar.
 `_clock_hours_spanned()` returns an hour *set* rather than a count for
 exactly this reason.
 
+## Bar size
+
+Bar size is a parameter, not a constant: `BotConfig.bar_minutes`,
+`Scanner(bar_minutes=...)`, `--bar-minutes` on the CLI. It must divide evenly
+into 1440. Every function in `core/sessions.py` takes it, so cadence and
+horizons stay correct at any resolution.
+
+| Bar size | Regular hours | Extended | Crypto |
+|---|---|---|---|
+| 1 hour | 7 | 16 | 24 |
+| 30 min | 13 | 32 | 48 |
+| 15 min | 26 | 64 | 96 |
+| 5 min | 78 | 192 | 288 |
+
+Hourly is the only size with a stub bar: 09:30 falls mid-hour, so the 09:00
+bucket covers just 09:30–10:00. Sizes that divide the session evenly (5, 15,
+30) have no stub — 390 minutes of regular session is exactly 78 five-minute
+bars.
+
+**Changing bar size changes what the indicators mean.** `sma_slow=30` spans
+30 hours of hourly bars but only 150 minutes of 5-minute bars — a different
+strategy wearing the same numbers. Revisit `IndicatorParams` when changing
+`bar_minutes`; roughly, multiply the periods by `60 / bar_minutes` to keep
+the same wall-clock lookback.
+
 ## Cadence — how many cycles per day
 
 **Scan once per completed bar, ~2 minutes after it closes.** The bar interval
 is the ceiling: a signal computed on hourly bars cannot change more than
 once an hour, so anything faster is wasted API budget.
 
+At hourly bars:
+
 - Equities, regular hours: **7 scans/day** — 10:02, 11:02, … 16:02 ET
 - Equities, regular + after-hours: **11 scans/day** — through 20:02 ET
 - Crypto: **24 scans/day**, every hour
 
-`core.sessions.scan_times()` generates these. The *delay* matters as much as
-the count: evaluating the in-progress bar produces signals that appear
-mid-hour and vanish before the hour closes. See
-`docs/specs/bot/closed-bar-signals.md`.
+At 5-minute bars, regular hours: **78 scans/day**, 09:36 → 16:01 ET.
+
+`core.sessions.scan_times()` generates these, with a delay past each bar
+close that scales with bar size — two minutes for hourly, one for 5-minute
+(two would be 40% of the bar).
+
+The delay is a convenience, not the safety mechanism. Bars that have not
+closed are dropped in `core.data.drop_forming_bars` regardless of when the
+scan runs. See `docs/specs/bot/closed-bar-signals.md`.
 
 ## Horizons — the outcomes-table fix
 
@@ -53,15 +85,17 @@ mid-hour and vanish before the hour closes. See
 
 | Config | +20 bars means |
 |---|---|
-| Crypto | ~20 hours |
-| Equity, regular hours only | ~3 trading days |
-| Equity, full extended hours | ~1.3 days |
+| Crypto, hourly | ~20 hours |
+| Equity, hourly, regular hours only | ~3 trading days |
+| Equity, hourly, full extended hours | ~1.3 days |
+| Equity, 5-minute, regular hours | ~100 minutes |
 
 An outcomes table with a shared "+20 bars" column compares a 20-hour result
 against a 3-day one — and across a weekend, a 5-calendar-day one.
 
 **Rule: horizons are wall-clock, resolved to bars per symbol.**
-`core.sessions.horizon_to_bars(horizon, symbol, config)` does the conversion.
+`core.sessions.horizon_to_bars(horizon, symbol, config, bar_minutes=...)` does
+the conversion.
 Valid horizons are `1h`, `2h`, `4h`, `1d`, `5d`, `20d`, where a "day" means
 one *session* — 7 bars for a regular-hours equity, 24 for crypto. Unknown
 horizons raise rather than guessing.
@@ -129,4 +163,8 @@ roughly nine days a year. Wiring the calendar fetch is not yet done — see
 - [ ] Fetch the Alpaca calendar at startup and populate `SessionCalendar`.
       Until then, holiday scans return stale bars rather than being skipped.
 - [ ] Scheduled runs (`docs/specs/scanner/scheduled-runs.md`) should drive
-      off `scan_times()` rather than a fixed interval.
+      off `scan_times()` rather than a fixed interval. The bot still polls
+      every 60 seconds, which at hourly bars is ~60 wake-ups per usable scan.
+- [ ] Indicator periods do not adapt to `bar_minutes`. Switching to 5-minute
+      bars silently shortens every lookback by 12x; the periods should either
+      scale or the config should warn.

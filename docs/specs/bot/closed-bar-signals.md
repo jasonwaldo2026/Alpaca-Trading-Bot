@@ -1,6 +1,6 @@
 # Act only on closed bars
 
-**Status:** proposed — **live bug**, not a new feature
+**Status:** done — fixed in `core/data.py:drop_forming_bars`
 **Touches:** `bot/strategies.py`, `core/data.py`
 
 ## Why
@@ -28,26 +28,28 @@ This affects `EnhancedSMAStrategy` and `SMAcrossoverStrategy` equally, and
 `RiskManager`'s ATR sizing inherits it — `signal.atr` and
 `signal.current_price` also come from the partial bar.
 
-## What
+## What was done
 
-- Evaluate signals on the last **closed** bar only.
-- Two ways to do it; pick one and apply it consistently:
-  1. Drop the trailing bar when its period has not elapsed (needs the bar
-     timestamp and the timeframe — `core.sessions` already has the clock).
-  2. Request bars with an explicit `end` at the last bar boundary.
-- Option 2 is cleaner but costs a timestamp calculation per fetch; option 1
-  keeps the fetch simple. Prefer 2 if it does not complicate `MarketDataFetcher`.
-- Align the poll interval to bar close rather than 60 seconds — see
-  `core.sessions.scan_times()`.
+The filter lives at the **fetcher**, not in each strategy, so every consumer
+inherits it: bot, scanner, and Studio previews alike. A bar starting at T
+covers `[T, T + bar_minutes)` and is dropped until `now >= T + bar_minutes`.
 
-## Done when
+`MarketDataFetcher(drop_forming=True)` is the default. Backtests that supply
+an explicit end timestamp have no forming bar and can pass `False`.
 
-- [ ] A crossover that appears and reverses within one bar produces no signal
-- [ ] Test drives a frame whose final bar is explicitly in-progress and
-      asserts the signal is computed from the prior two closed bars
-- [ ] `signal.atr` and `signal.current_price` come from the closed bar
-- [ ] Both strategies covered
-- [ ] Crypto covered — 24/7 means there is always a forming bar
+Strategies still read `iloc[-1]` — that is now correct, because the frame
+they receive ends at the last closed bar.
+
+## Done
+
+- [x] A crossover that appears and reverses within one bar produces no signal
+      (`tests/test_strategies.py::test_dropping_the_forming_bar_prevents_the_phantom_trade`)
+- [x] Test drives a frame whose final bar is explicitly in-progress
+- [x] `signal.atr` and `signal.current_price` come from the closed bar
+- [x] Both strategies covered — the fetcher-level fix protects them equally
+- [x] Crypto covered — 24/7 means there is always a forming bar
+- [x] MultiIndex (multi-symbol) frames handled
+- [x] tz-naive frames treated as UTC, not local time
 
 ## Explicitly out of scope
 
@@ -56,6 +58,13 @@ data it always intended to.
 
 ## Note
 
-This changes live trading behavior — it will make the bot trade **less**
-often and later within the hour. That is the point, but it should be stated
-in the PR rather than discovered from a change in fill counts.
+This changes live trading behavior — the bot trades **less** often, and
+later within each bar. That is the point, but it is a real change in fill
+counts, not a no-op refactor.
+
+## Remaining
+
+The poll interval is still a flat 60 seconds. It should be driven by
+`core.sessions.scan_times()` so the bot wakes just after each bar close
+rather than 60 times per bar. Tracked in
+`docs/specs/scanner/scheduled-runs.md`.

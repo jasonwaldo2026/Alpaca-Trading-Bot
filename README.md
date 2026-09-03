@@ -129,10 +129,41 @@ Turning this on changes three things automatically:
 | After-hours | 16:00 – 20:00 | 4 |
 | Crypto | 24/7 | 24 |
 
-Scan once per *completed* bar, about two minutes after it closes —
-`core.sessions.scan_times()` generates the schedule. Holidays and early
-closes are not hardcoded; supply them from Alpaca's calendar endpoint via
-`SessionCalendar`.
+Holidays and early closes are not hardcoded; supply them from Alpaca's
+calendar endpoint via `SessionCalendar`.
+
+## Bar size
+
+Hourly by default, but any size that divides evenly into a day works:
+
+```python
+BotConfig(bar_minutes=5)              # bot
+Scanner(fetcher, bar_minutes=5)       # scanner
+python -m scanner.cli --bar-minutes 5 # CLI
+```
+
+| Bar size | Regular hours | Extended | Crypto |
+|---|---|---|---|
+| 1 hour | 7 | 16 | 24 |
+| 15 min | 26 | 64 | 96 |
+| 5 min | 78 | 192 | 288 |
+
+**Changing bar size changes what your indicator periods mean.** `sma_slow=30`
+spans 30 hours of hourly bars but only 150 minutes of 5-minute bars — the
+same numbers describing a completely different strategy. Scale the periods by
+roughly `60 / bar_minutes` to keep the same wall-clock lookback.
+
+## Closed bars only
+
+Alpaca includes the currently-forming bar in a `limit=N` request.
+`MarketDataFetcher` drops it, so strategies only ever see completed bars.
+Without this, a crossover can appear mid-bar, fire an order, and reverse
+before the bar closes — a trade on a signal that never existed on the
+finished series.
+
+Scan once per *completed* bar, shortly after it closes —
+`core.sessions.scan_times()` generates the schedule (10:02 → 16:02 ET hourly;
+09:36 → 16:01 at 5 minutes).
 
 Full detail: `docs/specs/core/market-sessions.md`.
 

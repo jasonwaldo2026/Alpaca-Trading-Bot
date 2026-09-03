@@ -6,7 +6,7 @@ from typing import List
 
 from core.indicators import IndicatorParams
 from core.client import Credentials
-from core.sessions import SessionCalendar, SessionConfig
+from core.sessions import DEFAULT_BAR_MINUTES, SessionCalendar, SessionConfig
 from core import universe
 
 
@@ -61,6 +61,14 @@ class BotConfig:
     # How far through the reference price to place an extended-hours limit,
     # so it fills against the thin book without unbounded slippage.
     extended_hours_limit_offset_pct: float = 0.002
+
+    # Bar size, in minutes. Must divide evenly into 1440.
+    #
+    # 60 (hourly) gives 7 bars per regular-hours day; 5 gives 78. A shorter
+    # bar means more signals and a much shorter effective lookback — SMA(30)
+    # spans 30 hours of hourly bars but only 150 minutes of 5-minute bars, so
+    # revisit the indicator periods when changing this.
+    bar_minutes: int = DEFAULT_BAR_MINUTES
 
     # Polling
     poll_interval_seconds: int = 60   # how often the bot cycles

@@ -19,6 +19,7 @@ from core.data import MarketDataFetcher
 from core.indicators import add_indicators
 from core.rules import Rule
 from core.sessions import (
+    DEFAULT_BAR_MINUTES,
     DEFAULT_CALENDAR,
     SessionCalendar,
     SessionConfig,
@@ -72,9 +73,11 @@ class Scanner:
         sessions: Optional[SessionConfig] = None,
         calendar: SessionCalendar = DEFAULT_CALENDAR,
         skip_closed: bool = True,
+        bar_minutes: int = DEFAULT_BAR_MINUTES,
     ):
         self.fetcher = fetcher
         self.bar_limit = bar_limit
+        self.bar_minutes = bar_minutes
         self.sessions = sessions or SessionConfig()
         self.calendar = calendar
         # Backtests and Studio previews scan regardless of the clock; a

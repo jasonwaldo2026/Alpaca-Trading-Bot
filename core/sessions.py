@@ -183,17 +183,42 @@ def is_tradable(
 
 # ── Bar cadence ──────────────────────────────────────────────────────────────
 
-def _clock_hours_spanned(start: time, end: time) -> FrozenSet[int]:
-    """
-    Clock-hour buckets a session touches.
+#: Bar sizes in minutes. Alpaca aligns bars to the clock from midnight, so
+#: these must divide evenly into a day.
+MINUTE_1 = 1
+MINUTE_5 = 5
+MINUTE_15 = 15
+MINUTE_30 = 30
+HOUR_1 = 60
 
-    Alpaca aligns hourly bars to the clock hour, so a session running
-    09:30–16:00 produces bars in hours 9…15 — seven of them, the first a
-    half-length stub. Returning the hour set (rather than a count) is what
-    makes overlapping sessions merge correctly: with pre-market enabled,
-    09:00–09:30 and 09:30–10:00 are one bar, not two.
+DEFAULT_BAR_MINUTES = HOUR_1
+
+
+def _minutes_since_midnight(t: time) -> int:
+    return t.hour * 60 + t.minute
+
+
+def _bar_buckets(start: time, end: time, bar_minutes: int) -> FrozenSet[int]:
     """
-    return frozenset(range(start.hour, end.hour + (1 if end.minute else 0)))
+    Bar indices (from midnight) that a session `[start, end)` touches.
+
+    Alpaca aligns bars to the clock, not to the session open, so a session
+    boundary can fall mid-bar. At hourly resolution 09:30–16:00 touches
+    buckets 9…15 — seven bars, the first a half-length stub covering only
+    09:30–10:00. At 5-minute resolution the same session divides evenly into
+    78 bars with no stub.
+
+    Returning a *set* rather than a count is what makes adjacent sessions
+    merge correctly: with pre-market enabled on hourly bars, 09:00–09:30 and
+    09:30–10:00 are one bar, not two.
+    """
+    if bar_minutes <= 0 or 1440 % bar_minutes:
+        raise ValueError(
+            f"bar_minutes must divide evenly into 1440; got {bar_minutes}."
+        )
+    first = _minutes_since_midnight(start) // bar_minutes
+    last = (_minutes_since_midnight(end) - 1) // bar_minutes
+    return frozenset(range(first, last + 1))
 
 
 def bars_per_day(
@@ -201,26 +226,39 @@ def bars_per_day(
     config: SessionConfig = SessionConfig(),
     calendar: SessionCalendar = DEFAULT_CALENDAR,
     day: Optional[date] = None,
+    bar_minutes: int = DEFAULT_BAR_MINUTES,
 ) -> int:
     """
-    Hourly bars a symbol produces on one trading day.
+    Bars a symbol produces on one trading day at a given bar size.
 
-    Crypto is 24. Equities depend on which sessions are enabled — which is
+    Crypto trades continuously, so it is simply a full day's worth. Equities
+    depend on which sessions are enabled *and* on the bar size — which is
     exactly why a bar count is not a duration.
     """
     if universe.is_crypto(symbol):
-        return 24
+        return (24 * 60) // bar_minutes
 
     day = day or date(2026, 1, 5)  # an ordinary Monday, for the default case
     if not calendar.is_trading_day(day):
         return 0
 
-    hours: set = set()
+    buckets: set = set()
     for name in config.enabled():
         bounds = calendar.bounds_for(day, name)
         if bounds:
-            hours |= _clock_hours_spanned(*bounds)
-    return len(hours)
+            buckets |= _bar_buckets(*bounds, bar_minutes)
+    return len(buckets)
+
+
+def default_delay_minutes(bar_minutes: int) -> int:
+    """
+    How long to wait past a bar close before scanning.
+
+    Long enough that the bar is settled, short enough that it is a small
+    fraction of the bar: two minutes suits hourly bars but would be 40% of a
+    5-minute bar.
+    """
+    return max(1, min(2, bar_minutes // 5))
 
 
 def scan_times(
@@ -228,44 +266,55 @@ def scan_times(
     config: SessionConfig = SessionConfig(),
     calendar: SessionCalendar = DEFAULT_CALENDAR,
     day: Optional[date] = None,
-    delay_minutes: int = 2,
+    delay_minutes: Optional[int] = None,
+    bar_minutes: int = DEFAULT_BAR_MINUTES,
 ) -> List[time]:
     """
-    When to scan, in Eastern Time — once per *completed* hourly bar.
+    When to scan, in Eastern Time — once per *completed* bar.
 
-    `delay_minutes` pushes each scan past the bar boundary so the bar being
+    The delay pushes each scan past the bar boundary so the bar being
     evaluated is closed. Acting on the in-progress bar is what produces
-    signals that appear mid-hour and vanish before the hour ends.
+    signals that appear mid-bar and vanish before it ends — see
+    `core.data.drop_forming_bars`.
     """
+    if delay_minutes is None:
+        delay_minutes = default_delay_minutes(bar_minutes)
+
+    def _close_time(bucket: int) -> time:
+        minute_of_day = ((bucket + 1) * bar_minutes + delay_minutes) % 1440
+        return time(minute_of_day // 60, minute_of_day % 60)
+
     if universe.is_crypto(symbol):
-        return [time((h + 1) % 24, delay_minutes) for h in range(24)]
+        return [_close_time(b) for b in range((24 * 60) // bar_minutes)]
 
     day = day or date(2026, 1, 5)
     if not calendar.is_trading_day(day):
         return []
 
-    hours: set = set()
+    buckets: set = set()
     for name in config.enabled():
         bounds = calendar.bounds_for(day, name)
         if bounds:
-            hours |= _clock_hours_spanned(*bounds)
+            buckets |= _bar_buckets(*bounds, bar_minutes)
 
-    # A bar starting at hour H is complete at H+1.
-    return sorted(time((h + 1) % 24, delay_minutes) for h in hours)
+    return sorted(_close_time(b) for b in buckets)
 
 
 def cycles_per_day(
     symbols: Iterable[str],
     config: SessionConfig = SessionConfig(),
     calendar: SessionCalendar = DEFAULT_CALENDAR,
+    bar_minutes: int = DEFAULT_BAR_MINUTES,
 ) -> Dict[str, int]:
     """Scans per day per asset class, for capacity planning."""
     stocks, crypto = universe.split_by_asset_class(symbols)
     out: Dict[str, int] = {}
     if stocks:
-        out[universe.STOCK] = bars_per_day(stocks[0], config, calendar)
+        out[universe.STOCK] = bars_per_day(
+            stocks[0], config, calendar, bar_minutes=bar_minutes
+        )
     if crypto:
-        out[universe.CRYPTO] = 24
+        out[universe.CRYPTO] = (24 * 60) // bar_minutes
     return out
 
 
@@ -290,13 +339,15 @@ def horizon_to_bars(
     symbol: str,
     config: SessionConfig = SessionConfig(),
     calendar: SessionCalendar = DEFAULT_CALENDAR,
+    bar_minutes: int = DEFAULT_BAR_MINUTES,
 ) -> int:
     """
     Convert a wall-clock horizon to a bar count for one symbol.
 
-    This is the fix for comparing outcomes across asset classes. "+20 bars"
-    means ~20 hours for crypto and ~3 trading days for a regular-hours
-    equity; "+1d" means one session for both, which is comparable.
+    This is the fix for comparing outcomes across asset classes and bar
+    sizes. "+20 bars" means ~20 hours of hourly crypto data, ~3 trading days
+    of hourly regular-hours equity data, and ~100 minutes of 5-minute data.
+    "+1d" means one session in every one of those cases.
 
     Raises KeyError on an unknown horizon rather than guessing.
     """
@@ -305,24 +356,24 @@ def horizon_to_bars(
             f"Unknown horizon {horizon!r}. Known: {', '.join(sorted(HORIZONS))}"
         )
 
-    per_day = bars_per_day(symbol, config, calendar)
+    per_day = bars_per_day(symbol, config, calendar, bar_minutes=bar_minutes)
     if per_day == 0:
         return 0
 
     if horizon in _SESSION_DAY_MULTIPLIER:
         return per_day * _SESSION_DAY_MULTIPLIER[horizon]
 
-    # Hour-denominated horizons are one bar per hour on hourly data.
-    return int(HORIZONS[horizon])
+    return int(HORIZONS[horizon] * 60 / bar_minutes)
 
 
 def describe_horizon(
     horizon: str,
     symbol: str,
     config: SessionConfig = SessionConfig(),
+    bar_minutes: int = DEFAULT_BAR_MINUTES,
 ) -> str:
     """Human-readable label for an outcomes table column."""
-    bars = horizon_to_bars(horizon, symbol, config)
+    bars = horizon_to_bars(horizon, symbol, config, bar_minutes=bar_minutes)
     return f"{horizon} ({bars} bars)"
 
 

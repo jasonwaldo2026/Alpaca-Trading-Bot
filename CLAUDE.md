@@ -33,6 +33,13 @@ Four apps over one shared core. Paper trading only.
 7. **Session boundaries come from `core/sessions.py`.** Never hardcode
    09:30/16:00, never assume a fixed UTC offset (Eastern shifts with DST),
    and never treat a naive timestamp as local time — Alpaca returns UTC.
+8. **Never act on a forming bar.** Alpaca includes the in-progress period in
+   a `limit=N` request. `MarketDataFetcher` drops it — do not bypass the
+   fetcher, and do not set `drop_forming=False` outside a backtest that
+   supplies an explicit end timestamp.
+9. **Bar size is a parameter, never a constant.** `bar_minutes` flows from
+   config through `core/sessions.py` and `core/data.py`. Never hardcode
+   `TimeFrame.Hour`.
 
 ## Conventions
 
@@ -55,8 +62,12 @@ Four apps over one shared core. Paper trading only.
   Pass `core.sessions.session_series(...)` to `add_indicators()`. A flat
   rolling average across sessions turns `volume > vol_sma` into "is it
   regular hours".
-- Cadence is one scan per *completed* bar — 7/day regular hours, 11 with
-  after-hours, 24 for crypto. `core/sessions.py:scan_times()` generates them.
+- Cadence is one scan per *completed* bar. At hourly bars: 7/day regular
+  hours, 11 with after-hours, 24 for crypto. At 5-minute bars: 78/day regular
+  hours. `core/sessions.py:scan_times()` generates them.
+- Changing `bar_minutes` changes what the indicator periods mean —
+  `sma_slow=30` is 30 hours of hourly bars but 150 minutes of 5-minute bars.
+  Say so explicitly when changing it; do not treat it as a tuning knob.
 
 ## Testing
 

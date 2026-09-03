@@ -29,7 +29,7 @@ class TradingBot:
     def __init__(self, config: BotConfig, strategy: Optional[BaseStrategy] = None):
         self.config = config
         self.client = AlpacaClient(config.credentials())
-        self.data = MarketDataFetcher(self.client)
+        self.data = MarketDataFetcher(self.client, config.bar_minutes)
         self.strategy = strategy or EnhancedSMAStrategy()
         self.risk = RiskManager(config)
         self.orders = OrderManager(self.client, config)

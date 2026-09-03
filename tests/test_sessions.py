@@ -263,3 +263,85 @@ def test_volume_sma_by_session_requires_aligned_index():
     df = _extended_hours_frame()
     with pytest.raises(ValueError, match="share an index"):
         volume_sma_by_session(df["volume"], pd.Series(["a", "b"]), 3)
+
+
+# ── Bar size (timeframe) ─────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("bar_minutes,rth,extended,crypto", [
+    (60, 7, 16, 24),
+    (30, 13, 32, 48),
+    (15, 26, 64, 96),
+    (5, 78, 192, 288),
+])
+def test_bars_per_day_scales_with_bar_size(bar_minutes, rth, extended, crypto):
+    assert S.bars_per_day(
+        "AAPL", S.SessionConfig.regular_only(), day=WED, bar_minutes=bar_minutes
+    ) == rth
+    assert S.bars_per_day(
+        "AAPL", S.SessionConfig.extended(), day=WED, bar_minutes=bar_minutes
+    ) == extended
+    assert S.bars_per_day("BTC/USD", bar_minutes=bar_minutes) == crypto
+
+
+def test_five_minute_regular_session_divides_evenly():
+    """390 minutes of regular session / 5 = 78 bars, no stub — unlike hourly,
+    where 09:30 falls mid-bar."""
+    assert S.bars_per_day(
+        "AAPL", S.SessionConfig.regular_only(), day=WED, bar_minutes=5
+    ) == 390 // 5
+
+
+def test_hourly_open_bar_is_a_stub_but_still_counts():
+    """09:30–10:00 is half an hour of trading in one hourly bucket. It is one
+    bar, which is why regular hours give 7 and not 6."""
+    buckets = S._bar_buckets(time(9, 30), time(16, 0), 60)
+    assert min(buckets) == 9 and max(buckets) == 15
+    assert len(buckets) == 7
+
+
+def test_bar_size_must_divide_into_a_day():
+    with pytest.raises(ValueError, match="divide evenly"):
+        S.bars_per_day("AAPL", day=WED, bar_minutes=7)
+
+
+def test_five_minute_scan_times_start_after_the_opening_bar():
+    times = S.scan_times(
+        "AAPL", S.SessionConfig.regular_only(), day=WED, bar_minutes=5
+    )
+    assert times[0] == time(9, 36), "09:30–09:35 bar closes at 09:35, +1 min"
+    assert times[-1] == time(16, 1)
+    assert len(times) == 78
+
+
+def test_scan_delay_shrinks_for_short_bars():
+    """Two minutes is fine on an hourly bar and absurd on a 5-minute one."""
+    assert S.default_delay_minutes(60) == 2
+    assert S.default_delay_minutes(15) == 2
+    assert S.default_delay_minutes(5) == 1
+
+
+def test_hour_horizon_scales_with_bar_size():
+    assert S.horizon_to_bars("1h", "AAPL", bar_minutes=60) == 1
+    assert S.horizon_to_bars("1h", "AAPL", bar_minutes=15) == 4
+    assert S.horizon_to_bars("1h", "AAPL", bar_minutes=5) == 12
+
+
+def test_day_horizon_is_a_session_at_any_bar_size():
+    """The whole point of wall-clock horizons: '1d' is one session whether
+    that is 7 bars or 78."""
+    cfg = S.SessionConfig.regular_only()
+    assert S.horizon_to_bars("1d", "AAPL", cfg, bar_minutes=60) == 7
+    assert S.horizon_to_bars("1d", "AAPL", cfg, bar_minutes=5) == 78
+    assert S.horizon_to_bars("1d", "BTC/USD", cfg, bar_minutes=5) == 288
+
+
+def test_describe_horizon_reflects_bar_size():
+    cfg = S.SessionConfig.regular_only()
+    assert S.describe_horizon("1d", "AAPL", cfg, bar_minutes=5) == "1d (78 bars)"
+
+
+def test_cycles_per_day_reflects_bar_size():
+    out = S.cycles_per_day(
+        ["AAPL", "BTC/USD"], S.SessionConfig.regular_only(), bar_minutes=5
+    )
+    assert out == {"stock": 78, "crypto": 288}
