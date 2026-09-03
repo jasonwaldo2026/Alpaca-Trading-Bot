@@ -345,3 +345,74 @@ def test_cycles_per_day_reflects_bar_size():
         ["AAPL", "BTC/USD"], S.SessionConfig.regular_only(), bar_minutes=5
     )
     assert out == {"stock": 78, "crypto": 288}
+
+
+# ── Config safety at fine resolutions ────────────────────────────────────────
+
+def test_bar_limit_too_small_for_five_minute_bars_is_rejected():
+    """
+    The worst failure mode available: too few bars means every indicator is
+    NaN, every symbol is skipped, and the bot looks healthy while never
+    trading. It must fail at construction instead.
+    """
+    from bot.config import BotConfig
+
+    config = BotConfig(
+        api_key="k", api_secret="s",
+        bar_minutes=5, indicator_period_basis=60, bar_limit=60,
+    )
+    with pytest.raises(ValueError, match="too small for 5-minute bars"):
+        config.validate()
+
+
+def test_the_error_names_the_bar_limit_that_would_work():
+    from bot.config import BotConfig
+
+    config = BotConfig(
+        api_key="k", api_secret="s",
+        bar_minutes=5, indicator_period_basis=60, bar_limit=60,
+    )
+    try:
+        config.validate()
+    except ValueError as exc:
+        assert str(config.required_bar_limit()) in str(exc)
+    else:
+        pytest.fail("expected ValueError")
+
+
+def test_default_hourly_config_is_valid():
+    from bot.config import BotConfig
+    BotConfig(api_key="k", api_secret="s").validate()
+
+
+def test_conventional_five_minute_periods_need_no_extra_history():
+    """Without a rescale basis the periods stay 12/26/9 bars, so the default
+    bar_limit is still enough."""
+    from bot.config import BotConfig
+    BotConfig(api_key="k", api_secret="s", bar_minutes=5).validate()
+
+
+def test_period_basis_rescales_config_periods():
+    from bot.config import BotConfig
+    config = BotConfig(
+        api_key="k", api_secret="s",
+        bar_minutes=5, indicator_period_basis=60, bar_limit=600,
+    )
+    params = config.indicator_params()
+    assert params.bar_minutes == 5
+    assert params.sma_slow == 360          # 30 hourly bars = 30 hours
+    assert params.duration_minutes("sma_slow") == 1800
+
+
+def test_without_a_basis_periods_are_bar_counts_at_the_data_resolution():
+    from bot.config import BotConfig
+    config = BotConfig(api_key="k", api_secret="s", bar_minutes=5)
+    params = config.indicator_params()
+    assert params.sma_slow == 30
+    assert params.duration_minutes("sma_slow") == 150
+
+
+def test_invalid_bar_minutes_is_rejected():
+    from bot.config import BotConfig
+    with pytest.raises(ValueError, match="divide evenly"):
+        BotConfig(api_key="k", api_secret="s", bar_minutes=7).validate()

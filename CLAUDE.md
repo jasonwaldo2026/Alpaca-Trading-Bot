@@ -40,11 +40,29 @@ Four apps over one shared core. Paper trading only.
 9. **Bar size is a parameter, never a constant.** `bar_minutes` flows from
    config through `core/sessions.py` and `core/data.py`. Never hardcode
    `TimeFrame.Hour`.
+10. **VWAP must be anchored.** It is a running average within a trading day,
+    not a rolling window. Always pass
+    `core/sessions.py:session_day_series()` as `add_indicators(anchor=...)`.
+    An unanchored VWAP drifts further from price every day and is not the
+    line any charting platform draws.
+11. **Indicator periods are bar counts, and `IndicatorParams.bar_minutes`
+    records which resolution they were written for.** Changing bar size
+    without deciding what the periods mean is the silent way to change
+    strategy. `BotConfig.indicator_period_basis` makes the choice explicit:
+    unset means "12/26/9 bars at this resolution" (what a trader means);
+    set means "rescale to preserve wall-clock lookback".
 
 ## Conventions
 
 - Indicator column names are constants in `core/indicators.py`
-  (`COL_RSI`, `COL_ATR`, …). Reference those, not string literals, in new code.
+  (`COL_RSI`, `COL_ATR`, `COL_VWAP`, `COL_MACD`, …). Reference those, not
+  string literals, in new code. Studio's rule-field list and the scanner's
+  reported values both derive from `INDICATOR_COLUMNS`, so a new indicator
+  added to `core/` becomes selectable everywhere with no app edit.
+- `IndicatorParams.min_bars()` is driven by MACD (`macd_slow + macd_signal`),
+  not by the longest single period. `BotConfig.validate()` enforces that
+  `bar_limit` covers it — call it before running anything, because fetching
+  too few bars yields all-NaN indicators and a bot that silently never trades.
 - Indicator periods travel as an `IndicatorParams`. Get one from
   `BotConfig.indicator_params()` or a `Rule.params` — never construct one
   ad hoc in app code, or the apps will silently disagree.

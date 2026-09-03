@@ -1,8 +1,11 @@
 """Bot configuration."""
 
+import logging
 import os
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
+
+log = logging.getLogger(__name__)
 
 from core.indicators import IndicatorParams
 from core.client import Credentials
@@ -37,6 +40,15 @@ class BotConfig:
     sma_fast: int = 10   # fast moving average period (bars)
     sma_slow: int = 30   # slow moving average period (bars)
 
+    # EMA periods (bars)
+    ema_fast: int = 9
+    ema_slow: int = 21
+
+    # MACD periods (bars) — conventional 12/26/9
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+
     # RSI parameters
     rsi_period: int = 14
     rsi_overbought: float = 70.0   # block BUY if RSI is above this
@@ -63,12 +75,23 @@ class BotConfig:
     extended_hours_limit_offset_pct: float = 0.002
 
     # Bar size, in minutes. Must divide evenly into 1440.
-    #
-    # 60 (hourly) gives 7 bars per regular-hours day; 5 gives 78. A shorter
-    # bar means more signals and a much shorter effective lookback — SMA(30)
-    # spans 30 hours of hourly bars but only 150 minutes of 5-minute bars, so
-    # revisit the indicator periods when changing this.
+    # 60 (hourly) gives 7 bars per regular-hours day; 5 gives 78.
     bar_minutes: int = DEFAULT_BAR_MINUTES
+
+    # How to interpret the indicator periods above when bar_minutes changes.
+    #
+    #   None (default) — periods are bar counts at bar_minutes. "MACD 12/26/9
+    #     on the 5-minute chart" means 12/26/9 five-minute bars, which is what
+    #     a trader means and what a charting platform draws. Switching
+    #     resolution therefore changes the strategy.
+    #
+    #   60 (or any basis) — periods were tuned at that resolution and are
+    #     rescaled to preserve wall-clock lookback. sma_slow=30 authored at 60
+    #     becomes 360 at 5-minute: still 30 hours.
+    #
+    # Neither is more correct; they are different strategies. The setting
+    # exists so the choice is made deliberately rather than by accident.
+    indicator_period_basis: Optional[int] = None
 
     # Polling
     poll_interval_seconds: int = 60   # how often the bot cycles
@@ -76,19 +99,74 @@ class BotConfig:
 
     def indicator_params(self) -> IndicatorParams:
         """
-        The periods the shared indicator module needs.
+        The periods the shared indicator module needs, resolved to the
+        configured bar size.
 
         Going through this method is what guarantees the bot and the scanner
         compute RSI over the same window — never build an IndicatorParams by
         hand in app code.
+
+        When `indicator_period_basis` is set, the periods are treated as
+        having been authored at that resolution and are rescaled to preserve
+        wall-clock lookback. Otherwise they are taken as bar counts at
+        `bar_minutes`.
         """
-        return IndicatorParams(
+        basis = self.indicator_period_basis or self.bar_minutes
+        params = IndicatorParams(
             sma_fast=self.sma_fast,
             sma_slow=self.sma_slow,
+            ema_fast=self.ema_fast,
+            ema_slow=self.ema_slow,
             rsi_period=self.rsi_period,
             volume_sma_period=self.volume_sma_period,
             atr_period=self.atr_period,
+            macd_fast=self.macd_fast,
+            macd_slow=self.macd_slow,
+            macd_signal=self.macd_signal,
+            bar_minutes=basis,
         )
+        return params.rescaled_to(self.bar_minutes)
+
+    def required_bar_limit(self) -> int:
+        """
+        Bars that must be fetched for every indicator to produce a value.
+
+        MACD's signal line is the binding constraint. A 20% margin absorbs
+        bars dropped as still-forming and any gaps in the returned series.
+        """
+        return int(self.indicator_params().min_bars() * 1.2) + 1
+
+    def validate(self) -> None:
+        """
+        Fail loudly on a configuration that cannot produce signals.
+
+        Fetching fewer bars than the indicators need does not raise anywhere
+        downstream — every indicator is simply NaN, every symbol is skipped,
+        and the bot looks like it is running fine while never trading. That
+        is the worst failure mode available, so it is checked here.
+        """
+        if self.bar_minutes <= 0 or 1440 % self.bar_minutes:
+            raise ValueError(
+                f"bar_minutes must divide evenly into 1440; got {self.bar_minutes}."
+            )
+
+        needed = self.required_bar_limit()
+        if self.bar_limit < needed:
+            params = self.indicator_params()
+            raise ValueError(
+                f"bar_limit={self.bar_limit} is too small for {self.bar_minutes}-minute "
+                f"bars: the indicators need {params.min_bars()} bars "
+                f"({params.min_bars() * self.bar_minutes / 60:.1f} hours of data), so "
+                f"bar_limit must be at least {needed}. "
+                f"Set bar_limit={needed}, or reduce the indicator periods."
+            )
+
+        if self.indicator_period_basis and self.indicator_period_basis != self.bar_minutes:
+            log.info(
+                "Indicator periods authored for %d-minute bars, rescaled to %d-minute: %s",
+                self.indicator_period_basis, self.bar_minutes,
+                self.indicator_params().describe(),
+            )
 
     def credentials(self) -> Credentials:
         return Credentials(

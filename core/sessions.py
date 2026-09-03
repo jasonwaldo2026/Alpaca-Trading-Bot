@@ -397,3 +397,35 @@ def session_series(index, symbol: str, calendar: SessionCalendar = DEFAULT_CALEN
         index=index,
         name="session",
     )
+
+
+def session_day_series(index, symbol: str, calendar: SessionCalendar = DEFAULT_CALENDAR):
+    """
+    Label every bar with the trading day it belongs to — the VWAP anchor.
+
+    VWAP is a running average *within* a trading day, so it needs a grouping
+    key that changes at each session start. For equities that key is the
+    Eastern **calendar date**, which deliberately puts pre-market, regular,
+    and after-hours bars of the same date in one group: they are one trading
+    day, and a VWAP that reset at 09:30 would discard the pre-market volume
+    that often sets the day's opening context.
+
+    For crypto there is no session, so the UTC date is used — the usual
+    anchor for a daily crypto VWAP.
+
+    Returns a Series of `datetime.date`, aligned to `index`.
+    """
+    import pandas as pd
+
+    if not isinstance(index, pd.DatetimeIndex):
+        raise TypeError(
+            f"session_day_series needs a DatetimeIndex, got {type(index).__name__}. "
+            f"Alpaca bar frames are timestamp-indexed; reset_index() drops that."
+        )
+
+    if universe.is_crypto(symbol):
+        days = [ts.tz_convert("UTC").date() if ts.tzinfo else ts.date() for ts in index]
+    else:
+        days = [to_eastern(ts.to_pydatetime()).date() for ts in index]
+
+    return pd.Series(days, index=index, name="session_day")

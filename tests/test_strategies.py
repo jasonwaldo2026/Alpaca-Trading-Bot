@@ -24,11 +24,17 @@ CLOSED_CLOSES = [100, 101, 100.5, 101.5, 100.8, 101.2, 100.4,
                  100.9, 100.2, 100.6, 100.0, 100.3, 99.8]
 FORMING_CLOSE = 101.5
 
+# Every period is shrunk, including EMA and MACD: MACD's signal line needs
+# macd_slow + macd_signal bars, so leaving those at 12/26/9 would push
+# min_bars past the length of this fixture and skip the symbol entirely.
 CONFIG = BotConfig(
     api_key="k", api_secret="s",
     stock_symbols=["AAPL"], crypto_symbols=[],
     sma_fast=3, sma_slow=5, rsi_period=5,
     volume_sma_period=3, atr_period=3,
+    ema_fast=2, ema_slow=4,
+    macd_fast=2, macd_slow=4, macd_signal=2,
+    bar_limit=20,
 )
 
 

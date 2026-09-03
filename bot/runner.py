@@ -27,6 +27,9 @@ class TradingBot:
     """
 
     def __init__(self, config: BotConfig, strategy: Optional[BaseStrategy] = None):
+        # Fail at construction rather than running a bot that silently never
+        # signals because it fetches fewer bars than the indicators need.
+        config.validate()
         self.config = config
         self.client = AlpacaClient(config.credentials())
         self.data = MarketDataFetcher(self.client, config.bar_minutes)

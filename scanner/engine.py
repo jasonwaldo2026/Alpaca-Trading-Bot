@@ -25,6 +25,7 @@ from core.sessions import (
     SessionConfig,
     is_tradable,
     session_at,
+    session_day_series,
     session_series,
 )
 
@@ -60,7 +61,10 @@ class ScanResult:
 
 
 # Indicator values worth reporting alongside a match.
-_REPORTED = ("rsi", "atr", "sma_fast", "sma_slow", "vol_sma")
+_REPORTED = (
+    "rsi", "atr", "vwap", "macd", "macd_signal",
+    "sma_fast", "sma_slow", "ema_fast", "ema_slow", "vol_sma",
+)
 
 
 class Scanner:
@@ -148,12 +152,15 @@ class Scanner:
                             f"only {len(df)} bars, need {rule.params.min_bars()}"
                         )
                         continue
-                    sessions = None
-                    if self.sessions.requires_extended_hours_orders() and isinstance(
-                        df.index, pd.DatetimeIndex
-                    ):
-                        sessions = session_series(df.index, sym, self.calendar)
-                    enriched_cache[key] = add_indicators(df, rule.params, sessions)
+                    sessions = anchor = None
+                    if isinstance(df.index, pd.DatetimeIndex):
+                        # VWAP needs its daily reset at every resolution.
+                        anchor = session_day_series(df.index, sym, self.calendar)
+                        if self.sessions.requires_extended_hours_orders():
+                            sessions = session_series(df.index, sym, self.calendar)
+                    enriched_cache[key] = add_indicators(
+                        df, rule.params, sessions, anchor
+                    )
 
                 enriched = enriched_cache.get(key)
                 if enriched is None:

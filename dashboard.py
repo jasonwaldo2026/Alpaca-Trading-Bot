@@ -29,6 +29,7 @@ try:
         crossed_down,
         crossed_up,
     )
+    from core.sessions import session_day_series
 except ImportError:
     st.error("Missing packages — run:  pip install -r requirements.txt")
     st.stop()
@@ -89,32 +90,54 @@ def fetch_orders(limit=20):
     return trading_client.get_orders(req)
 
 @st.cache_data(ttl=300)
-def fetch_bars(symbol: str, bar_limit: int = 100):
+def fetch_bars(symbol: str, bar_limit: int = 100, bar_minutes: int = 60):
     """Hourly OHLCV for one symbol. Asset class is routed by core.universe."""
     try:
-        frames = MarketDataFetcher(client).get_bars([symbol], limit=bar_limit)
+        frames = MarketDataFetcher(client, bar_minutes).get_bars(
+            [symbol], limit=bar_limit
+        )
         df = frames.get(symbol)
         if df is None or df.empty:
             return pd.DataFrame()
-        return df.reset_index()
+        # Keep the DatetimeIndex: VWAP's daily reset is derived from it.
+        return df
     except Exception as e:
         st.warning(f"Could not fetch bars for {symbol}: {e}")
         return pd.DataFrame()
 
-def compute_indicators(df: pd.DataFrame, sma_fast=10, sma_slow=30,
-                       rsi_period=14, vol_sma_period=20, atr_period=14) -> pd.DataFrame:
+def compute_indicators(
+    df: pd.DataFrame,
+    symbol: str,
+    sma_fast=10, sma_slow=30, rsi_period=14, vol_sma_period=20, atr_period=14,
+    ema_fast=9, ema_slow=21,
+    macd_fast=12, macd_slow=26, macd_signal=9,
+    bar_minutes=60,
+) -> pd.DataFrame:
     """
     Thin wrapper over core.indicators so the chart shows exactly the values
     the bot and scanner act on. Do not inline indicator math here.
+
+    The VWAP anchor is derived from the frame's DatetimeIndex so VWAP resets
+    each trading day, as it does on every charting platform.
     """
     params = IndicatorParams(
         sma_fast=sma_fast,
         sma_slow=sma_slow,
+        ema_fast=ema_fast,
+        ema_slow=ema_slow,
         rsi_period=rsi_period,
         volume_sma_period=vol_sma_period,
         atr_period=atr_period,
+        macd_fast=macd_fast,
+        macd_slow=macd_slow,
+        macd_signal=macd_signal,
+        bar_minutes=bar_minutes,
     )
-    return add_indicators(df, params)
+    anchor = (
+        session_day_series(df.index, symbol)
+        if isinstance(df.index, pd.DatetimeIndex) else None
+    )
+    return add_indicators(df, params, anchor=anchor)
 
 
 def read_log(path="bot.log", max_lines=200) -> list[str]:
@@ -146,7 +169,27 @@ with st.sidebar:
     rsi_period     = st.slider("RSI period",        5,  30, 14)
     vol_sma_period = st.slider("Volume SMA period", 5,  50, 20)
     atr_period     = st.slider("ATR period",        5,  30, 14)
-    bar_limit      = st.slider("Bars to load",     60, 500, 120)
+
+    st.caption("EMA / MACD")
+    ema_fast       = st.slider("Fast EMA period",   3,  50,  9)
+    ema_slow       = st.slider("Slow EMA period",   5, 100, 21)
+    macd_fast      = st.slider("MACD fast",         3,  40, 12)
+    macd_slow      = st.slider("MACD slow",         5,  80, 26)
+    macd_signal    = st.slider("MACD signal",       2,  30,  9)
+
+    st.divider()
+    bar_minutes = st.selectbox(
+        "Bar size",
+        [5, 15, 30, 60],
+        index=3,
+        format_func=lambda m: f"{m} min" if m < 60 else "1 hour",
+        help=(
+            "Periods above are bar counts, so their wall-clock meaning changes "
+            "with this. SMA(30) is 30 hours of hourly bars but 150 minutes of "
+            "5-minute bars."
+        ),
+    )
+    bar_limit      = st.slider("Bars to load",     60, 1000, 120)
 
     st.divider()
     if st.button("🔄 Refresh data"):
@@ -296,12 +339,16 @@ st.markdown(
     """
 )
 
-df_raw = fetch_bars(selected_symbol, bar_limit)
+df_raw = fetch_bars(selected_symbol, bar_limit, bar_minutes)
 
 if df_raw.empty:
     st.warning(f"No bar data returned for {selected_symbol}.")
 else:
-    df = compute_indicators(df_raw, sma_fast, sma_slow, rsi_period, vol_sma_period, atr_period)
+    df = compute_indicators(
+        df_raw, selected_symbol,
+        sma_fast, sma_slow, rsi_period, vol_sma_period, atr_period,
+        ema_fast, ema_slow, macd_fast, macd_slow, macd_signal, bar_minutes,
+    )
 
     # Determine current signal
     clean = df.dropna(subset=["sma_fast", "sma_slow", "rsi", "vol_sma", "atr"])
@@ -344,11 +391,17 @@ else:
 
     # ── Four-panel chart ──────────────────────────────────────────────────────
     fig = make_subplots(
-        rows=4, cols=1,
+        rows=5, cols=1,
         shared_xaxes=True,
-        row_heights=[0.50, 0.18, 0.18, 0.14],
-        vertical_spacing=0.04,
-        subplot_titles=("Price + SMAs", "RSI (14)", "Volume", "ATR — Volatility"),
+        row_heights=[0.42, 0.16, 0.15, 0.15, 0.12],
+        vertical_spacing=0.035,
+        subplot_titles=(
+            "Price + SMAs, EMAs & VWAP",
+            f"RSI ({rsi_period})",
+            f"MACD ({macd_fast}/{macd_slow}/{macd_signal})",
+            "Volume",
+            f"ATR ({atr_period}) — Volatility",
+        ),
     )
 
     ts = df["timestamp"] if "timestamp" in df.columns else df.index
@@ -359,6 +412,21 @@ else:
         name="Price",
         increasing_line_color=GREEN, decreasing_line_color=RED,
         increasing_fillcolor=GREEN, decreasing_fillcolor=RED,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=ts, y=df["vwap"], name="VWAP",
+        line=dict(color=YELLOW, width=2, dash="dot"),
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=ts, y=df["ema_fast"], name=f"Fast EMA ({ema_fast})",
+        line=dict(color="#b48ead", width=1.2),
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=ts, y=df["ema_slow"], name=f"Slow EMA ({ema_slow})",
+        line=dict(color="#d08770", width=1.2),
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
@@ -390,27 +458,43 @@ else:
     fig.add_hrect(y0=70, y1=100, fillcolor=RED,   opacity=0.07, row=2, col=1, line_width=0)
     fig.add_hrect(y0=0,  y1=30,  fillcolor=GREEN, opacity=0.07, row=2, col=1, line_width=0)
 
+    # — MACD —
+    hist_colors = [GREEN if h >= 0 else RED for h in df["macd_hist"].fillna(0)]
+    fig.add_trace(go.Bar(
+        x=ts, y=df["macd_hist"], name="Histogram",
+        marker_color=hist_colors, showlegend=False, opacity=0.55,
+    ), row=3, col=1)
+    fig.add_trace(go.Scatter(
+        x=ts, y=df["macd"], name="MACD",
+        line=dict(color=BLUE, width=1.5),
+    ), row=3, col=1)
+    fig.add_trace(go.Scatter(
+        x=ts, y=df["macd_signal"], name="Signal",
+        line=dict(color=YELLOW, width=1.2),
+    ), row=3, col=1)
+    fig.add_hline(y=0, line_width=1, line_color=GREY, row=3, col=1)
+
     # — Volume (coloured by above/below average) —
     vol_colors = [BLUE if v > a else GREY
                   for v, a in zip(df["volume"], df["vol_sma"])]
     fig.add_trace(go.Bar(
         x=ts, y=df["volume"], name="Volume",
         marker_color=vol_colors, showlegend=False,
-    ), row=3, col=1)
+    ), row=4, col=1)
     fig.add_trace(go.Scatter(
         x=ts, y=df["vol_sma"], name=f"Vol SMA ({vol_sma_period})",
         line=dict(color=YELLOW, width=1.2, dash="dot"),
-    ), row=3, col=1)
+    ), row=4, col=1)
 
     # — ATR —
     fig.add_trace(go.Scatter(
         x=ts, y=df["atr"], name=f"ATR ({atr_period})",
         line=dict(color="#fb923c", width=1.5),
         fill="tozeroy", fillcolor="rgba(251,146,60,0.12)",
-    ), row=4, col=1)
+    ), row=5, col=1)
 
     fig.update_layout(
-        height=780,
+        height=920,
         xaxis_rangeslider_visible=False,
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
@@ -441,6 +525,24 @@ else:
                   f"${curr['atr']:,.4f}",
                   delta=f"{atr_pct:.2f}% of price",
                   delta_color="off")
+
+        d1, d2, d3, d4, d5 = st.columns(5)
+        vwap_gap = (curr["close"] - curr["vwap"]) / curr["vwap"] * 100
+        d1.metric("VWAP (today)", f"${curr['vwap']:,.4f}",
+                  delta=f"{vwap_gap:+.2f}% vs price", delta_color="off")
+        d2.metric(f"Fast EMA ({ema_fast})", f"${curr['ema_fast']:,.4f}")
+        d3.metric(f"Slow EMA ({ema_slow})", f"${curr['ema_slow']:,.4f}")
+        d4.metric("MACD", f"{curr['macd']:,.4f}")
+        hist = curr["macd_hist"]
+        d5.metric("MACD Signal", f"{curr['macd_signal']:,.4f}",
+                  delta=f"hist {hist:+.4f}",
+                  delta_color="normal" if hist >= 0 else "inverse")
+
+        st.caption(
+            f"Periods are bar counts at the selected {bar_minutes}-minute resolution. "
+            f"SMA({sma_slow}) spans {sma_slow * bar_minutes} minutes here. "
+            f"VWAP resets each trading day."
+        )
 
 st.divider()
 

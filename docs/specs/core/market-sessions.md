@@ -52,10 +52,27 @@ bucket covers just 09:30–10:00. Sizes that divide the session evenly (5, 15,
 bars.
 
 **Changing bar size changes what the indicators mean.** `sma_slow=30` spans
-30 hours of hourly bars but only 150 minutes of 5-minute bars — a different
-strategy wearing the same numbers. Revisit `IndicatorParams` when changing
-`bar_minutes`; roughly, multiply the periods by `60 / bar_minutes` to keep
-the same wall-clock lookback.
+30 hours of hourly bars but only 150 minutes of 5-minute bars.
+
+`IndicatorParams.bar_minutes` records the resolution the periods were written
+for, and `.rescaled_to(target)` converts them preserving wall-clock lookback.
+`BotConfig.indicator_period_basis` selects between the two readings:
+
+| Setting | Meaning | `sma_slow=30` at 5-min |
+|---|---|---|
+| unset (default) | periods are bar counts at `bar_minutes` | 30 bars = 150 min |
+| `60` | periods authored hourly, rescaled | 360 bars = 30 hours |
+
+Neither is more correct. "MACD 12/26/9 on the 5-minute chart" conventionally
+means 12/26/9 *five-minute* bars — a genuinely faster indicator, which is the
+unset default. The basis exists for when you tuned a strategy hourly and want
+the same strategy at finer resolution.
+
+**`bar_limit` must grow with the periods.** At 5-minute bars with an hourly
+basis, MACD alone needs 422 bars. Fetching fewer does not raise anywhere:
+every indicator is NaN, every symbol is skipped, and the bot runs happily
+without ever trading. `BotConfig.validate()` catches it at construction and
+names the bar_limit that would work.
 
 ## Cadence — how many cycles per day
 
@@ -165,6 +182,10 @@ roughly nine days a year. Wiring the calendar fetch is not yet done — see
 - [ ] Scheduled runs (`docs/specs/scanner/scheduled-runs.md`) should drive
       off `scan_times()` rather than a fixed interval. The bot still polls
       every 60 seconds, which at hourly bars is ~60 wake-ups per usable scan.
-- [ ] Indicator periods do not adapt to `bar_minutes`. Switching to 5-minute
-      bars silently shortens every lookback by 12x; the periods should either
-      scale or the config should warn.
+- [x] Indicator periods and `bar_limit` — done. `indicator_period_basis`
+      selects the interpretation; `BotConfig.validate()` rejects a bar_limit
+      that cannot produce signals.
+- [ ] The poll loop still wakes every 60 seconds regardless of bar size. Now
+      harmless (forming bars are dropped, so it re-reads the same closed bar)
+      but wasteful: ~60 wake-ups per usable scan hourly, 12 at 5-minute. It
+      should skip the fetch when no new bar has closed since the last cycle.

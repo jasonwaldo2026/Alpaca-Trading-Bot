@@ -149,9 +149,42 @@ python -m scanner.cli --bar-minutes 5 # CLI
 | 5 min | 78 | 192 | 288 |
 
 **Changing bar size changes what your indicator periods mean.** `sma_slow=30`
-spans 30 hours of hourly bars but only 150 minutes of 5-minute bars — the
-same numbers describing a completely different strategy. Scale the periods by
-roughly `60 / bar_minutes` to keep the same wall-clock lookback.
+spans 30 hours of hourly bars but only 150 minutes of 5-minute bars. Both
+readings are legitimate, so the choice is explicit:
+
+```python
+BotConfig(bar_minutes=5)                             # 12/26/9 five-minute
+                                                     # bars — what "MACD on
+                                                     # the 5-min chart" means
+
+BotConfig(bar_minutes=5, indicator_period_basis=60,  # same wall-clock
+          bar_limit=600)                             # lookback as hourly
+```
+
+The second rescales every period by `60 / 5`, so `sma_slow=30` becomes 360 —
+still 30 hours. It needs far more history, which is why `bar_limit` goes up;
+`BotConfig.validate()` raises with the exact number if it is too small,
+rather than letting the bot run with all-NaN indicators and never trade.
+
+## Indicators
+
+All computed in `core/indicators.py` — SMA, EMA, RSI, ATR, MACD, VWAP, and a
+volume baseline.
+
+| Indicator | Notes |
+|---|---|
+| `sma_fast` / `sma_slow` | Simple moving averages |
+| `ema_fast` / `ema_slow` | `adjust=False` recursion, matching charting platforms |
+| `rsi` | Wilder's smoothing; NaN rather than 100 when there are no losses |
+| `atr` | EWM true range, captures overnight gaps |
+| `macd` / `macd_signal` / `macd_hist` | Signal is an EMA **of the MACD line**, so it warms up `slow + signal` bars in |
+| `vwap` | **Resets each trading day.** Pass `session_day_series()` as the anchor |
+| `vol_sma` | Per-session baseline when extended hours are on |
+
+VWAP's anchor groups pre-market, regular, and after-hours bars of the same
+date together — they are one trading day, and resetting at 09:30 would throw
+away the pre-market volume that often sets the day's context. Crypto anchors
+on the UTC day.
 
 ## Closed bars only
 

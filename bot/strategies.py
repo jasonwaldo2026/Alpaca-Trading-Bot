@@ -24,7 +24,7 @@ from core.indicators import (
     crossed_down,
     crossed_up,
 )
-from core.sessions import session_series
+from core.sessions import session_day_series, session_series
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +45,20 @@ def _frame_for(bars: pd.DataFrame, symbol: str) -> pd.DataFrame:
     if isinstance(bars.index, pd.MultiIndex):
         return bars.xs(symbol, level="symbol").copy()
     return bars.copy()
+
+
+def _anchor_for(df: pd.DataFrame, symbol: str, config: BotConfig):
+    """
+    VWAP anchor for a bar frame, or None when it cannot be derived.
+
+    Always computed when the frame is timestamp-indexed: unlike the volume
+    baseline, VWAP needs its daily reset at every resolution, not just when
+    extended hours are enabled.
+    """
+    if not isinstance(df.index, pd.DatetimeIndex):
+        log.debug("No DatetimeIndex for %s — VWAP will not reset daily.", symbol)
+        return None
+    return session_day_series(df.index, symbol, config.calendar)
 
 
 def _sessions_for(df: pd.DataFrame, symbol: str, config: BotConfig):
@@ -127,7 +141,11 @@ class EnhancedSMAStrategy(BaseStrategy):
                     log.debug("Not enough bars for %s (%d < %d)", sym, len(df), min_bars)
                     continue
 
-                df = add_indicators(df, params, _sessions_for(df, sym, config))
+                df = add_indicators(
+                    df, params,
+                    _sessions_for(df, sym, config),
+                    _anchor_for(df, sym, config),
+                )
                 df.dropna(inplace=True)
 
                 if len(df) < 2:
@@ -188,7 +206,11 @@ class SMAcrossoverStrategy(BaseStrategy):
                 df = _frame_for(bars, sym)
                 if len(df) < config.sma_slow + 2:
                     continue
-                df = add_indicators(df, params, _sessions_for(df, sym, config))
+                df = add_indicators(
+                    df, params,
+                    _sessions_for(df, sym, config),
+                    _anchor_for(df, sym, config),
+                )
                 df.dropna(subset=[COL_SMA_FAST, COL_SMA_SLOW], inplace=True)
                 if len(df) < 2:
                     continue

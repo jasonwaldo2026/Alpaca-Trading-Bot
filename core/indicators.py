@@ -9,8 +9,8 @@ reproduce on the chart.
 All functions are pure: DataFrame/Series in, Series out, no I/O.
 """
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, replace
+from typing import NamedTuple, Optional
 
 import pandas as pd
 
@@ -18,11 +18,22 @@ import pandas as pd
 # constants rather than hardcoding strings, so a rename stays mechanical.
 COL_SMA_FAST = "sma_fast"
 COL_SMA_SLOW = "sma_slow"
+COL_EMA_FAST = "ema_fast"
+COL_EMA_SLOW = "ema_slow"
 COL_RSI = "rsi"
 COL_VOL_SMA = "vol_sma"
 COL_ATR = "atr"
+COL_VWAP = "vwap"
+COL_MACD = "macd"
+COL_MACD_SIGNAL = "macd_signal"
+COL_MACD_HIST = "macd_hist"
 
-INDICATOR_COLUMNS = (COL_SMA_FAST, COL_SMA_SLOW, COL_RSI, COL_VOL_SMA, COL_ATR)
+INDICATOR_COLUMNS = (
+    COL_SMA_FAST, COL_SMA_SLOW,
+    COL_EMA_FAST, COL_EMA_SLOW,
+    COL_RSI, COL_VOL_SMA, COL_ATR, COL_VWAP,
+    COL_MACD, COL_MACD_SIGNAL, COL_MACD_HIST,
+)
 
 # OHLCV columns every fetcher must supply before indicators can be computed.
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
@@ -40,19 +51,89 @@ class IndicatorParams:
 
     sma_fast: int = 10
     sma_slow: int = 30
+    ema_fast: int = 9
+    ema_slow: int = 21
     rsi_period: int = 14
     volume_sma_period: int = 20
     atr_period: int = 14
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+
+    #: The bar size these periods are expressed in. Periods are *bar counts*,
+    #: so the same numbers mean different durations at different resolutions:
+    #: sma_slow=30 is 30 hours of hourly bars but 150 minutes of 5-minute
+    #: bars. Recording the intended resolution is what makes rescaled_to()
+    #: possible and stops the mismatch from being silent.
+    bar_minutes: int = 60
+
+    #: Period fields, for rescaling and validation. Not every field on this
+    #: dataclass is a period, so they are named rather than inferred.
+    PERIOD_FIELDS = (
+        "sma_fast", "sma_slow", "ema_fast", "ema_slow", "rsi_period",
+        "volume_sma_period", "atr_period", "macd_fast", "macd_slow",
+        "macd_signal",
+    )
 
     def min_bars(self) -> int:
-        """Bars needed before every indicator has a non-NaN value, plus one
-        extra so crossover logic can compare the last two rows."""
+        """
+        Bars needed before every indicator has a non-NaN value, plus one
+        extra so crossover logic can compare the last two rows.
+
+        MACD is the binding constraint: its signal line is an EMA *of* the
+        MACD line, so it needs macd_slow bars before the line exists and
+        macd_signal more before the signal does.
+        """
         return max(
             self.sma_slow,
+            self.ema_slow,
             self.rsi_period,
             self.volume_sma_period,
             self.atr_period,
+            self.macd_slow + self.macd_signal,
         ) + 2
+
+    def rescaled_to(self, bar_minutes: int) -> "IndicatorParams":
+        """
+        Same wall-clock lookback, expressed at a different bar size.
+
+        `IndicatorParams(sma_slow=30, bar_minutes=60).rescaled_to(5)` gives
+        sma_slow=360 — still 30 hours, now counted in 5-minute bars.
+
+        Use this when the periods were tuned at one resolution and you want
+        the *same strategy* at another. Do NOT use it if you mean the
+        conventional reading of "MACD 12/26/9 on the 5-minute chart", which
+        is 12/26/9 five-minute bars and a genuinely faster indicator. Both
+        are legitimate; they are different strategies, so the choice is
+        explicit rather than automatic.
+        """
+        if bar_minutes <= 0:
+            raise ValueError(f"bar_minutes must be positive; got {bar_minutes}.")
+        if bar_minutes == self.bar_minutes:
+            return self
+
+        factor = self.bar_minutes / bar_minutes
+        scaled = {
+            name: max(2, round(getattr(self, name) * factor))
+            for name in self.PERIOD_FIELDS
+        }
+        return replace(self, bar_minutes=bar_minutes, **scaled)
+
+    def duration_minutes(self, field: str) -> int:
+        """Wall-clock span of one period, for labelling."""
+        if field not in self.PERIOD_FIELDS:
+            raise KeyError(
+                f"{field!r} is not a period. Known: {', '.join(self.PERIOD_FIELDS)}"
+            )
+        return getattr(self, field) * self.bar_minutes
+
+    def describe(self) -> str:
+        """Human-readable summary — periods with their wall-clock meaning."""
+        parts = [
+            f"{name}={getattr(self, name)} ({self.duration_minutes(name)}m)"
+            for name in ("sma_fast", "sma_slow", "macd_fast", "macd_slow")
+        ]
+        return f"[{self.bar_minutes}m bars] " + "  ".join(parts)
 
 
 def sma(series: pd.Series, period: int) -> pd.Series:
@@ -97,6 +178,105 @@ def atr(df: pd.DataFrame, period: int) -> pd.Series:
     return true_range.ewm(com=period - 1, min_periods=period).mean()
 
 
+def ema(series: pd.Series, period: int) -> pd.Series:
+    """
+    Exponential moving average, span-based with alpha = 2 / (period + 1).
+
+    `adjust=False` gives the standard recursive form traders expect —
+    y_t = alpha*x_t + (1-alpha)*y_(t-1) — rather than pandas' default
+    bias-corrected weighting, which does not match charting platforms.
+
+    `min_periods=period` suppresses output until `period` observations exist.
+    The recursion still seeds from the first value, so the first emitted
+    reading carries some seed influence; that matches TradingView and the
+    common convention. It differs slightly from an SMA-seeded EMA, which
+    matters only in the first few readings.
+    """
+    return series.ewm(span=period, adjust=False, min_periods=period).mean()
+
+
+class MACDResult(NamedTuple):
+    """MACD line, its signal line, and the histogram between them."""
+
+    macd: pd.Series
+    signal: pd.Series
+    histogram: pd.Series
+
+
+def macd(
+    series: pd.Series,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> MACDResult:
+    """
+    Moving Average Convergence Divergence.
+
+        macd      = EMA(fast) - EMA(slow)
+        signal    = EMA(macd, signal)
+        histogram = macd - signal
+
+    The signal line is an EMA *of the MACD line*, not of price, so it only
+    becomes valid `signal` bars after the MACD line itself does — roughly
+    `slow + signal` bars from the start of the series. Feeding it a short
+    frame yields NaN rather than a wrong number.
+
+    Periods are bar counts. On 5-minute bars, 12/26/9 spans 60/130/45
+    minutes; on hourly bars the same numbers span 12/26/9 hours. Use
+    `IndicatorParams.rescaled_to()` if you want the same wall-clock span at a
+    different resolution.
+    """
+    if fast >= slow:
+        raise ValueError(
+            f"MACD needs fast < slow; got fast={fast}, slow={slow}."
+        )
+    line = ema(series, fast) - ema(series, slow)
+    signal_line = ema(line, signal)
+    return MACDResult(line, signal_line, line - signal_line)
+
+
+def typical_price(df: pd.DataFrame) -> pd.Series:
+    """(high + low + close) / 3 — the price VWAP weights by volume."""
+    return (df["high"] + df["low"] + df["close"]) / 3
+
+
+def vwap(df: pd.DataFrame, anchor: Optional[pd.Series] = None) -> pd.Series:
+    """
+    Volume-Weighted Average Price, anchored to a session.
+
+        vwap = cumsum(typical_price * volume) / cumsum(volume)
+
+    **VWAP resets.** It is a running average *within* a trading day, not a
+    rolling window — a VWAP accumulated continuously across weeks is not the
+    line any trading platform draws, and drifts further from price every day.
+    That reset is what `anchor` provides: pass
+    `core.sessions.session_day_series(...)`, which groups bars by ET trading
+    day for equities and by UTC day for crypto.
+
+    Omitting `anchor` accumulates over the whole frame. That is only correct
+    for a frame that already covers exactly one session.
+
+    Bars with zero volume contribute nothing and leave VWAP flat rather than
+    dividing by zero.
+    """
+    price_volume = typical_price(df) * df["volume"]
+
+    if anchor is None:
+        cumulative_pv = price_volume.cumsum()
+        cumulative_volume = df["volume"].cumsum()
+    else:
+        if not df.index.equals(anchor.index):
+            raise ValueError(
+                "bars and anchor must share an index; got "
+                f"{len(df)} and {len(anchor)} rows."
+            )
+        grouped = anchor
+        cumulative_pv = price_volume.groupby(grouped, sort=False).cumsum()
+        cumulative_volume = df["volume"].groupby(grouped, sort=False).cumsum()
+
+    return cumulative_pv / cumulative_volume.replace(0, float("nan"))
+
+
 def volume_sma_by_session(
     volume: pd.Series, sessions: pd.Series, period: int
 ) -> pd.Series:
@@ -126,6 +306,7 @@ def add_indicators(
     df: pd.DataFrame,
     params: IndicatorParams,
     sessions: Optional[pd.Series] = None,
+    anchor: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
     """
     Return a copy of `df` with every indicator column added.
@@ -138,6 +319,15 @@ def add_indicators(
     Pass `sessions` (from `core.sessions.session_series`) when the frame spans
     extended hours, so the volume baseline is computed per session rather
     than across sessions of wildly different typical volume.
+
+    Pass `anchor` (from `core.sessions.session_day_series`) so VWAP resets
+    each trading day. Without it VWAP accumulates across the whole frame,
+    which is only correct for a single-session frame.
+
+    `params.bar_minutes` records the resolution the periods were written for.
+    It is not enforced here — the caller decides whether to reinterpret the
+    periods at a new resolution (`params.rescaled_to(...)`) or keep them as
+    bar counts. See `docs/specs/core/market-sessions.md`.
     """
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
@@ -149,6 +339,8 @@ def add_indicators(
     out = df.copy()
     out[COL_SMA_FAST] = sma(out["close"], params.sma_fast)
     out[COL_SMA_SLOW] = sma(out["close"], params.sma_slow)
+    out[COL_EMA_FAST] = ema(out["close"], params.ema_fast)
+    out[COL_EMA_SLOW] = ema(out["close"], params.ema_slow)
     out[COL_RSI] = rsi(out["close"], params.rsi_period)
     if sessions is None:
         out[COL_VOL_SMA] = sma(out["volume"], params.volume_sma_period)
@@ -157,6 +349,14 @@ def add_indicators(
             out["volume"], sessions, params.volume_sma_period
         )
     out[COL_ATR] = atr(out, params.atr_period)
+    out[COL_VWAP] = vwap(out, anchor)
+
+    macd_result = macd(
+        out["close"], params.macd_fast, params.macd_slow, params.macd_signal
+    )
+    out[COL_MACD] = macd_result.macd
+    out[COL_MACD_SIGNAL] = macd_result.signal
+    out[COL_MACD_HIST] = macd_result.histogram
     return out
 
 
