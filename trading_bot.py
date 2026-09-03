@@ -92,8 +92,8 @@ if __name__ == "__main__":
         # SMA
         sma_fast=10,
         sma_slow=30,
-        # EMA — 9 and 12 for intraday momentum, 200 for the long trend
-        ema_periods=(9, 12, 200),
+        # EMA — 4 and 12 are drawn, 9 drives the exit rule, 200 the trend
+        ema_periods=(4, 9, 12, 200),
         # MACD
         macd_fast=12,
         macd_slow=26,

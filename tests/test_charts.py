@@ -12,7 +12,9 @@ import pytest
 
 from core.indicators import IndicatorParams, add_indicators
 from studio.charts import (
+    CHART_EMA_PERIODS,
     DARK,
+    EMA_DASHES,
     LIGHT,
     ChartOptions,
     _ema_colors,
@@ -47,11 +49,19 @@ def _trace(fig, name):
 # ── What gets drawn ──────────────────────────────────────────────────────────
 
 def test_everything_requested_is_drawn(bars):
-    fig = build_chart(bars, "NVDA", ChartOptions(ema_periods=(9, 12, 200)), LIGHT)
+    fig = build_chart(bars, "NVDA", ChartOptions(), LIGHT)
     names = _names(fig)
-    for expected in ("NVDA", "EMA 9", "EMA 12", "EMA 200", "VWAP",
+    for expected in ("NVDA", "EMA 4", "EMA 12", "EMA 200", "VWAP",
                      "MACD", "Signal", "Volume", "Volume MA"):
         assert expected in names
+
+
+def test_ema_9_is_computed_but_never_drawn(bars):
+    """It is the exit line for the above-VWAP scenario — a rule reads it, a
+    fourth line on the price panel would only crowd the chart."""
+    assert "ema_9" in bars.columns
+    assert 9 not in CHART_EMA_PERIODS
+    assert "EMA 9" not in _names(build_chart(bars, "NVDA", ChartOptions(), LIGHT))
 
 
 def test_candles_are_candles(bars):
@@ -77,32 +87,54 @@ def test_each_panel_can_be_dropped_independently(bars):
 
 # ── Encoding ─────────────────────────────────────────────────────────────────
 
-def test_emas_use_an_ordinal_ramp_shortest_lightest():
-    """Three EMAs are one measure at three lookbacks, not three unrelated
-    series — so they share a hue and differ in lightness."""
-    colours = _ema_colors((9, 12, 200), LIGHT)
-    assert colours[9] == LIGHT.ema_ramp[0]
-    assert colours[200] == LIGHT.ema_ramp[-1]
-    assert len(set(colours.values())) == 3
+def test_each_ema_takes_the_colour_it_was_asked_for():
+    """These hues are a stated preference, not a generated scheme: 4 green,
+    12 red, 200 pink. Matching the charts already in the trader's head is
+    worth more here than a generic ramp."""
+    for palette in (LIGHT, DARK):
+        colours = _ema_colors(CHART_EMA_PERIODS, palette)
+        assert colours == {p: palette.ema_colors[p] for p in CHART_EMA_PERIODS}
+        assert len(set(colours.values())) == len(CHART_EMA_PERIODS)
 
 
-def test_a_single_ema_takes_a_mid_step():
-    colours = _ema_colors((50,), LIGHT)
+def test_emas_differ_in_dash_as_well_as_hue(bars):
+    """Green and red separate cleanly for normal colour vision but not for
+    red-green colour blindness, so shape carries the identity too."""
+    fig = build_chart(bars, "X", ChartOptions(), LIGHT)
+    dashes = {p: _trace(fig, f"EMA {p}").line.dash for p in CHART_EMA_PERIODS}
+    assert dashes == {p: EMA_DASHES[p] for p in CHART_EMA_PERIODS}
+    assert len(set(dashes.values())) == len(CHART_EMA_PERIODS)
+
+
+def test_an_unchosen_period_falls_back_to_the_ordinal_ramp():
+    """A period with no stated colour is still one measure at another
+    lookback, so it takes a ramp step rather than an invented hue."""
+    colours = _ema_colors((4, 50, 200), LIGHT)
+    assert colours[4] == LIGHT.ema_colors[4]
+    assert colours[200] == LIGHT.ema_colors[200]
     assert colours[50] in LIGHT.ema_ramp
 
 
 def test_more_emas_than_ramp_steps_reuse_ends_rather_than_inventing_hues():
     """A generated hue would break the 'same measure' reading the ramp
     exists to create."""
-    colours = _ema_colors((5, 9, 20, 50, 200), LIGHT)
+    colours = _ema_colors((5, 20, 50, 100, 150), LIGHT)
     assert set(colours.values()) <= set(LIGHT.ema_ramp)
 
 
 def test_vwap_is_distinguished_by_dash_as_well_as_hue(bars):
     """Identity never rests on colour alone."""
     fig = build_chart(bars, "X", ChartOptions(), LIGHT)
-    assert _trace(fig, "VWAP").line.dash == "dash"
+    assert _trace(fig, "VWAP").line.dash == "dot"
     assert _trace(fig, "VWAP").line.color == LIGHT.vwap
+
+
+def test_the_volume_baseline_does_not_borrow_the_vwap_hue(bars):
+    """Two panels, two unrelated measures — sharing a colour would imply a
+    relationship that is not there."""
+    fig = build_chart(bars, "X", ChartOptions(), LIGHT)
+    assert _trace(fig, "Volume MA").line.color == LIGHT.volume_ma
+    assert LIGHT.volume_ma != LIGHT.vwap
 
 
 def test_candles_use_the_status_pair(bars):
@@ -129,9 +161,9 @@ def test_volume_bars_are_coloured_against_their_baseline(bars):
 def test_only_price_overlays_appear_in_the_legend(bars):
     """A shared legend listing MACD next to the EMAs reads as though it were
     a price overlay too."""
-    fig = build_chart(bars, "X", ChartOptions(ema_periods=(9, 12, 200)), LIGHT)
+    fig = build_chart(bars, "X", ChartOptions(), LIGHT)
     legended = {t.name for t in fig.data if t.showlegend}
-    assert legended == {"EMA 9", "EMA 12", "EMA 200", "VWAP"}
+    assert legended == {"EMA 4", "EMA 12", "EMA 200", "VWAP"}
 
 
 def test_lower_panels_are_labelled_on_the_chart_instead(bars):

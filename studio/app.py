@@ -30,7 +30,12 @@ from core.alerts import (
 )
 from core.rules import VALID_OPS, Condition, Rule, RuleError
 from scanner.engine import Scanner
-from studio.charts import ChartOptions, build_chart, palette_for
+from studio.charts import (
+    CHART_EMA_PERIODS,
+    ChartOptions,
+    build_chart,
+    palette_for,
+)
 
 RULES_DIR = Path("rules")
 
@@ -62,7 +67,7 @@ def _to_condition(row: dict) -> Condition:
 
 
 def _parse_ema_periods(text: str):
-    """Read '9, 12, 200' into (9, 12, 200). Invalid entries fall back."""
+    """Read '4, 9, 12, 200' into (4, 9, 12, 200). Invalid entries fall back."""
     try:
         periods = tuple(int(p.strip()) for p in text.split(",") if p.strip())
     except ValueError:
@@ -71,11 +76,13 @@ def _parse_ema_periods(text: str):
 
 
 def _current_params() -> IndicatorParams:
-    periods = _parse_ema_periods(st.session_state.get("ema_periods_text", "9, 12, 200"))
+    periods = _parse_ema_periods(
+        st.session_state.get("ema_periods_text", "4, 9, 12, 200")
+    )
     return IndicatorParams(
         sma_fast=st.session_state.sma_fast,
         sma_slow=st.session_state.sma_slow,
-        ema_periods=periods or (9, 12, 200),
+        ema_periods=periods or (4, 9, 12, 200),
         rsi_period=st.session_state.rsi_period,
         volume_sma_period=st.session_state.vol_sma_period,
         atr_period=st.session_state.atr_period,
@@ -140,7 +147,7 @@ with st.sidebar:
     st.slider("Volume SMA", 5, 50, 20, key="vol_sma_period")
     st.slider("ATR period", 5, 30, 14, key="atr_period")
     st.text_input(
-        "EMA periods", value="9, 12, 200", key="ema_periods_text",
+        "EMA periods", value="4, 9, 12, 200", key="ema_periods_text",
         help="Comma-separated. Each becomes a selectable field: ema_9, ema_12, …",
     )
     st.slider("MACD fast", 3, 40, 12, key="macd_fast")
@@ -169,7 +176,9 @@ st.subheader("Conditions")
 st.caption("A symbol matches when **every** condition holds on the latest bar.")
 
 if _parse_ema_periods(st.session_state.ema_periods_text) is None:
-    st.error("EMA periods must be comma-separated whole numbers, e.g. `9, 12, 200`.")
+    st.error(
+        "EMA periods must be comma-separated whole numbers, e.g. `4, 9, 12, 200`."
+    )
     st.stop()
 
 # Selectable fields follow the current params, so changing the EMA periods
@@ -423,8 +432,14 @@ else:
     # Enough history for the longest EMA, plus the window being displayed.
     fetch_limit = max(params.min_bars() + visible_bars, 300)
 
+    # Draw only CHART_EMA_PERIODS, and only those actually computed. EMA 9
+    # is in `params` because the exit rule reads it, but a fourth line on the
+    # price panel would crowd the chart for a number no decision is taken
+    # from visually.
+    drawn_emas = tuple(p for p in CHART_EMA_PERIODS if p in params.ema_periods)
+
     options = ChartOptions(
-        ema_periods=params.ema_periods if show_emas else (),
+        ema_periods=drawn_emas if show_emas else (),
         show_vwap=show_vwap, show_macd=show_macd, show_volume=show_volume,
         bars=visible_bars, compact=multi,
     )

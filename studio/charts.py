@@ -7,14 +7,19 @@ read rather than being buried in UI code.
 
 **Encoding decisions, and why:**
 
-- **EMAs are one measure at three lookbacks, not three unrelated series.**
-  They get an *ordinal* single-hue ramp — short is light, long is dark — so
-  the chart says "same thing, different speeds" before you read the legend.
-  Four categorical hues would have said the opposite, and would also have
-  failed the palette's all-pairs separation floors.
-- **VWAP is a different measure**, so it takes a contrasting hue *and* a
-  dashed stroke. The dash is deliberate: identity never rests on colour
-  alone.
+- **Colours are the ones the trader asked for**, not the generic palette:
+  EMA 4 green, EMA 12 red, EMA 200 pink, VWAP purple, volume blue, MACD
+  green with a red signal. A design system supplies parameters; here the
+  parameters are a personal preference, and matching the charts already in
+  someone's head is worth more than a generic scheme.
+- **Every line also differs in dash pattern.** Green and red separate
+  cleanly for normal colour vision (validator ΔE 33.9) but not for
+  red-green colour blindness (ΔE 4.1), and even with full colour vision two
+  same-lightness lines overlapping on a phone screen are hard to pull apart.
+  Shape carries the identity when hue cannot.
+- **EMA 9 is computed but not drawn.** It drives the exit rule; putting a
+  fourth line on the price panel would crowd it for something no decision is
+  read off visually.
 - **Candles use the status good/critical pair.** Direction is polarity, not
   identity, and the candle body itself carries the direction independently of
   colour.
@@ -57,35 +62,56 @@ class Palette:
     grid: str
     up: str
     down: str
-    #: Ordinal ramp for EMAs, light to dark. Short period gets the light end.
+    #: Colour per EMA period. A period not listed falls back to `ema_ramp`.
+    ema_colors: Dict[int, str]
+    #: Fallback ordinal ramp, light to dark, for periods with no chosen colour.
     ema_ramp: Sequence[str]
     vwap: str
     macd: str
     macd_signal: str
     volume: str
     volume_quiet: str
+    #: The volume baseline. Its own slot rather than borrowing VWAP's hue —
+    #: a purple line in the volume panel would read as related to the purple
+    #: line on the price panel, and it is not.
+    volume_ma: str
 
 
 # Status good/critical are fixed and never themed.
 UP = "#0ca30c"
 DOWN = "#d03b3b"
 
+#: EMA periods the chart draws. 9 is deliberately absent — it is computed
+#: for the exit rule, not read off the chart.
+CHART_EMA_PERIODS = (4, 12, 200)
+
+#: Dash pattern per EMA period, so identity survives when hue does not.
+EMA_DASHES = {4: "solid", 12: "dash", 200: "longdash"}
+
 LIGHT = Palette(
     surface="#fcfcfb", text="#0b0b0b", muted="#52514e",
     grid="rgba(11,11,11,0.08)",
     up=UP, down=DOWN,
-    ema_ramp=("#86b6ef", "#3987e5", "#184f95"),   # ordinal, validated light
-    vwap="#eb6834", macd="#2a78d6", macd_signal="#eb6834",
+    ema_colors={4: "#0ca30c", 12: "#d03b3b", 200: "#e87ba4"},
+    ema_ramp=("#86b6ef", "#3987e5", "#184f95"),
+    vwap="#4a3aa7",                                # purple
+    macd="#0ca30c", macd_signal="#d03b3b",         # green line, red signal
     volume="#2a78d6", volume_quiet="rgba(82,81,78,0.35)",
+    volume_ma="#3f3e3a",
 )
 
 DARK = Palette(
     surface="#1a1a19", text="#ffffff", muted="#c3c2b7",
     grid="rgba(255,255,255,0.08)",
     up=UP, down=DOWN,
-    ema_ramp=("#9ec5f4", "#5598e7", "#1c5cab"),   # ordinal, validated dark
-    vwap="#d95926", macd="#3987e5", macd_signal="#d95926",
+    # Same hues, stepped for the dark surface. Green and red are the fixed
+    # status pair and are unchanged in both modes.
+    ema_colors={4: "#0ca30c", 12: "#d03b3b", 200: "#d55181"},
+    ema_ramp=("#9ec5f4", "#5598e7", "#1c5cab"),
+    vwap="#9085e9",                                # purple, dark step
+    macd="#0ca30c", macd_signal="#d03b3b",
     volume="#3987e5", volume_quiet="rgba(195,194,183,0.35)",
+    volume_ma="#e0dfd6",
 )
 
 
@@ -97,7 +123,9 @@ def palette_for(theme: Optional[str]) -> Palette:
 class ChartOptions:
     """Which overlays and panels to draw."""
 
-    ema_periods: Sequence[int] = ()
+    #: Periods to *draw*. Defaults to CHART_EMA_PERIODS; EMA 9 is computed
+    #: for the exit rule but deliberately not plotted.
+    ema_periods: Sequence[int] = CHART_EMA_PERIODS
     show_vwap: bool = True
     show_macd: bool = True
     show_volume: bool = True
@@ -110,21 +138,26 @@ class ChartOptions:
 
 def _ema_colors(periods: Sequence[int], palette: Palette) -> Dict[int, str]:
     """
-    Map EMA periods onto the ordinal ramp, shortest to lightest.
+    Colour per EMA period.
 
-    With more periods than ramp steps the ends repeat rather than inventing
-    hues — a generated hue would break the "same measure" reading the ramp
-    exists to create.
+    Chosen colours win; any period without one falls back to the ordinal
+    ramp so an added period is still drawn rather than crashing or
+    colliding.
     """
     ordered = sorted(periods)
     ramp = list(palette.ema_ramp)
-    if not ordered:
-        return {}
-    if len(ordered) == 1:
-        return {ordered[0]: ramp[len(ramp) // 2]}
-    step = (len(ramp) - 1) / (len(ordered) - 1)
-    return {p: ramp[min(len(ramp) - 1, round(i * step))]
-            for i, p in enumerate(ordered)}
+    out: Dict[int, str] = {}
+    unchosen = [p for p in ordered if p not in palette.ema_colors]
+
+    for index, period in enumerate(ordered):
+        chosen = palette.ema_colors.get(period)
+        if chosen:
+            out[period] = chosen
+            continue
+        position = unchosen.index(period)
+        step = 0 if len(unchosen) == 1 else position * (len(ramp) - 1) / (len(unchosen) - 1)
+        out[period] = ramp[min(len(ramp) - 1, round(step))]
+    return out
 
 
 def _recent(df: pd.DataFrame, bars: int) -> pd.DataFrame:
@@ -196,14 +229,15 @@ def build_chart(
             continue
         fig.add_trace(go.Scatter(
             x=x, y=view[column], name=f"EMA {period}", showlegend=True,
-            line=dict(color=colour, width=2),
+            line=dict(color=colour, width=2,
+                      dash=EMA_DASHES.get(period, "solid")),
             hovertemplate=f"EMA {period}: %{{y:.4f}}<extra></extra>",
         ), row=1, col=1)
 
     if options.show_vwap and COL_VWAP in view.columns:
         fig.add_trace(go.Scatter(
             x=x, y=view[COL_VWAP], name="VWAP", showlegend=True,
-            line=dict(color=palette.vwap, width=2, dash="dash"),
+            line=dict(color=palette.vwap, width=2.5, dash="dot"),
             hovertemplate="VWAP: %{y:.4f}<extra></extra>",
         ), row=1, col=1)
 
@@ -251,11 +285,11 @@ def build_chart(
         if baseline is not None:
             fig.add_trace(go.Scatter(
                 x=x, y=baseline, name="Volume MA", showlegend=False,
-                line=dict(color=palette.vwap, width=2, dash="dot"),
+                line=dict(color=palette.volume_ma, width=2, dash="dot"),
                 hovertemplate="Vol MA: %{y:,.0f}<extra></extra>",
             ), row=row, col=1)
             if not options.compact:
-                _label_last(fig, x, baseline, "Vol MA", palette.vwap, row)
+                _label_last(fig, x, baseline, "Vol MA", palette.volume_ma, row)
 
     fig.update_layout(
         height=320 if options.compact else 760,

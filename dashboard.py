@@ -109,7 +109,7 @@ def compute_indicators(
     df: pd.DataFrame,
     symbol: str,
     sma_fast=10, sma_slow=30, rsi_period=14, vol_sma_period=20, atr_period=14,
-    ema_periods=(9, 12, 200),
+    ema_periods=(4, 9, 12, 200),
     macd_fast=12, macd_slow=26, macd_signal=9,
     bar_minutes=60,
 ) -> pd.DataFrame:
@@ -170,14 +170,15 @@ with st.sidebar:
     atr_period     = st.slider("ATR period",        5,  30, 14)
 
     st.caption("EMA / MACD")
-    ema_text       = st.text_input("EMA periods", value="9, 12, 200",
+    ema_text       = st.text_input("EMA periods", value="4, 9, 12, 200",
                                    help="Comma-separated; one line per period.")
     try:
         ema_periods = tuple(int(p.strip()) for p in ema_text.split(",") if p.strip())
     except ValueError:
         ema_periods = ()
     if not ema_periods:
-        st.error("EMA periods must be comma-separated whole numbers, e.g. 9, 12, 200")
+        st.error("EMA periods must be comma-separated whole numbers, "
+                 "e.g. 4, 9, 12, 200")
         st.stop()
     macd_fast      = st.slider("MACD fast",         3,  40, 12)
     macd_slow      = st.slider("MACD slow",         5,  80, 26)

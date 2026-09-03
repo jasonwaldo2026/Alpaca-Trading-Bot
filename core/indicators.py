@@ -78,10 +78,13 @@ class IndicatorParams:
     sma_fast: int = 10
     sma_slow: int = 30
 
-    #: EMA periods, one column each (ema_9, ema_12, ema_200). 9 and 12 are
-    #: fast intraday averages; 200 is the long-trend reference every charting
-    #: platform draws. Order does not matter.
-    ema_periods: Tuple[int, ...] = (9, 12, 200)
+    #: EMA periods, one column each (ema_4, ema_9, ema_12, ema_200). 4 and
+    #: 12 are the fast pair read off the chart; 200 is the long-trend
+    #: reference every charting platform draws. 9 is computed but not
+    #: plotted — it is the exit line for the above-VWAP scenario, and a
+    #: rule cannot reference a column that was never calculated. Order does
+    #: not matter; the tuple is sorted for a stable cache identity.
+    ema_periods: Tuple[int, ...] = (4, 9, 12, 200)
 
     rsi_period: int = 14
     volume_sma_period: int = 20

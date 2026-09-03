@@ -76,9 +76,21 @@ def test_default_config_runs_premarket_five_minute():
     assert config.sessions.pre and config.sessions.regular and config.sessions.after
 
 
-def test_default_config_carries_the_9_12_200_emas():
+def test_default_config_carries_the_4_9_12_200_emas():
     params = BotConfig(api_key="k", api_secret="s").indicator_params()
-    assert params.ema_periods == (9, 12, 200)
+    assert params.ema_periods == (4, 9, 12, 200)
+
+
+def test_ema_9_is_computed_even_though_the_chart_does_not_draw_it():
+    """The above-VWAP exit is `close < ema_9`. A rule cannot reference a
+    column that was never calculated, so 9 stays in the params whether or
+    not Studio plots it."""
+    from studio.charts import CHART_EMA_PERIODS
+
+    params = BotConfig(api_key="k", api_secret="s").indicator_params()
+    assert 9 in params.ema_periods
+    assert 9 not in CHART_EMA_PERIODS
+    assert ema_column(9) in indicator_columns(params)
 
 
 def test_default_bar_limit_covers_the_200_ema():
@@ -96,8 +108,8 @@ def test_ema_200_at_five_minutes_spans_a_day_and_a_half_of_trading():
 # ── Multiple EMAs ────────────────────────────────────────────────────────────
 
 def test_each_ema_period_gets_its_own_column():
-    params = IndicatorParams(ema_periods=(9, 12, 200), bar_minutes=5)
-    for period in (9, 12, 200):
+    params = IndicatorParams(ema_periods=(4, 9, 12, 200), bar_minutes=5)
+    for period in (4, 9, 12, 200):
         assert ema_column(period) in indicator_columns(params)
 
 
@@ -134,9 +146,9 @@ def test_ema_periods_survive_a_json_round_trip_as_a_tuple():
 
 
 def test_ema_periods_are_sorted_for_a_stable_identity():
-    assert IndicatorParams(ema_periods=(200, 9, 12)).ema_periods == (9, 12, 200)
-    assert IndicatorParams(ema_periods=(9, 12, 200)) == IndicatorParams(
-        ema_periods=(200, 12, 9)
+    assert IndicatorParams(ema_periods=(200, 9, 4, 12)).ema_periods == (4, 9, 12, 200)
+    assert IndicatorParams(ema_periods=(4, 9, 12, 200)) == IndicatorParams(
+        ema_periods=(200, 12, 9, 4)
     )
 
 

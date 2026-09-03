@@ -15,7 +15,7 @@
     "limit_offset_pct": 0.002
   },
   "params": {
-    "sma_fast": 10, "sma_slow": 30, "ema_periods": [9, 12, 200],
+    "sma_fast": 10, "sma_slow": 30, "ema_periods": [4, 9, 12, 200],
     "rsi_period": 14, "volume_sma_period": 20, "atr_period": 14,
     "roc_period": 2, "choppiness_period": 24, "swing_threshold_pct": 1.0,
     "macd_fast": 12, "macd_slow": 26, "macd_signal": 9, "bar_minutes": 5

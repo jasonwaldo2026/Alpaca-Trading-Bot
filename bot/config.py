@@ -58,11 +58,13 @@ class BotConfig:
     sma_fast: int = 10   # fast moving average period (bars)
     sma_slow: int = 30   # slow moving average period (bars)
 
-    # EMA periods (bars) — one column each: ema_9, ema_12, ema_200.
-    # 9 and 12 track intraday momentum; 200 is the long-trend reference.
-    # At 5-minute bars, EMA(200) spans 1000 minutes of *trading* time —
-    # roughly a day and a half of the 04:00-20:00 extended session.
-    ema_periods: Tuple[int, ...] = (9, 12, 200)
+    # EMA periods (bars) — one column each: ema_4, ema_9, ema_12, ema_200.
+    # 4 and 12 are the fast pair drawn on the chart; 9 is computed for the
+    # exit rule (close below EMA 9) rather than plotted; 200 is the
+    # long-trend reference. At 5-minute bars, EMA(200) spans 1000 minutes of
+    # *trading* time — roughly a day and a half of the 04:00-20:00 extended
+    # session.
+    ema_periods: Tuple[int, ...] = (4, 9, 12, 200)
 
     # MACD periods (bars) — conventional 12/26/9
     macd_fast: int = 12

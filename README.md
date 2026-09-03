@@ -142,10 +142,22 @@ closed, so the scenario simply never fires rather than matching everything.
 ## Charts
 
 Studio draws candlesticks with the indicators the scenarios actually use:
-EMA 9/12/200, VWAP, MACD, and volume against its moving average. Each
+EMA 4/12/200, VWAP, MACD, and volume against its moving average. Each
 overlay toggles on or off, and a **Multi-chart (4)** switch swaps the single
 view for a grid — two columns on a desktop, stacking to one on a phone so
 each chart is full width rather than a quarter of it.
+
+Colours are the ones asked for rather than a generated scheme: EMA 4 green,
+EMA 12 red, EMA 200 pink, VWAP purple, volume blue, MACD green with a red
+signal. Every line also carries its own dash pattern, because green and red
+separate cleanly for normal colour vision but not for red-green colour
+blindness — and two same-weight lines crossing on a phone are hard to tell
+apart regardless.
+
+**EMA 9 is computed but not drawn.** It is the exit line for the above-VWAP
+scenario (`close < ema_9`), so it has to exist as a column for the rule to
+read; a fourth line on the price panel would only crowd it for a number no
+decision is taken from by eye.
 
 The window is the recent region only (60 bars by default, adjustable): a
 phone screen cannot usefully show 300 bars, and the current region is what
@@ -306,7 +318,7 @@ volume baseline.
 | Indicator | Notes |
 |---|---|
 | `sma_fast` / `sma_slow` | Simple moving averages |
-| `ema_9` / `ema_12` / `ema_200` | One column per period in `ema_periods`; `adjust=False` recursion, matching charting platforms |
+| `ema_4` / `ema_9` / `ema_12` / `ema_200` | One column per period in `ema_periods`; `adjust=False` recursion, matching charting platforms. 4/12/200 are drawn; 9 exists for the exit rule |
 | `rsi` | Wilder's smoothing; NaN rather than 100 when there are no losses |
 | `atr` | EWM true range, captures overnight gaps |
 | `macd` / `macd_signal` / `macd_hist` | Signal is an EMA **of the MACD line**, so it warms up `slow + signal` bars in |

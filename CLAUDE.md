@@ -108,10 +108,17 @@ Four apps over one shared core. Paper trading only.
   beyond its nominal span. `core/data.py:bar_coverage()` measures it. The
   usual amplifier is the data feed: unset means IEX (one venue, thin
   pre-market); `DataFeed.SIP` is the consolidated tape and needs a paid plan.
-- EMA periods are a tuple (`ema_periods=(9, 12, 200)`), one column each
-  (`ema_9`, `ema_12`, `ema_200`). Column lists come from
+- EMA periods are a tuple (`ema_periods=(4, 9, 12, 200)`), one column each
+  (`ema_4`, `ema_9`, `ema_12`, `ema_200`). Column lists come from
   `indicators.indicator_columns(params)`, not the fixed constant, so a new
   period is selectable in Studio with no app edit.
+- **Computed and drawn are different lists.** `IndicatorParams.ema_periods`
+  says what exists as a column; `studio/charts.py:CHART_EMA_PERIODS`
+  (4, 12, 200) says what the chart draws. EMA 9 is in the first and not the
+  second — it is the above-VWAP exit line, read by a rule rather than by
+  eye. Never drop a period from the params to keep it off the chart: a rule
+  referencing a column that was never calculated fails closed and the
+  scenario silently stops firing.
 - Chart figures are built by `studio/charts.py`, not inline in `app.py`, so
   the encoding can be tested without a browser. Its palette is the validated
   reference instance: EMAs ride an ordinal single-hue ramp (one measure,

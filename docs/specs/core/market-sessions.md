@@ -196,7 +196,7 @@ Default periods are bar counts at the data resolution:
 
 | Indicator | Periods | Span at 5-min |
 |---|---|---|
-| EMA | 9, 12, 200 | 45 min, 60 min, **1000 min** |
+| EMA | 4, 9, 12, 200 | 20 min, 45 min, 60 min, **1000 min** |
 | MACD | 12/26/9 | 60 / 130 / 45 min |
 | SMA | 10, 30 | 50 / 150 min |
 
