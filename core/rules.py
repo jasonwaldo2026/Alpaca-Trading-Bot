@@ -30,7 +30,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import pandas as pd
 
-from core.indicators import IndicatorParams, add_indicators
+from core.alerts import AlertTemplate
+from core.indicators import IndicatorParams, add_indicators, indicator_columns
 from core.persistence import consecutive_true
 
 # Operators that compare the latest bar only.
@@ -167,6 +168,10 @@ class Rule:
     params: IndicatorParams = field(default_factory=IndicatorParams)
     description: str = ""
 
+    #: What to send when this rule matches. None means "detect but do not
+    #: notify" — useful while a scenario is still being tuned.
+    alert: Optional[AlertTemplate] = None
+
     def validate(self) -> None:
         if not self.name.strip():
             raise RuleError("Rule needs a non-empty name.")
@@ -177,6 +182,14 @@ class Rule:
             )
         for cond in self.conditions:
             cond.validate()
+        if self.alert is not None:
+            self.alert.validate(self.available_fields())
+
+    def available_fields(self) -> set:
+        """Every column a match on this rule can reference, for templates."""
+        return {"open", "high", "low", "close", "volume"} | set(
+            indicator_columns(self.params)
+        )
 
     def matches(self, bars: pd.DataFrame) -> bool:
         """
@@ -200,7 +213,12 @@ class Rule:
     # ── Serialization — how Studio hands a rule to Scanner ────────────────
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        # asdict() turns the alert into a plain dict already; drop it entirely
+        # when unset so a rule without notifications stays a clean file.
+        if self.alert is None:
+            data.pop("alert", None)
+        return data
 
     def to_json(self, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent)
@@ -212,12 +230,14 @@ class Rule:
         except TypeError as exc:
             raise RuleError(f"Malformed condition in rule: {exc}") from exc
         params = IndicatorParams(**data.get("params", {}))
+        alert_block = data.get("alert")
         rule = cls(
             name=data.get("name", ""),
             conditions=conditions,
             universe=data.get("universe", "default_stocks"),
             params=params,
             description=data.get("description", ""),
+            alert=AlertTemplate.from_dict(alert_block) if alert_block else None,
         )
         rule.validate()
         return rule

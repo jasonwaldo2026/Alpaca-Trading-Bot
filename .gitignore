@@ -26,8 +26,9 @@ bot.log
 .pytest_cache/
 .ruff_cache/
 
-# Scanner run state (see docs/specs/scanner/scheduled-runs.md)
+# Scanner run state
 .scanner-state.json
+.scanner-alerts.json
 
 # OS
 .DS_Store

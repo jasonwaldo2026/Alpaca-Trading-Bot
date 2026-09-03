@@ -112,6 +112,12 @@ Four apps over one shared core. Paper trading only.
   (`ema_9`, `ema_12`, `ema_200`). Column lists come from
   `indicators.indicator_columns(params)`, not the fixed constant, so a new
   period is selectable in Studio with no app edit.
+- An alert scenario is a `Rule` plus an optional `AlertTemplate` in the same
+  JSON file — detection and message together, so adding one is adding a file.
+  Placeholders are validated against `Rule.available_fields()` at save time.
+- Alert dedupe replaces the seen set with what is true *now*, so a lapsed
+  setup that returns alerts again. Accumulating instead would silence it
+  forever.
 - Persistence ("true for N bars in a row") is `Condition.for_bars`, backed by
   `core/persistence.py`. NaN breaks a run, so a warming-up indicator never
   counts as satisfying a condition.

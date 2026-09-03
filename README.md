@@ -61,6 +61,57 @@ tests/                pytest, no network required
 
 ---
 
+## Alerts
+
+Each scenario is one JSON file in `rules/` carrying **both** what to look for
+and what to say. Adding something you want to be told about is adding a
+file — Studio writes them, with a live phone preview.
+
+```json
+{
+  "name": "vwap hold",
+  "conditions": [{"field": "close", "op": ">", "field2": "vwap", "for_bars": 3}],
+  "alert": {
+    "title": "Strong above VWAP",
+    "message": "{symbol} stock is strong and trading above VWAP\n\nPrice ${price}  •  VWAP ${vwap}\nSuggested limit: ${limit_price}"
+  }
+}
+```
+
+Placeholders: `{symbol}`, `{price}`, `{limit_price}`, `{rule}`, `{session}`,
+`{time}`, plus every indicator column the rule produces (`vwap`, `rsi`,
+`roc`, `rvol`, `ema_9`, `macd_hist`, …). A typo is caught when the scenario
+is saved, not when the alert should have fired.
+
+```bash
+export PUSHOVER_TOKEN=... PUSHOVER_USER=...
+python -m scanner.cli --watch --extended-hours
+```
+
+Missing credentials disable alerting without crashing. A setup that stays
+true is **one** alert, not one per scan — a lapsed setup that returns alerts
+again, because that is new. State survives restarts.
+
+**The notification link opens Robinhood to the stock page.** It cannot open
+a pre-filled order ticket: Robinhood publishes no deep link for order entry,
+and its third-party policy is explicit that outside apps cannot act in the
+app. From the stock page it is Trade → Buy → Limit. The suggested limit
+price is in the message text instead, and `link_template` is configurable.
+
+### Shipped scenarios
+
+| File | Looks for |
+|---|---|
+| `vwap-hold.json` | Close above VWAP for 3 consecutive 5-minute bars |
+| `vwap-hold-confirmed.json` | The same, plus volume above baseline and EMA9 > EMA12 |
+| `momentum-runner.json` | Up ≥10% in 10 minutes, ≥3x relative volume, above VWAP |
+
+`momentum-runner` covers two of the four momentum criteria. **Low float and
+"spiked in the last 12 months" are not checked** — float is fundamental data
+Alpaca does not serve, and the prior spike needs daily bars as a universe
+filter. The alert message says so. See
+`docs/specs/core/missing-fundamentals.md`.
+
 ## Scanner and Studio
 
 Studio and Scanner are two halves of one workflow:

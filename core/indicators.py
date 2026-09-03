@@ -25,6 +25,8 @@ COL_VWAP = "vwap"
 COL_MACD = "macd"
 COL_MACD_SIGNAL = "macd_signal"
 COL_MACD_HIST = "macd_hist"
+COL_ROC = "roc"
+COL_RVOL = "rvol"
 
 #: Columns that do not depend on configuration. EMA columns are named after
 #: their period (ema_9, ema_200, …) so several can coexist, so the full list
@@ -33,6 +35,7 @@ FIXED_INDICATOR_COLUMNS = (
     COL_SMA_FAST, COL_SMA_SLOW,
     COL_RSI, COL_VOL_SMA, COL_ATR, COL_VWAP,
     COL_MACD, COL_MACD_SIGNAL, COL_MACD_HIST,
+    COL_ROC, COL_RVOL,
 )
 
 
@@ -77,6 +80,10 @@ class IndicatorParams:
 
     rsi_period: int = 14
     volume_sma_period: int = 20
+
+    #: Bars for the rate-of-change window. At 5-minute bars, 2 covers the
+    #: last 10 minutes — "up 10% in 10 minutes" is `roc > 10` with roc_period=2.
+    roc_period: int = 2
     atr_period: int = 14
     macd_fast: int = 12
     macd_slow: int = 26
@@ -94,7 +101,7 @@ class IndicatorParams:
     PERIOD_FIELDS = (
         "sma_fast", "sma_slow", "rsi_period",
         "volume_sma_period", "atr_period", "macd_fast", "macd_slow",
-        "macd_signal",
+        "macd_signal", "roc_period",
     )
 
     def __post_init__(self):
@@ -318,6 +325,41 @@ def vwap(df: pd.DataFrame, anchor: Optional[pd.Series] = None) -> pd.Series:
     return cumulative_pv / cumulative_volume.replace(0, float("nan"))
 
 
+def roc(series: pd.Series, period: int) -> pd.Series:
+    """
+    Rate of change: percent move over the last `period` bars.
+
+    This is the "up 10% in 10 minutes" measure. `period` is bar counts, so
+    the window it covers depends on the resolution — 2 bars is 10 minutes at
+    5-minute bars and 2 minutes at 1-minute bars. Use
+    `IndicatorParams.duration_minutes("roc_period")` to state which is meant.
+
+    Returns percent, so 10.0 means +10%.
+    """
+    if period < 1:
+        raise ValueError(f"roc period must be >= 1; got {period}.")
+    previous = series.shift(period)
+    # A zero or missing prior price has no meaningful percentage change.
+    return (series / previous.replace(0, float("nan")) - 1) * 100
+
+
+def relative_volume(volume: pd.Series, baseline: pd.Series) -> pd.Series:
+    """
+    Volume as a multiple of its baseline: 3.0 means three times normal.
+
+    A ratio rather than a boolean, so a rule can ask for `rvol > 3` instead
+    of only "above average". When the baseline is session-aware (see
+    `volume_sma_by_session`) this compares a pre-market bar against
+    pre-market volume rather than against the regular session.
+
+    Note this is volume *per bar* against recent bars — not the same as the
+    "RVOL" on a scanner screen, which compares the day's cumulative volume
+    against the same time of day over previous days. See
+    docs/specs/core/relative-volume.md.
+    """
+    return volume / baseline.replace(0, float("nan"))
+
+
 def volume_sma_by_session(
     volume: pd.Series, sessions: pd.Series, period: int
 ) -> pd.Series:
@@ -391,6 +433,8 @@ def add_indicators(
         )
     out[COL_ATR] = atr(out, params.atr_period)
     out[COL_VWAP] = vwap(out, anchor)
+    out[COL_ROC] = roc(out["close"], params.roc_period)
+    out[COL_RVOL] = relative_volume(out["volume"], out[COL_VOL_SMA])
 
     macd_result = macd(
         out["close"], params.macd_fast, params.macd_slow, params.macd_signal

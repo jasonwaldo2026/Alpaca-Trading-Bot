@@ -11,6 +11,7 @@ previews here behaves identically when the scanner runs it on a schedule.
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
@@ -20,6 +21,7 @@ from core.client import AlpacaClient, Credentials
 from core.data import MarketDataFetcher
 from core.sessions import session_day_series
 from core.indicators import IndicatorParams, add_indicators, indicator_columns
+from core.alerts import AlertError, AlertTemplate, build_context
 from core.rules import VALID_OPS, Condition, Rule, RuleError
 from scanner.engine import Scanner
 
@@ -77,6 +79,18 @@ def _current_params() -> IndicatorParams:
     )
 
 
+def _current_alert() -> Optional[AlertTemplate]:
+    if not st.session_state.get("alert_enabled", True):
+        return None
+    return AlertTemplate(
+        title=st.session_state.alert_title,
+        message=st.session_state.alert_message,
+        priority=int(st.session_state.alert_priority),
+        limit_offset_pct=float(st.session_state.alert_limit_offset) / 100,
+        link_template=st.session_state.alert_link,
+    )
+
+
 def _build_rule() -> Rule:
     return Rule(
         name=st.session_state.rule_name,
@@ -84,6 +98,7 @@ def _build_rule() -> Rule:
         universe=st.session_state.rule_universe,
         conditions=[_to_condition(r) for r in st.session_state.conditions],
         params=_current_params(),
+        alert=_current_alert(),
     )
 
 
@@ -201,6 +216,64 @@ if st.button("➕ Add condition"):
     st.session_state.conditions.append(_blank_condition())
     st.rerun()
 
+# ── Alert ────────────────────────────────────────────────────────────────────
+
+st.divider()
+st.subheader("Alert")
+st.caption(
+    "What gets sent to your phone when this scenario fires. Placeholders in "
+    "`{braces}` are filled from the match."
+)
+
+st.checkbox(
+    "Send a notification when this matches", value=True, key="alert_enabled",
+    help="Leave off to detect a scenario while you are still tuning it.",
+)
+
+if st.session_state.alert_enabled:
+    a1, a2 = st.columns([1, 1])
+    with a1:
+        st.text_input("Title", value="Strong above VWAP", key="alert_title")
+        st.text_area(
+            "Message",
+            value=(
+                "{symbol} stock is strong and trading above VWAP\n\n"
+                "Price ${price}  •  VWAP ${vwap}\n"
+                "Suggested limit: ${limit_price}"
+            ),
+            key="alert_message", height=150,
+        )
+    with a2:
+        st.selectbox(
+            "Priority", [-1, 0, 1], index=1, key="alert_priority",
+            format_func=lambda p: {
+                -1: "Quiet — no sound",
+                0: "Normal",
+                1: "High — bypasses quiet hours",
+            }[p],
+        )
+        st.number_input(
+            "Suggested limit, % above price", 0.0, 5.0, 0.1, step=0.05,
+            key="alert_limit_offset",
+            help="Puts a marketable limit price in the message. It is a "
+                 "suggestion in text — nothing is ordered for you.",
+        )
+        st.text_input(
+            "Link template", value="https://robinhood.com/stocks/{symbol}",
+            key="alert_link",
+            help="Tapping the notification opens this. Robinhood publishes no "
+                 "deep link to a pre-filled order ticket, so this lands on the "
+                 "stock page: Trade → Buy → set order type to Limit.",
+        )
+
+    with st.expander("Available placeholders"):
+        st.code(
+            "  ".join(sorted(_build_rule().available_fields()
+                             | {"symbol", "price", "limit_price", "rule",
+                                "session", "time"})),
+            language="text",
+        )
+
 # ── Validation and preview ───────────────────────────────────────────────────
 
 st.divider()
@@ -208,11 +281,25 @@ st.divider()
 try:
     rule = _build_rule()
     rule.validate()
-except RuleError as exc:
-    st.error(f"Rule is not valid: {exc}")
+except (RuleError, AlertError) as exc:
+    st.error(f"Not valid: {exc}")
     st.stop()
 
 st.success(f"**{rule.name}** — `{rule.describe()}`")
+
+if rule.alert:
+    sample = {name: 100.0 for name in rule.available_fields()}
+    sample.update({"vwap": 183.64, "rsi": 61.2, "atr": 1.43,
+                   "ema_9": 184.02, "ema_12": 183.71, "ema_200": 179.80})
+    preview = rule.alert.render(build_context(
+        "NVDA", 184.21, rule.name, rule.alert, sample,
+        session="regular", time_label="14:35 UTC",
+    ))
+    with st.container(border=True):
+        st.caption("Phone preview")
+        st.markdown(f"**{preview['title']}**")
+        st.text(preview["message"])
+        st.caption(f"🔗 {preview['url_title']} → {preview['url']}")
 
 left, right = st.columns([1, 1])
 
@@ -411,4 +498,13 @@ if existing:
             ]
             st.session_state.rule_name = loaded.name
             st.session_state.rule_description = loaded.description
+            st.session_state.alert_enabled = loaded.alert is not None
+            if loaded.alert:
+                st.session_state.alert_title = loaded.alert.title
+                st.session_state.alert_message = loaded.alert.message
+                st.session_state.alert_priority = loaded.alert.priority
+                st.session_state.alert_limit_offset = (
+                    loaded.alert.limit_offset_pct * 100
+                )
+                st.session_state.alert_link = loaded.alert.link_template
             st.rerun()

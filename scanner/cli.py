@@ -10,13 +10,16 @@ import argparse
 import glob
 import logging
 import sys
+import time
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
 from core.client import AlpacaClient, Credentials
 from core.data import MarketDataFetcher
 from core.rules import RuleError, load_rules
-from core.sessions import SessionConfig
+from core.sessions import DEFAULT_CALENDAR, SessionConfig, session_at
+from scanner.alerts import AlertNotifier
 from scanner.engine import Scanner
 
 DEFAULT_RULE_GLOB = "rules/*.json"
@@ -44,6 +47,18 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--extended-hours", action="store_true",
         help="Include pre-market (04:00) and after-hours (to 20:00) sessions.",
+    )
+    parser.add_argument(
+        "--watch", action="store_true",
+        help="Keep scanning on an interval instead of running once.",
+    )
+    parser.add_argument(
+        "--every", type=int, default=None, metavar="MIN",
+        help="Minutes between scans in --watch mode (default: the bar size).",
+    )
+    parser.add_argument(
+        "--no-alerts", action="store_true",
+        help="Scan and print, but send no phone notifications.",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -82,17 +97,49 @@ def main(argv=None) -> int:
         sessions=sessions,
     )
     symbols = args.symbols.split(",") if args.symbols else None
-    result = scanner.scan(rules, symbols)
+    rules_by_name = {r.name: r for r in rules}
+    notifier = AlertNotifier(transport=None) if args.no_alerts else AlertNotifier.from_env()
+    if notifier.enabled:
+        alerting = sum(1 for r in rules if r.alert is not None)
+        print(f"Alerts on for {alerting} of {len(rules)} rule(s).")
 
-    print(f"\nScanned {result.scanned} symbols against {len(rules)} rule(s).\n")
-    grouped = result.by_rule()
-    if not grouped:
-        print("No matches.")
-    for rule_name, matches in grouped.items():
-        print(f"── {rule_name}  ({len(matches)} match{'es' if len(matches) != 1 else ''})")
-        for match in matches:
-            print(f"   {match}")
-        print()
+    interval = (args.every or args.bar_minutes) * 60
+
+    def one_pass() -> int:
+        result = scanner.scan(rules, symbols)
+        stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        print(f"\n[{stamp}] Scanned {result.scanned} symbols "
+              f"against {len(rules)} rule(s).")
+
+        grouped = result.by_rule()
+        if not grouped:
+            print("No matches.")
+        for rule_name, matches in grouped.items():
+            print(f"── {rule_name}  ({len(matches)} match{'es' if len(matches) != 1 else ''})")
+            for match in matches:
+                print(f"   {match}")
+
+        session = ""
+        if result.matches:
+            session = session_at(
+                datetime.now(timezone.utc), result.matches[0].symbol, DEFAULT_CALENDAR
+            )
+        sent = notifier.notify(result.matches, rules_by_name, session)
+        if sent:
+            print(f"   → {sent} alert(s) sent")
+        return result, sent
+
+    result, _ = one_pass()
+
+    if args.watch:
+        print(f"\nWatching — rescanning every {interval // 60} minute(s). Ctrl-C to stop.")
+        try:
+            while True:
+                time.sleep(interval)
+                result, _ = one_pass()
+        except KeyboardInterrupt:
+            print("\nStopped.")
+            return 0
 
     if result.sparse:
         print(
