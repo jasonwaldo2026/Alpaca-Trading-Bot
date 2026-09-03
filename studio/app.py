@@ -30,6 +30,7 @@ from core.alerts import (
 )
 from core.rules import VALID_OPS, Condition, Rule, RuleError
 from scanner.engine import Scanner
+from studio.charts import ChartOptions, build_chart, palette_for
 
 RULES_DIR = Path("rules")
 
@@ -358,6 +359,98 @@ with right:
         path = RULES_DIR / filename
         path.write_text(rule.to_json())
         st.success(f"Saved {path} — run it with `python -m scanner.cli {path}`")
+
+# ── Charts ───────────────────────────────────────────────────────────────────
+
+st.divider()
+st.subheader("Charts")
+
+
+@st.cache_data(ttl=120)
+def _chart_bars(symbol: str, bar_minutes: int, limit: int):
+    """Bars with indicators, ready to draw. Cached so a grid of four does not
+    refetch on every widget change."""
+    frames = MarketDataFetcher(get_client(), bar_minutes).get_bars(
+        [symbol], limit=limit
+    )
+    raw = frames.get(symbol)
+    if raw is None or raw.empty:
+        return None
+    return add_indicators(
+        raw, _current_params(), anchor=session_day_series(raw.index, symbol)
+    )
+
+
+def _theme() -> str:
+    try:
+        return getattr(st.context.theme, "type", "light") or "light"
+    except Exception:                                    # noqa: BLE001
+        return "light"
+
+
+c1, c2 = st.columns([2, 1])
+with c1:
+    chart_symbols_text = st.text_input(
+        "Symbols", value="NVDA, AAPL, TSLA, AMD", key="chart_symbols",
+        help="One for the single view; the first four fill the grid.",
+    )
+with c2:
+    multi = st.toggle(
+        "Multi-chart (4)", value=False, key="chart_multi",
+        help="Two-by-two grid, stacking to one column on a phone.",
+    )
+
+chart_symbols = [s.strip().upper() for s in chart_symbols_text.split(",") if s.strip()]
+
+o1, o2, o3, o4 = st.columns(4)
+show_emas = o1.checkbox("EMAs", value=True, key="chart_emas")
+show_vwap = o2.checkbox("VWAP", value=True, key="chart_vwap")
+show_macd = o3.checkbox("MACD", value=True, key="chart_macd")
+show_volume = o4.checkbox("Volume", value=True, key="chart_volume")
+
+visible_bars = st.slider(
+    "Bars shown", 20, 240, 60, step=10, key="chart_window",
+    help="The recent region only. A phone screen cannot usefully show 300 bars.",
+)
+
+if get_client() is None:
+    st.info("Add Alpaca credentials to draw charts.")
+elif not chart_symbols:
+    st.info("Enter at least one symbol.")
+else:
+    palette = palette_for(_theme())
+    params = _current_params()
+    # Enough history for the longest EMA, plus the window being displayed.
+    fetch_limit = max(params.min_bars() + visible_bars, 300)
+
+    options = ChartOptions(
+        ema_periods=params.ema_periods if show_emas else (),
+        show_vwap=show_vwap, show_macd=show_macd, show_volume=show_volume,
+        bars=visible_bars, compact=multi,
+    )
+
+    def _draw(symbol: str, container) -> None:
+        frame = _chart_bars(symbol, params.bar_minutes, fetch_limit)
+        if frame is None:
+            container.warning(f"No bars for {symbol}.")
+            return
+        container.plotly_chart(
+            build_chart(frame, symbol, options, palette),
+            use_container_width=True,
+            config={"displayModeBar": False, "scrollZoom": True},
+        )
+
+    if multi:
+        grid = chart_symbols[:4]
+        if len(grid) < 4:
+            st.caption(f"Showing {len(grid)} of 4 — add more symbols to fill the grid.")
+        # Two columns become one on a narrow screen, so each chart is full
+        # width on a phone rather than a quarter of it.
+        left, right = st.columns(2)
+        for i, symbol in enumerate(grid):
+            _draw(symbol, left if i % 2 == 0 else right)
+    else:
+        _draw(chart_symbols[0], st)
 
 # ── Backtest ─────────────────────────────────────────────────────────────────
 

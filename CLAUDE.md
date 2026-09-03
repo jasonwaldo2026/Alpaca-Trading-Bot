@@ -8,7 +8,7 @@ Four apps over one shared core. Paper trading only.
 | `bot/` | Live trading bot — strategies, risk, orders, poll loop. | `python trading_bot.py` |
 | `dashboard/` → `dashboard.py` | Streamlit read-only view of account, positions, charts. | `streamlit run dashboard.py` |
 | `scanner/` | Runs saved rules across a symbol universe. | `python -m scanner.cli` |
-| `studio/` | Streamlit rule builder. Authors the rules the scanner runs. | `streamlit run studio/app.py` |
+| `studio/` | Streamlit rule builder and charts. Authors the rules the scanner runs. | `streamlit run studio/app.py` |
 
 ## Invariants — do not break these
 
@@ -112,6 +112,11 @@ Four apps over one shared core. Paper trading only.
   (`ema_9`, `ema_12`, `ema_200`). Column lists come from
   `indicators.indicator_columns(params)`, not the fixed constant, so a new
   period is selectable in Studio with no app edit.
+- Chart figures are built by `studio/charts.py`, not inline in `app.py`, so
+  the encoding can be tested without a browser. Its palette is the validated
+  reference instance: EMAs ride an ordinal single-hue ramp (one measure,
+  three lookbacks), VWAP takes a contrasting hue plus a dash, and candles use
+  the fixed status pair. Never add a dual axis — stack a panel instead.
 - Oscillation detection needs all three of `efficiency`, `range_pct` and
   `swings`. Efficiency alone cannot tell a 5% swing from a 0.1% wobble, and
   amplitude alone cannot tell a range from a trend.

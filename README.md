@@ -139,6 +139,33 @@ Alternatively maintain `floats.json` by hand (copy `floats.example.json`).
 **Without either, low-float conditions cannot be met** — unknown float fails
 closed, so the scenario simply never fires rather than matching everything.
 
+## Charts
+
+Studio draws candlesticks with the indicators the scenarios actually use:
+EMA 9/12/200, VWAP, MACD, and volume against its moving average. Each
+overlay toggles on or off, and a **Multi-chart (4)** switch swaps the single
+view for a grid — two columns on a desktop, stacking to one on a phone so
+each chart is full width rather than a quarter of it.
+
+The window is the recent region only (60 bars by default, adjustable): a
+phone screen cannot usefully show 300 bars, and the current region is what
+you are deciding on.
+
+A few encoding choices, made deliberately:
+
+- **The EMAs share one hue and differ in lightness** — short is light, long
+  is dark. They are one measure at three lookbacks, not three unrelated
+  series, and the chart should say so before you read the legend. (Four
+  categorical hues also failed the palette's separation floors, which is how
+  the mistake surfaced.)
+- **VWAP is dashed as well as differently coloured**, so identity never
+  rests on colour alone.
+- **The legend covers the price panel only.** MACD, Signal and Volume MA are
+  labelled on their own panels — a shared legend listing them beside the
+  EMAs reads as though they were price overlays too.
+- **No dual axes.** Price, MACD and volume have unrelated scales, so they
+  are stacked panels rather than twinned y-axes.
+
 ## Scanner and Studio
 
 Studio and Scanner are two halves of one workflow:
