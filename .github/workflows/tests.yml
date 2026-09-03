@@ -1,7 +1,10 @@
 name: tests
 
+# Once per change: pull requests run on the PR event, and main runs on
+# push. Unscoped `push` would run every PR commit twice.
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
