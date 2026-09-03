@@ -50,6 +50,8 @@ from bot.strategies import (                                           # noqa: E
     EnhancedSMAStrategy,
     Signal,
     SMAcrossoverStrategy,
+    VwapTrendStrategy,
+    vwap_hold_rule,
 )
 from core.client import AlpacaClient, Credentials                      # noqa: E402
 from core.data import MarketDataFetcher                                # noqa: E402
@@ -59,20 +61,26 @@ __all__ = [
     "AlpacaClient", "BaseStrategy", "BotConfig", "Credentials",
     "EnhancedSMAStrategy", "MarketDataFetcher", "OrderManager",
     "RiskManager", "SessionConfig", "Signal", "SMAcrossoverStrategy",
-    "TradingBot",
+    "TradingBot", "VwapTrendStrategy", "vwap_hold_rule",
 ]
 
 
 if __name__ == "__main__":
     config = BotConfig(
         paper=True,
+
+        # MONITOR reports signals and places no orders — the mode for
+        # learning which alerts are worth acting on. Change to "paper" only
+        # deliberately; see docs/specs/bot/execution-modes.md.
+        execution_mode="monitor",
         stock_symbols=["AAPL", "MSFT", "NVDA", "SPY", "QQQ"],
         crypto_symbols=["BTC/USD", "ETH/USD", "SOL/USD"],
 
         # 5-minute bars across the full extended session (04:00-20:00 ET).
         # Periods below are bar counts at this resolution, which is what
         # "EMA 9 on the 5-minute chart" means to a trader.
-        bar_minutes=5,
+        bar_minutes=5,             # entry chart
+        manage_bar_minutes=1,      # exits checked on 1-minute bars
         sessions=SessionConfig.extended(),
         bar_limit=300,             # EMA(200) needs 202; 300 leaves headroom
 
@@ -104,4 +112,7 @@ if __name__ == "__main__":
         max_total_exposure=0.80,
         poll_interval_seconds=60,
     )
-    TradingBot(config, strategy=EnhancedSMAStrategy()).run()
+    # VwapTrendStrategy is the one under evaluation: enter when price has
+    # held above VWAP for three bars, exit on a close below the 9 EMA
+    # (checked on 1-minute bars) with an ATR stop beneath it.
+    TradingBot(config, strategy=VwapTrendStrategy()).run()

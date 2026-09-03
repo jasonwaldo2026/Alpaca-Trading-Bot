@@ -20,6 +20,10 @@ Four apps over one shared core. Paper trading only.
    The dependency arrow points one way. A test asserts this.
 3. **`paper=True` stays true.** Nothing in this repo should flip Alpaca to
    live trading. If a task seems to require it, stop and ask.
+   `BotConfig.execution_mode` defaults to `"monitor"`, which computes and
+   reports signals but never sends an order. Do not change that default:
+   the bot is currently used to generate alerts for manual trading, not to
+   trade. See `docs/specs/bot/execution-modes.md`.
 4. **Studio and Scanner share `core/rules.py`.** Studio writes rule JSON;
    Scanner reads it. Neither may define its own rule dialect or evaluation
    logic — both call `Rule.matches()`. A strategy belongs in a rule wherever
@@ -73,7 +77,16 @@ Four apps over one shared core. Paper trading only.
   `BotConfig.indicator_params()` or a `Rule.params` — never construct one
   ad hoc in app code, or the apps will silently disagree.
 - Strategies subclass `BaseStrategy` in `bot/strategies.py` and return
-  `List[Signal]`.
+  `List[Signal]`. `generate_signals()` takes optional `positions` and
+  `manage_bars` for strategies that manage open positions on a finer
+  timeframe.
+- **A live strategy must share the objects the backtest measured.**
+  `VwapTrendStrategy` takes a `core.rules.Rule` and a
+  `core.backtest.ExitPolicy` rather than reimplementing the logic — a
+  reimplementation could drift from the numbers that justified trading it,
+  and nothing would catch the drift.
+- Management bars are fetched for **held symbols only**. One or two symbols
+  at 1-minute resolution is cheap; the whole watchlist would not be.
 - Credentials are resolved by `core/client.py:Credentials` — `.from_env()`
   for CLI apps, `.from_streamlit(st.secrets)` for Streamlit ones. Do not read
   `os.getenv("ALPACA_...")` directly in an app.

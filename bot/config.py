@@ -13,6 +13,19 @@ from core.sessions import SessionCalendar, SessionConfig
 from core import universe
 
 
+#: Execution modes.
+#:
+#: MONITOR is the default and the safe one: the bot computes signals, logs
+#: them, and alerts — but never sends an order. It is the mode for learning
+#: which alerts are worth acting on before any money moves.
+#:
+#: PAPER places real Alpaca paper orders. Switching to it is a deliberate
+#: decision, which is why it is not the default.
+MODE_MONITOR = "monitor"
+MODE_PAPER = "paper"
+EXECUTION_MODES = (MODE_MONITOR, MODE_PAPER)
+
+
 @dataclass
 class BotConfig:
     """All tunable parameters in one place. Edit here or pull from env vars."""
@@ -21,6 +34,11 @@ class BotConfig:
     api_key: str = field(default_factory=lambda: os.getenv("ALPACA_API_KEY", ""))
     api_secret: str = field(default_factory=lambda: os.getenv("ALPACA_API_SECRET", ""))
     paper: bool = True  # ← switch to False only when you're fully ready
+
+    # How signals are acted on. "monitor" computes and reports signals but
+    # never places an order; "paper" sends Alpaca paper orders. Monitor is
+    # the default so running the bot cannot trade by accident.
+    execution_mode: str = MODE_MONITOR
 
     # Watchlists
     stock_symbols: List[str] = field(
@@ -88,6 +106,15 @@ class BotConfig:
     # 60 (hourly) gives 7 bars per regular-hours day; 5 gives 78.
     bar_minutes: int = 5
 
+    # Resolution used to manage an open position. Finer than bar_minutes so
+    # an adverse move is noticed within a minute rather than up to five.
+    # None disables the second fetch and manages exits on the entry frame.
+    #
+    # Note this changes what the exit EMA means: EMA(9) spans 9 minutes on
+    # 1-minute bars and 45 on 5-minute ones — a tighter exit, not merely a
+    # faster one.
+    manage_bar_minutes: Optional[int] = 1
+
     # How to interpret the indicator periods above when bar_minutes changes.
     #
     #   None (default) — periods are bar counts at bar_minutes. "MACD 12/26/9
@@ -106,6 +133,23 @@ class BotConfig:
     # Polling
     poll_interval_seconds: int = 60   # how often the bot cycles
     bar_limit: int = 300              # must cover min_bars(); EMA(200) binds
+
+    def is_monitor_only(self) -> bool:
+        return self.execution_mode == MODE_MONITOR
+
+    def manage_params(self, ema_period: int) -> IndicatorParams:
+        """
+        Indicator periods for the management timeframe.
+
+        Only the exit EMA and ATR are needed there, so this is deliberately
+        small — computing a 200-period EMA on 1-minute bars for every held
+        symbol would cost far more than it informs.
+        """
+        return IndicatorParams(
+            ema_periods=(ema_period,),
+            atr_period=self.atr_period,
+            bar_minutes=self.manage_bar_minutes or self.bar_minutes,
+        )
 
     def indicator_params(self) -> IndicatorParams:
         """
@@ -154,10 +198,29 @@ class BotConfig:
         and the bot looks like it is running fine while never trading. That
         is the worst failure mode available, so it is checked here.
         """
+        if self.execution_mode not in EXECUTION_MODES:
+            raise ValueError(
+                f"execution_mode must be one of {EXECUTION_MODES}; "
+                f"got {self.execution_mode!r}."
+            )
+
         if self.bar_minutes <= 0 or 1440 % self.bar_minutes:
             raise ValueError(
                 f"bar_minutes must divide evenly into 1440; got {self.bar_minutes}."
             )
+
+        if self.manage_bar_minutes is not None:
+            if 1440 % self.manage_bar_minutes:
+                raise ValueError(
+                    f"manage_bar_minutes must divide evenly into 1440; "
+                    f"got {self.manage_bar_minutes}."
+                )
+            if self.manage_bar_minutes > self.bar_minutes:
+                raise ValueError(
+                    f"manage_bar_minutes ({self.manage_bar_minutes}) must be no "
+                    f"coarser than bar_minutes ({self.bar_minutes}), or exits "
+                    f"would be noticed later than entries."
+                )
 
         needed = self.required_bar_limit()
         if self.bar_limit < needed:

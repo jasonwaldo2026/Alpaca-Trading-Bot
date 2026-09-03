@@ -258,6 +258,24 @@ See `docs/specs/studio/vwap-trend-strategy.md`.
 
 ---
 
+## Monitor mode
+
+**The bot does not trade by default.** `BotConfig.execution_mode` is
+`"monitor"`: signals are computed, risk-checked, and logged — no order is
+sent.
+
+```
+WARNING ALERT [monitor] BUY AAPL @ $184.2100  (would size $4,812.50)
+        — Held above VWAP for 3 bars (+0.31% vs VWAP)
+```
+
+Risk checks still run, so the alert reports what would actually have been
+traded, at the size it would have been. Switch to `execution_mode="paper"`
+to place Alpaca paper orders — a deliberate change, not a default.
+
+See `docs/specs/bot/execution-modes.md`, which also lists promotion criteria
+worth deciding before flipping that switch.
+
 ## Bot strategy
 
 **EnhancedSMAStrategy** (default) needs three confirmations to fire:
@@ -272,6 +290,17 @@ dollar_risk = portfolio × risk_per_trade_pct     (default 1%)
 stop_dist   = ATR × atr_risk_multiplier          (default 1.5×)
 notional    = (dollar_risk / stop_dist) × price  capped at max_position_pct
 ```
+
+**VwapTrendStrategy** is the strategy currently under evaluation, and the
+default in `trading_bot.py`:
+
+- **Entry** — close above VWAP for three consecutive 5-minute bars
+- **Exit** — close below the 9 EMA, checked on **1-minute** bars so an
+  adverse move is caught within a minute rather than up to five
+- **Floor** — ATR stop beneath the entry, against gaps
+
+It takes the same `Rule` and `ExitPolicy` objects the Studio backtest
+measures, so live behavior and backtested behavior cannot drift apart.
 
 `SMAcrossoverStrategy` (SMA only) is kept for A/B comparison:
 ```python
