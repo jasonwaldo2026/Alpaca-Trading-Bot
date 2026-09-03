@@ -22,7 +22,6 @@ from core.indicators import (
     add_indicators,
     ema,
     ema_column,
-    indicator_columns,
     macd,
     typical_price,
     vwap,
