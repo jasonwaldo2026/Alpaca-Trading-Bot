@@ -35,6 +35,26 @@ python -m scanner.cli            # scan with rules/*.json
 streamlit run studio/app.py      # build a new rule
 ```
 
+### 4. Open Studio on your phone
+
+Streamlit runs on the computer; the phone is just a browser pointed at it.
+When Studio starts it prints two addresses:
+
+```
+Local URL:   http://localhost:8501
+Network URL: http://192.168.1.23:8501
+```
+
+`localhost` only works on the computer itself. On the phone, connected to
+the **same Wi-Fi**, open the **Network URL**. If nothing loads, the
+computer's firewall is the usual reason — allow inbound connections to
+Python, or start Studio with `--server.port 8501` and allow that port.
+
+Away from home Wi-Fi, deploy the repository to Streamlit Community Cloud
+(free), set the main file to `studio/app.py`, and paste the contents of
+your `.env` into the app's Secrets as `KEY = "value"` lines. Add the app
+to your home screen and it opens like an app.
+
 ---
 
 ## Layout

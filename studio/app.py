@@ -9,10 +9,19 @@ with its own logic — it calls core.rules and scanner.engine, so a rule that
 previews here behaves identically when the scanner runs it on a schedule.
 """
 
+import sys
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+# `streamlit run studio/app.py` puts studio/ on sys.path, not the repository
+# root, so `import core` fails and the page never renders. Put the root
+# first, before any project import. ROOT also anchors the rules/ and
+# floats.json paths, so Studio works from any working directory.
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import pandas as pd
 import streamlit as st
@@ -44,9 +53,9 @@ from studio.charts import (
 
 # Same credential path as the CLI apps: .env first, Streamlit secrets as the
 # hosted alternative. Also picks up FMP_API_KEY for the float provider.
-load_dotenv()
+load_dotenv(ROOT / ".env")
 
-RULES_DIR = Path("rules")
+RULES_DIR = ROOT / "rules"
 
 # Fields a condition can reference: raw OHLCV plus every indicator column
 # the current params produce (EMA columns are named after their periods).
@@ -65,7 +74,7 @@ def get_client():
 def get_floats():
     """Same float source the scanner CLI picks by default: floats.json if
     present, else FMP when a key is configured, else nothing."""
-    return load_provider(Path("floats.json"))
+    return load_provider(ROOT / "floats.json")
 
 
 
