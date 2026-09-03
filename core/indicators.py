@@ -10,7 +10,7 @@ All functions are pure: DataFrame/Series in, Series out, no I/O.
 """
 
 from dataclasses import dataclass, replace
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Tuple
 
 import pandas as pd
 
@@ -18,8 +18,6 @@ import pandas as pd
 # constants rather than hardcoding strings, so a rename stays mechanical.
 COL_SMA_FAST = "sma_fast"
 COL_SMA_SLOW = "sma_slow"
-COL_EMA_FAST = "ema_fast"
-COL_EMA_SLOW = "ema_slow"
 COL_RSI = "rsi"
 COL_VOL_SMA = "vol_sma"
 COL_ATR = "atr"
@@ -28,12 +26,32 @@ COL_MACD = "macd"
 COL_MACD_SIGNAL = "macd_signal"
 COL_MACD_HIST = "macd_hist"
 
-INDICATOR_COLUMNS = (
+#: Columns that do not depend on configuration. EMA columns are named after
+#: their period (ema_9, ema_200, …) so several can coexist, so the full list
+#: is per-params — use indicator_columns().
+FIXED_INDICATOR_COLUMNS = (
     COL_SMA_FAST, COL_SMA_SLOW,
-    COL_EMA_FAST, COL_EMA_SLOW,
     COL_RSI, COL_VOL_SMA, COL_ATR, COL_VWAP,
     COL_MACD, COL_MACD_SIGNAL, COL_MACD_HIST,
 )
+
+
+def ema_column(period: int) -> str:
+    """Column name for an EMA of a given period: 9 -> 'ema_9'."""
+    return f"ema_{period}"
+
+
+def indicator_columns(params: "IndicatorParams") -> Tuple[str, ...]:
+    """
+    Every column add_indicators() writes for these params.
+
+    Studio's field picker and the scanner's reported values both derive from
+    this, so adding an EMA period makes it selectable everywhere with no app
+    edit.
+    """
+    return FIXED_INDICATOR_COLUMNS + tuple(
+        ema_column(p) for p in params.ema_periods
+    )
 
 # OHLCV columns every fetcher must supply before indicators can be computed.
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
@@ -51,8 +69,12 @@ class IndicatorParams:
 
     sma_fast: int = 10
     sma_slow: int = 30
-    ema_fast: int = 9
-    ema_slow: int = 21
+
+    #: EMA periods, one column each (ema_9, ema_12, ema_200). 9 and 12 are
+    #: fast intraday averages; 200 is the long-trend reference every charting
+    #: platform draws. Order does not matter.
+    ema_periods: Tuple[int, ...] = (9, 12, 200)
+
     rsi_period: int = 14
     volume_sma_period: int = 20
     atr_period: int = 14
@@ -70,10 +92,22 @@ class IndicatorParams:
     #: Period fields, for rescaling and validation. Not every field on this
     #: dataclass is a period, so they are named rather than inferred.
     PERIOD_FIELDS = (
-        "sma_fast", "sma_slow", "ema_fast", "ema_slow", "rsi_period",
+        "sma_fast", "sma_slow", "rsi_period",
         "volume_sma_period", "atr_period", "macd_fast", "macd_slow",
         "macd_signal",
     )
+
+    def __post_init__(self):
+        # Rules deserialize from JSON, where a tuple becomes a list. A list
+        # would make this dataclass unhashable, and the scanner uses it as a
+        # cache key, so coerce and sort for a stable identity.
+        object.__setattr__(
+            self, "ema_periods", tuple(sorted(int(p) for p in self.ema_periods))
+        )
+        if any(p < 2 for p in self.ema_periods):
+            raise ValueError(
+                f"EMA periods must be >= 2; got {self.ema_periods}."
+            )
 
     def min_bars(self) -> int:
         """
@@ -86,7 +120,7 @@ class IndicatorParams:
         """
         return max(
             self.sma_slow,
-            self.ema_slow,
+            max(self.ema_periods) if self.ema_periods else 0,
             self.rsi_period,
             self.volume_sma_period,
             self.atr_period,
@@ -117,6 +151,9 @@ class IndicatorParams:
             name: max(2, round(getattr(self, name) * factor))
             for name in self.PERIOD_FIELDS
         }
+        scaled["ema_periods"] = tuple(
+            max(2, round(p * factor)) for p in self.ema_periods
+        )
         return replace(self, bar_minutes=bar_minutes, **scaled)
 
     def duration_minutes(self, field: str) -> int:
@@ -126,6 +163,10 @@ class IndicatorParams:
                 f"{field!r} is not a period. Known: {', '.join(self.PERIOD_FIELDS)}"
             )
         return getattr(self, field) * self.bar_minutes
+
+    def ema_duration_minutes(self, period: int) -> int:
+        """Wall-clock span of one EMA period."""
+        return period * self.bar_minutes
 
     def describe(self) -> str:
         """Human-readable summary — periods with their wall-clock meaning."""
@@ -339,8 +380,8 @@ def add_indicators(
     out = df.copy()
     out[COL_SMA_FAST] = sma(out["close"], params.sma_fast)
     out[COL_SMA_SLOW] = sma(out["close"], params.sma_slow)
-    out[COL_EMA_FAST] = ema(out["close"], params.ema_fast)
-    out[COL_EMA_SLOW] = ema(out["close"], params.ema_slow)
+    for period in params.ema_periods:
+        out[ema_column(period)] = ema(out["close"], period)
     out[COL_RSI] = rsi(out["close"], params.rsi_period)
     if sessions is None:
         out[COL_VOL_SMA] = sma(out["volume"], params.volume_sma_period)

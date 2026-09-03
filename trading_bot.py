@@ -53,11 +53,13 @@ from bot.strategies import (                                           # noqa: E
 )
 from core.client import AlpacaClient, Credentials                      # noqa: E402
 from core.data import MarketDataFetcher                                # noqa: E402
+from core.sessions import SessionConfig                                # noqa: E402
 
 __all__ = [
     "AlpacaClient", "BaseStrategy", "BotConfig", "Credentials",
     "EnhancedSMAStrategy", "MarketDataFetcher", "OrderManager",
-    "RiskManager", "Signal", "SMAcrossoverStrategy", "TradingBot",
+    "RiskManager", "SessionConfig", "Signal", "SMAcrossoverStrategy",
+    "TradingBot",
 ]
 
 
@@ -66,14 +68,33 @@ if __name__ == "__main__":
         paper=True,
         stock_symbols=["AAPL", "MSFT", "NVDA", "SPY", "QQQ"],
         crypto_symbols=["BTC/USD", "ETH/USD", "SOL/USD"],
+
+        # 5-minute bars across the full extended session (04:00-20:00 ET).
+        # Periods below are bar counts at this resolution, which is what
+        # "EMA 9 on the 5-minute chart" means to a trader.
+        bar_minutes=5,
+        sessions=SessionConfig.extended(),
+        bar_limit=300,             # EMA(200) needs 202; 300 leaves headroom
+
+        # Set to DataFeed.SIP if your Alpaca plan includes the consolidated
+        # tape. The default (IEX) is thin in pre-market — many 5-minute
+        # windows contain no trades and so produce no bar at all.
+        data_feed=None,
+
         # SMA
         sma_fast=10,
         sma_slow=30,
+        # EMA — 9 and 12 for intraday momentum, 200 for the long trend
+        ema_periods=(9, 12, 200),
+        # MACD
+        macd_fast=12,
+        macd_slow=26,
+        macd_signal=9,
         # RSI confirmation
         rsi_period=14,
         rsi_overbought=70.0,
         rsi_oversold=30.0,
-        # Volume confirmation
+        # Volume confirmation (per session when extended hours are on)
         volume_sma_period=20,
         # ATR position sizing
         atr_period=14,

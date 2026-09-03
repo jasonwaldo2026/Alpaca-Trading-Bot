@@ -82,7 +82,17 @@ Four apps over one shared core. Paper trading only.
   regular hours".
 - Cadence is one scan per *completed* bar. At hourly bars: 7/day regular
   hours, 11 with after-hours, 24 for crypto. At 5-minute bars: 78/day regular
-  hours. `core/sessions.py:scan_times()` generates them.
+  hours, 192 across the full extended session (04:06 → 20:01 ET), which is
+  the shipped default. `core/sessions.py:scan_times()` generates them.
+- **Alpaca builds bars from trades, so a window with no trades yields no
+  bar.** Pre-market series are sparse, which stretches every rolling window
+  beyond its nominal span. `core/data.py:bar_coverage()` measures it. The
+  usual amplifier is the data feed: unset means IEX (one venue, thin
+  pre-market); `DataFeed.SIP` is the consolidated tape and needs a paid plan.
+- EMA periods are a tuple (`ema_periods=(9, 12, 200)`), one column each
+  (`ema_9`, `ema_12`, `ema_200`). Column lists come from
+  `indicators.indicator_columns(params)`, not the fixed constant, so a new
+  period is selectable in Studio with no app edit.
 - Changing `bar_minutes` changes what the indicator periods mean —
   `sma_slow=30` is 30 hours of hourly bars but 150 minutes of 5-minute bars.
   Say so explicitly when changing it; do not treat it as a tuning knob.

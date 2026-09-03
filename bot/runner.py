@@ -32,7 +32,9 @@ class TradingBot:
         config.validate()
         self.config = config
         self.client = AlpacaClient(config.credentials())
-        self.data = MarketDataFetcher(self.client, config.bar_minutes)
+        self.data = MarketDataFetcher(
+            self.client, config.bar_minutes, feed=config.data_feed
+        )
         self.strategy = strategy or EnhancedSMAStrategy()
         self.risk = RiskManager(config)
         self.orders = OrderManager(self.client, config)

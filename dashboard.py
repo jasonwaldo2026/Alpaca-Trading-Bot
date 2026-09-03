@@ -109,7 +109,7 @@ def compute_indicators(
     df: pd.DataFrame,
     symbol: str,
     sma_fast=10, sma_slow=30, rsi_period=14, vol_sma_period=20, atr_period=14,
-    ema_fast=9, ema_slow=21,
+    ema_periods=(9, 12, 200),
     macd_fast=12, macd_slow=26, macd_signal=9,
     bar_minutes=60,
 ) -> pd.DataFrame:
@@ -123,8 +123,7 @@ def compute_indicators(
     params = IndicatorParams(
         sma_fast=sma_fast,
         sma_slow=sma_slow,
-        ema_fast=ema_fast,
-        ema_slow=ema_slow,
+        ema_periods=tuple(ema_periods),
         rsi_period=rsi_period,
         volume_sma_period=vol_sma_period,
         atr_period=atr_period,
@@ -171,8 +170,15 @@ with st.sidebar:
     atr_period     = st.slider("ATR period",        5,  30, 14)
 
     st.caption("EMA / MACD")
-    ema_fast       = st.slider("Fast EMA period",   3,  50,  9)
-    ema_slow       = st.slider("Slow EMA period",   5, 100, 21)
+    ema_text       = st.text_input("EMA periods", value="9, 12, 200",
+                                   help="Comma-separated; one line per period.")
+    try:
+        ema_periods = tuple(int(p.strip()) for p in ema_text.split(",") if p.strip())
+    except ValueError:
+        ema_periods = ()
+    if not ema_periods:
+        st.error("EMA periods must be comma-separated whole numbers, e.g. 9, 12, 200")
+        st.stop()
     macd_fast      = st.slider("MACD fast",         3,  40, 12)
     macd_slow      = st.slider("MACD slow",         5,  80, 26)
     macd_signal    = st.slider("MACD signal",       2,  30,  9)
@@ -347,10 +353,12 @@ else:
     df = compute_indicators(
         df_raw, selected_symbol,
         sma_fast, sma_slow, rsi_period, vol_sma_period, atr_period,
-        ema_fast, ema_slow, macd_fast, macd_slow, macd_signal, bar_minutes,
+        ema_periods, macd_fast, macd_slow, macd_signal, bar_minutes,
     )
 
     # Determine current signal
+    # A long EMA (200) stays NaN far longer than the rest; requiring it here
+    # would blank the whole panel, so the signal check uses the SMA set only.
     clean = df.dropna(subset=["sma_fast", "sma_slow", "rsi", "vol_sma", "atr"])
     signal_label = "⬜ HOLD — waiting for a confirmed signal"
     signal_color = GREY
@@ -419,15 +427,16 @@ else:
         line=dict(color=YELLOW, width=2, dash="dot"),
     ), row=1, col=1)
 
-    fig.add_trace(go.Scatter(
-        x=ts, y=df["ema_fast"], name=f"Fast EMA ({ema_fast})",
-        line=dict(color="#b48ead", width=1.2),
-    ), row=1, col=1)
-
-    fig.add_trace(go.Scatter(
-        x=ts, y=df["ema_slow"], name=f"Slow EMA ({ema_slow})",
-        line=dict(color="#d08770", width=1.2),
-    ), row=1, col=1)
+    ema_palette = ["#b48ead", "#d08770", "#88c0d0", "#a3be8c", "#ebcb8b"]
+    for i, period in enumerate(sorted(ema_periods)):
+        col = f"ema_{period}"
+        if col not in df.columns:
+            continue
+        fig.add_trace(go.Scatter(
+            x=ts, y=df[col], name=f"EMA {period}",
+            line=dict(color=ema_palette[i % len(ema_palette)],
+                      width=1.6 if period >= 100 else 1.2),
+        ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
         x=ts, y=df["sma_fast"], name=f"Fast SMA ({sma_fast})",
@@ -530,8 +539,9 @@ else:
         vwap_gap = (curr["close"] - curr["vwap"]) / curr["vwap"] * 100
         d1.metric("VWAP (today)", f"${curr['vwap']:,.4f}",
                   delta=f"{vwap_gap:+.2f}% vs price", delta_color="off")
-        d2.metric(f"Fast EMA ({ema_fast})", f"${curr['ema_fast']:,.4f}")
-        d3.metric(f"Slow EMA ({ema_slow})", f"${curr['ema_slow']:,.4f}")
+        shown = [p for p in sorted(ema_periods) if f"ema_{p}" in clean.columns][:2]
+        for col_box, period in zip((d2, d3), shown):
+            col_box.metric(f"EMA {period}", f"${curr[f'ema_{period}']:,.4f}")
         d4.metric("MACD", f"{curr['macd']:,.4f}")
         hist = curr["macd_hist"]
         d5.metric("MACD Signal", f"{curr['macd_signal']:,.4f}",

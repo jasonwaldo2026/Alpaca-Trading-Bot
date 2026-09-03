@@ -32,7 +32,7 @@ CONFIG = BotConfig(
     stock_symbols=["AAPL"], crypto_symbols=[],
     sma_fast=3, sma_slow=5, rsi_period=5,
     volume_sma_period=3, atr_period=3,
-    ema_fast=2, ema_slow=4,
+    ema_periods=(2, 4),
     macd_fast=2, macd_slow=4, macd_signal=2,
     bar_limit=20,
 )

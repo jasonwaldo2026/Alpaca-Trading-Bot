@@ -14,7 +14,6 @@ import pytest
 from zoneinfo import ZoneInfo
 
 from core.indicators import (
-    COL_EMA_FAST,
     COL_MACD,
     COL_MACD_HIST,
     COL_MACD_SIGNAL,
@@ -22,6 +21,8 @@ from core.indicators import (
     IndicatorParams,
     add_indicators,
     ema,
+    ema_column,
+    indicator_columns,
     macd,
     typical_price,
     vwap,
@@ -205,7 +206,7 @@ def test_add_indicators_emits_every_new_column():
         index=pd.date_range("2026-09-02", periods=120, freq="5min", tz="UTC"),
     )
     out = add_indicators(df, IndicatorParams(bar_minutes=5))
-    for col in (COL_EMA_FAST, COL_VWAP, COL_MACD, COL_MACD_SIGNAL, COL_MACD_HIST):
+    for col in (ema_column(9), COL_VWAP, COL_MACD, COL_MACD_SIGNAL, COL_MACD_HIST):
         assert col in out.columns
         assert out[col].notna().any(), f"{col} produced no values"
 
@@ -213,7 +214,7 @@ def test_add_indicators_emits_every_new_column():
 def test_add_indicators_passes_the_vwap_anchor_through():
     df = pd.concat([_day_bars(2, [100.0] * 6), _day_bars(3, [200.0] * 6)])
     params = IndicatorParams(
-        sma_fast=2, sma_slow=3, ema_fast=2, ema_slow=3,
+        sma_fast=2, sma_slow=3, ema_periods=(2, 3),
         rsi_period=2, volume_sma_period=2, atr_period=2,
         macd_fast=2, macd_slow=3, macd_signal=2,
     )
@@ -259,10 +260,16 @@ def test_rescaling_never_produces_a_degenerate_period():
 def test_min_bars_accounts_for_the_macd_signal_chain():
     """MACD needs slow + signal bars — more than any single period."""
     params = IndicatorParams(
-        sma_slow=5, ema_slow=5, rsi_period=5, volume_sma_period=5, atr_period=5,
-        macd_fast=12, macd_slow=26, macd_signal=9,
+        sma_slow=5, ema_periods=(5,), rsi_period=5, volume_sma_period=5,
+        atr_period=5, macd_fast=12, macd_slow=26, macd_signal=9,
     )
     assert params.min_bars() == 26 + 9 + 2
+
+
+def test_min_bars_accounts_for_the_longest_ema():
+    """EMA(200) outlasts the MACD chain and becomes the binding constraint."""
+    params = IndicatorParams(ema_periods=(9, 12, 200))
+    assert params.min_bars() == 202
 
 
 def test_indicators_are_complete_after_min_bars_at_five_minutes():
@@ -276,7 +283,7 @@ def test_indicators_are_complete_after_min_bars_at_five_minutes():
         index=pd.date_range("2026-09-02 13:30", periods=n, freq="5min", tz="UTC"),
     )
     last = add_indicators(df, params).iloc[-1]
-    for col in (COL_EMA_FAST, COL_VWAP, COL_MACD, COL_MACD_SIGNAL, COL_MACD_HIST):
+    for col in (ema_column(9), COL_VWAP, COL_MACD, COL_MACD_SIGNAL, COL_MACD_HIST):
         assert not pd.isna(last[col]), f"{col} still NaN after min_bars()"
 
 

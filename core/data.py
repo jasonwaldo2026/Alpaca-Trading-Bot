@@ -8,12 +8,14 @@ is solved once here: get_bars() always returns {symbol: flat DataFrame}.
 """
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 
 try:
+    from alpaca.data.enums import DataFeed
     from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 except ImportError:  # pragma: no cover - environment guard
@@ -27,6 +29,69 @@ log = logging.getLogger(__name__)
 
 # Alpaca rejects very large symbol batches; sweep in chunks this size.
 MAX_SYMBOLS_PER_REQUEST = 100
+
+#: A gap this many times the bar size suggests missing data rather than a
+#: normal session break.
+GAP_WARN_MULTIPLE = 3
+
+
+@dataclass(frozen=True)
+class BarCoverage:
+    """
+    How complete a bar series actually is.
+
+    Alpaca builds bars from trades: a window with no trades produces **no
+    bar**, not a zero-volume bar. In pre-market that is common, so a series
+    of N bars can span far more wall-clock time than N * bar_minutes. Every
+    rolling indicator is affected — an SMA(30) over sparse 5-minute
+    pre-market bars may reach back hours rather than 150 minutes.
+    """
+
+    bars: int
+    span_minutes: float
+    expected_bars: int
+    largest_gap_minutes: float
+
+    @property
+    def density(self) -> float:
+        """Fraction of the expected bars that actually exist (0.0 - 1.0)."""
+        return self.bars / self.expected_bars if self.expected_bars else 1.0
+
+    def is_sparse(self, threshold: float = 0.8) -> bool:
+        return self.density < threshold
+
+    def describe(self) -> str:
+        return (
+            f"{self.bars} bars over {self.span_minutes:.0f} min "
+            f"({self.density:.0%} of expected); largest gap "
+            f"{self.largest_gap_minutes:.0f} min"
+        )
+
+
+def bar_coverage(df: pd.DataFrame, bar_minutes: int) -> Optional[BarCoverage]:
+    """
+    Measure gaps in a bar series. Returns None if it cannot be measured.
+
+    Use it to explain why an indicator looks stale: thin pre-market tape (or
+    a narrow data feed such as IEX) yields far fewer bars than the clock
+    suggests.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex):
+        return None
+    if len(df) < 2:
+        return None
+
+    stamps = df.index.sort_values()
+    span = (stamps[-1] - stamps[0]).total_seconds() / 60
+    deltas = stamps.to_series().diff().dropna().dt.total_seconds() / 60
+    expected = int(span // bar_minutes) + 1
+
+    return BarCoverage(
+        bars=len(df),
+        span_minutes=span,
+        expected_bars=max(expected, len(df)),
+        largest_gap_minutes=float(deltas.max()) if not deltas.empty else 0.0,
+    )
 
 
 def alpaca_timeframe(bar_minutes: int) -> TimeFrame:
@@ -127,10 +192,17 @@ class MarketDataFetcher:
         client: AlpacaClient,
         bar_minutes: int = DEFAULT_BAR_MINUTES,
         drop_forming: bool = True,
+        feed: Optional[DataFeed] = None,
     ):
         self.client = client
         self.bar_minutes = bar_minutes
         self.drop_forming = drop_forming
+        # Which equity data feed to request. None uses the account default,
+        # which on free and basic plans is IEX — a single venue carrying a
+        # small share of consolidated volume. In pre-market that often means
+        # long stretches with no trades and therefore no bars. DataFeed.SIP
+        # is the consolidated tape and needs a paid Alpaca data plan.
+        self.feed = feed
 
     @property
     def timeframe(self) -> TimeFrame:
@@ -145,7 +217,8 @@ class MarketDataFetcher:
         if not symbols:
             return pd.DataFrame()
         req = StockBarsRequest(
-            symbol_or_symbols=symbols, timeframe=timeframe, limit=limit
+            symbol_or_symbols=symbols, timeframe=timeframe, limit=limit,
+            **({"feed": self.feed} if self.feed else {}),
         )
         bars = self.client.stock_data.get_stock_bars(req)
         return bars.df if hasattr(bars, "df") else pd.DataFrame()

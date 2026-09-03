@@ -86,7 +86,12 @@ At hourly bars:
 - Equities, regular + after-hours: **11 scans/day** — through 20:02 ET
 - Crypto: **24 scans/day**, every hour
 
-At 5-minute bars, regular hours: **78 scans/day**, 09:36 → 16:01 ET.
+At 5-minute bars: **78 scans/day** regular hours (09:36 → 16:01 ET), or
+**192** across the full extended session (04:06 → 20:01 ET) — the shipped
+default.
+
+The first pre-market scan is 04:06, not 04:00: the 04:00–04:05 bar does not
+exist until 04:05, and acting on it before then is the phantom-signal bug.
 
 `core.sessions.scan_times()` generates these, with a delay past each bar
 close that scales with bar size — two minutes for hourly, one for 5-minute
@@ -160,6 +165,47 @@ Consequences the bot handles explicitly rather than silently:
 - A buy sized below one share is skipped and logged.
 - A fractional holding cannot be sold after hours; it is skipped and logged.
 - A signal with no reference price is skipped — there is no safe default limit.
+
+## Data feed and sparse pre-market bars
+
+**Alpaca builds bars from trades. A window with no trades produces no bar at
+all** — not a zero-volume bar, a missing one. So a pre-market series of N
+bars can span far more wall-clock time than `N * bar_minutes`, and every
+rolling indicator over it reaches back further than its period suggests.
+
+Two causes compound:
+
+1. **The feed.** `StockBarsRequest` takes a `feed`; leaving it unset uses the
+   account default, which on free and basic plans is **IEX** — a single venue
+   carrying a small share of consolidated volume. Pre-market IEX activity is
+   thin enough that many 5-minute windows are empty. `DataFeed.SIP` is the
+   consolidated tape and needs a paid Alpaca data plan. Set it via
+   `BotConfig.data_feed` or `--feed sip`.
+2. **Genuine thinness.** Even on SIP, pre-market prints are intermittent for
+   anything but the most active names.
+
+`core.data.bar_coverage()` measures it: bars returned, wall-clock span,
+density against expectation, and largest gap. `ScanResult.sparse` records
+symbols below 80% density, and the CLI prints a note. This is diagnostic, not
+a fix — the tape is what it is; the point is that thin data is visible rather
+than mistaken for a stale bot.
+
+## Indicators at 5-minute resolution
+
+Default periods are bar counts at the data resolution:
+
+| Indicator | Periods | Span at 5-min |
+|---|---|---|
+| EMA | 9, 12, 200 | 45 min, 60 min, **1000 min** |
+| MACD | 12/26/9 | 60 / 130 / 45 min |
+| SMA | 10, 30 | 50 / 150 min |
+
+EMA(200) is the binding constraint on `min_bars()` — 202 bars, so
+`bar_limit` must be at least 243. `BotConfig.validate()` enforces it.
+
+At 1000 minutes of *trading* time, EMA(200) spans slightly more than one
+960-minute extended session. Across sparse pre-market bars it reaches back
+further still, since 200 bars there is more than 1000 minutes of clock.
 
 ## Holidays
 

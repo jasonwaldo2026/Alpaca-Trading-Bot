@@ -16,7 +16,7 @@ def _scanner(fetcher, **kw):
     return Scanner(fetcher, **kw)
 
 
-def _bars(n=120, start=100.0, drift=0.0, seed=1) -> pd.DataFrame:
+def _bars(n=300, start=100.0, drift=0.0, seed=1) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     close = start + np.cumsum(rng.normal(drift, 1.0, n))
     return pd.DataFrame({

@@ -16,14 +16,15 @@ import streamlit as st
 
 from core.client import AlpacaClient, Credentials
 from core.data import MarketDataFetcher
-from core.indicators import INDICATOR_COLUMNS, IndicatorParams
+from core.indicators import IndicatorParams, indicator_columns
 from core.rules import VALID_OPS, Condition, Rule, RuleError
 from scanner.engine import Scanner
 
 RULES_DIR = Path("rules")
 
-# Fields a condition can reference: raw OHLCV plus every indicator column.
-FIELDS = ["close", "open", "high", "low", "volume", *INDICATOR_COLUMNS]
+# Fields a condition can reference: raw OHLCV plus every indicator column
+# the current params produce (EMA columns are named after their periods).
+OHLCV_FIELDS = ["close", "open", "high", "low", "volume"]
 
 st.set_page_config(page_title="Scanner Studio", page_icon="🛠️", layout="wide")
 
@@ -44,19 +45,38 @@ def _to_condition(row: dict) -> Condition:
     return Condition(field=row["field"], op=row["op"], field2=row["field2"])
 
 
+def _parse_ema_periods(text: str):
+    """Read '9, 12, 200' into (9, 12, 200). Invalid entries fall back."""
+    try:
+        periods = tuple(int(p.strip()) for p in text.split(",") if p.strip())
+    except ValueError:
+        return None
+    return periods or None
+
+
+def _current_params() -> IndicatorParams:
+    periods = _parse_ema_periods(st.session_state.get("ema_periods_text", "9, 12, 200"))
+    return IndicatorParams(
+        sma_fast=st.session_state.sma_fast,
+        sma_slow=st.session_state.sma_slow,
+        ema_periods=periods or (9, 12, 200),
+        rsi_period=st.session_state.rsi_period,
+        volume_sma_period=st.session_state.vol_sma_period,
+        atr_period=st.session_state.atr_period,
+        macd_fast=st.session_state.macd_fast,
+        macd_slow=st.session_state.macd_slow,
+        macd_signal=st.session_state.macd_signal,
+        bar_minutes=st.session_state.bar_minutes,
+    )
+
+
 def _build_rule() -> Rule:
     return Rule(
         name=st.session_state.rule_name,
         description=st.session_state.rule_description,
         universe=st.session_state.rule_universe,
         conditions=[_to_condition(r) for r in st.session_state.conditions],
-        params=IndicatorParams(
-            sma_fast=st.session_state.sma_fast,
-            sma_slow=st.session_state.sma_slow,
-            rsi_period=st.session_state.rsi_period,
-            volume_sma_period=st.session_state.vol_sma_period,
-            atr_period=st.session_state.atr_period,
-        ),
+        params=_current_params(),
     )
 
 
@@ -90,6 +110,20 @@ with st.sidebar:
     st.slider("RSI period", 5, 30, 14, key="rsi_period")
     st.slider("Volume SMA", 5, 50, 20, key="vol_sma_period")
     st.slider("ATR period", 5, 30, 14, key="atr_period")
+    st.text_input(
+        "EMA periods", value="9, 12, 200", key="ema_periods_text",
+        help="Comma-separated. Each becomes a selectable field: ema_9, ema_12, …",
+    )
+    st.slider("MACD fast", 3, 40, 12, key="macd_fast")
+    st.slider("MACD slow", 5, 80, 26, key="macd_slow")
+    st.slider("MACD signal", 2, 30, 9, key="macd_signal")
+
+    st.divider()
+    st.selectbox(
+        "Bar size", [5, 15, 30, 60], index=0, key="bar_minutes",
+        format_func=lambda m: f"{m} min" if m < 60 else "1 hour",
+        help="Periods above are bar counts, so their wall-clock span scales with this.",
+    )
 
 # ── Condition builder ────────────────────────────────────────────────────────
 
@@ -105,8 +139,18 @@ if get_client() is None:
 st.subheader("Conditions")
 st.caption("A symbol matches when **every** condition holds on the latest bar.")
 
+if _parse_ema_periods(st.session_state.ema_periods_text) is None:
+    st.error("EMA periods must be comma-separated whole numbers, e.g. `9, 12, 200`.")
+    st.stop()
+
+# Selectable fields follow the current params, so changing the EMA periods
+# immediately changes what a condition can reference.
+FIELDS = OHLCV_FIELDS + list(indicator_columns(_current_params()))
+
 for i, row in enumerate(st.session_state.conditions):
     c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 3, 1])
+    if row["field"] not in FIELDS:
+        FIELDS.append(row["field"])      # keep a loaded rule's field selectable
     row["field"] = c1.selectbox("Field", FIELDS, index=FIELDS.index(row["field"]), key=f"f{i}")
     row["op"] = c2.selectbox("Operator", VALID_OPS, index=VALID_OPS.index(row["op"]), key=f"o{i}")
 
@@ -125,6 +169,8 @@ for i, row in enumerate(st.session_state.conditions):
     if row["mode"] == "value":
         row["value"] = c4.number_input("Value", value=float(row["value"]), key=f"v{i}")
     else:
+        if row["field2"] not in FIELDS:
+            FIELDS.append(row["field2"])
         row["field2"] = c4.selectbox(
             "Field", FIELDS, index=FIELDS.index(row["field2"]), key=f"f2{i}"
         )

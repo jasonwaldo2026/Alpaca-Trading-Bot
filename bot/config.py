@@ -3,13 +3,13 @@
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
 from core.indicators import IndicatorParams
 from core.client import Credentials
-from core.sessions import DEFAULT_BAR_MINUTES, SessionCalendar, SessionConfig
+from core.sessions import SessionCalendar, SessionConfig
 from core import universe
 
 
@@ -40,9 +40,11 @@ class BotConfig:
     sma_fast: int = 10   # fast moving average period (bars)
     sma_slow: int = 30   # slow moving average period (bars)
 
-    # EMA periods (bars)
-    ema_fast: int = 9
-    ema_slow: int = 21
+    # EMA periods (bars) — one column each: ema_9, ema_12, ema_200.
+    # 9 and 12 track intraday momentum; 200 is the long-trend reference.
+    # At 5-minute bars, EMA(200) spans 1000 minutes of *trading* time —
+    # roughly a day and a half of the 04:00-20:00 extended session.
+    ema_periods: Tuple[int, ...] = (9, 12, 200)
 
     # MACD periods (bars) — conventional 12/26/9
     macd_fast: int = 12
@@ -67,8 +69,16 @@ class BotConfig:
     # docs/specs/core/market-sessions.md first: extended hours changes how
     # orders must be placed (limit-only, whole shares) and makes the volume
     # baseline session-relative.
-    sessions: SessionConfig = field(default_factory=SessionConfig)
+    sessions: SessionConfig = field(default_factory=SessionConfig.extended)
     calendar: SessionCalendar = field(default_factory=SessionCalendar)
+
+    # Equity data feed. None uses the account default, which on free and
+    # basic plans is IEX — one venue with a small share of consolidated
+    # volume. Pre-market IEX activity is thin enough that many 5-minute
+    # windows contain no trades and therefore produce no bar at all, which
+    # is the usual reason pre-market data "does not update often".
+    # DataFeed.SIP is the consolidated tape and requires a paid data plan.
+    data_feed: Optional[object] = None
 
     # How far through the reference price to place an extended-hours limit,
     # so it fills against the thin book without unbounded slippage.
@@ -76,7 +86,7 @@ class BotConfig:
 
     # Bar size, in minutes. Must divide evenly into 1440.
     # 60 (hourly) gives 7 bars per regular-hours day; 5 gives 78.
-    bar_minutes: int = DEFAULT_BAR_MINUTES
+    bar_minutes: int = 5
 
     # How to interpret the indicator periods above when bar_minutes changes.
     #
@@ -95,7 +105,7 @@ class BotConfig:
 
     # Polling
     poll_interval_seconds: int = 60   # how often the bot cycles
-    bar_limit: int = 60               # must cover sma_slow + atr/rsi periods
+    bar_limit: int = 300              # must cover min_bars(); EMA(200) binds
 
     def indicator_params(self) -> IndicatorParams:
         """
@@ -115,8 +125,7 @@ class BotConfig:
         params = IndicatorParams(
             sma_fast=self.sma_fast,
             sma_slow=self.sma_slow,
-            ema_fast=self.ema_fast,
-            ema_slow=self.ema_slow,
+            ema_periods=self.ema_periods,
             rsi_period=self.rsi_period,
             volume_sma_period=self.volume_sma_period,
             atr_period=self.atr_period,

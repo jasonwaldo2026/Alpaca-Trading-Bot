@@ -98,17 +98,42 @@ python -m scanner.cli --symbols AAPL,MSFT   # override the universe
 
 ## Market sessions and extended hours
 
-Sessions are regular-hours-only by default. Enable extended hours on
-`BotConfig`:
+**The default is 5-minute bars across the full extended session, 04:00–20:00
+ET** — 192 scans a day, first at 04:06. (The 04:00–04:05 bar does not exist
+until 04:05, so 04:06 is the earliest actionable scan.)
+
+To narrow it:
 
 ```python
 from core.sessions import SessionConfig
 
 BotConfig(
-    sessions=SessionConfig.after_hours(),   # 09:30–20:00 ET
-    # or SessionConfig.extended()           # 04:00–20:00 ET
+    sessions=SessionConfig.regular_only(),  # 09:30–16:00 ET
+    # or SessionConfig.after_hours(),       # 09:30–20:00 ET
+    # default is SessionConfig.extended()   # 04:00–20:00 ET
 )
 ```
+
+### Why pre-market data looks stale
+
+Alpaca builds bars from trades, so **a 5-minute window with no trades
+produces no bar at all** — not an empty bar, a missing one. Pre-market
+series are therefore sparse, and a rolling average over them reaches back
+much further in clock time than its period suggests.
+
+The usual amplifier is the data feed. `BotConfig.data_feed` is unset by
+default, which uses your account's feed — on free and basic plans that is
+**IEX**, one venue with a small share of consolidated volume, and very thin
+before the open. If your plan includes the consolidated tape:
+
+```python
+from alpaca.data.enums import DataFeed
+BotConfig(data_feed=DataFeed.SIP)      # or:  scanner.cli --feed sip
+```
+
+The scanner reports symbols whose bars came back sparse
+(`ScanResult.sparse`), so thin data is visible rather than mistaken for a
+stale bot.
 
 Turning this on changes three things automatically:
 
@@ -174,7 +199,7 @@ volume baseline.
 | Indicator | Notes |
 |---|---|
 | `sma_fast` / `sma_slow` | Simple moving averages |
-| `ema_fast` / `ema_slow` | `adjust=False` recursion, matching charting platforms |
+| `ema_9` / `ema_12` / `ema_200` | One column per period in `ema_periods`; `adjust=False` recursion, matching charting platforms |
 | `rsi` | Wilder's smoothing; NaN rather than 100 when there are no losses |
 | `atr` | EWM true range, captures overnight gaps |
 | `macd` / `macd_signal` / `macd_hist` | Signal is an EMA **of the MACD line**, so it warms up `slow + signal` bars in |

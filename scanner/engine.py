@@ -15,7 +15,7 @@ from typing import Dict, Iterable, List, Optional
 import pandas as pd
 
 from core import universe
-from core.data import MarketDataFetcher
+from core.data import MarketDataFetcher, bar_coverage
 from core.indicators import add_indicators
 from core.rules import Rule
 from core.sessions import (
@@ -52,6 +52,10 @@ class ScanResult:
     matches: List[Match] = field(default_factory=list)
     scanned: int = 0
     skipped: Dict[str, str] = field(default_factory=dict)  # symbol → why
+    #: symbol → coverage description, for series with visible gaps. Thin
+    #: pre-market tape (or a narrow feed like IEX) produces far fewer bars
+    #: than the clock suggests, which stretches every rolling indicator.
+    sparse: Dict[str, str] = field(default_factory=dict)
 
     def by_rule(self) -> Dict[str, List[Match]]:
         out: Dict[str, List[Match]] = {}
@@ -61,10 +65,19 @@ class ScanResult:
 
 
 # Indicator values worth reporting alongside a match.
-_REPORTED = (
-    "rsi", "atr", "vwap", "macd", "macd_signal",
-    "sma_fast", "sma_slow", "ema_fast", "ema_slow", "vol_sma",
+#: Values reported alongside a match. Derived per-rule so a rule's EMA
+#: periods show up automatically.
+_REPORTED_FIXED = (
+    "rsi", "atr", "vwap", "macd", "macd_signal", "sma_fast", "sma_slow",
+    "vol_sma",
 )
+
+
+def _reported_columns(rule: Rule):
+    from core.indicators import ema_column
+    return _REPORTED_FIXED + tuple(
+        ema_column(p) for p in rule.params.ema_periods
+    )
 
 
 class Scanner:
@@ -144,6 +157,11 @@ class Scanner:
                 continue
             result.scanned += 1
 
+            coverage = bar_coverage(df, self.bar_minutes)
+            if coverage and coverage.is_sparse():
+                result.sparse[sym] = coverage.describe()
+                log.debug("Sparse bars for %s: %s", sym, coverage.describe())
+
             for rule in rules:
                 key = (sym, rule.params)
                 if key not in enriched_cache:
@@ -177,7 +195,7 @@ class Scanner:
                                 price=float(curr["close"]),
                                 values={
                                     k: float(curr[k])
-                                    for k in _REPORTED
+                                    for k in _reported_columns(rule)
                                     if k in enriched.columns and not pd.isna(curr[k])
                                 },
                             )

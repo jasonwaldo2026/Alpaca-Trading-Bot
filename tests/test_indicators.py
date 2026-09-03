@@ -26,16 +26,17 @@ from core.indicators import (
 def bars() -> pd.DataFrame:
     """Deterministic pseudo-random OHLCV, long enough for every warmup."""
     rng = np.random.default_rng(42)
-    close = 100 + np.cumsum(rng.normal(0, 1.5, 200))
-    high = close + rng.uniform(0.1, 2.0, 200)
-    low = close - rng.uniform(0.1, 2.0, 200)
+    n = 300  # must exceed IndicatorParams().min_bars(), which EMA(200) drives
+    close = 100 + np.cumsum(rng.normal(0, 1.5, n))
+    high = close + rng.uniform(0.1, 2.0, n)
+    low = close - rng.uniform(0.1, 2.0, n)
     return pd.DataFrame(
         {
-            "open": close + rng.normal(0, 0.5, 200),
+            "open": close + rng.normal(0, 0.5, n),
             "high": high,
             "low": low,
             "close": close,
-            "volume": rng.integers(1_000, 100_000, 200).astype(float),
+            "volume": rng.integers(1_000, 100_000, n).astype(float),
         }
     )
 
@@ -119,7 +120,12 @@ def test_add_indicators_rejects_missing_columns():
 
 
 def test_min_bars_covers_longest_period():
-    params = IndicatorParams(sma_slow=30, rsi_period=14, volume_sma_period=50, atr_period=14)
+    """Isolates the SMA/volume path — EMA and MACD are shortened so they do
+    not become the binding constraint."""
+    params = IndicatorParams(
+        sma_slow=30, rsi_period=14, volume_sma_period=50, atr_period=14,
+        ema_periods=(9,), macd_fast=3, macd_slow=6, macd_signal=3,
+    )
     assert params.min_bars() == 52
 
 

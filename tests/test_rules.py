@@ -11,13 +11,14 @@ from core.rules import Condition, Rule, RuleError
 @pytest.fixture
 def bars() -> pd.DataFrame:
     rng = np.random.default_rng(7)
-    close = 100 + np.cumsum(rng.normal(0, 1.0, 120))
+    n = 300  # must exceed IndicatorParams().min_bars() — EMA(200) is the binder
+    close = 100 + np.cumsum(rng.normal(0, 1.0, n))
     return pd.DataFrame({
         "open": close,
         "high": close + 1.0,
         "low": close - 1.0,
         "close": close,
-        "volume": rng.integers(1_000, 50_000, 120).astype(float),
+        "volume": rng.integers(1_000, 50_000, n).astype(float),
     })
 
 
