@@ -29,14 +29,31 @@ from typing import Any, Dict, Optional, Set
 #: Opens the Robinhood app to the stock's page on iOS (universal link), or
 #: the website otherwise.
 #:
-#: Robinhood publishes no deep link that opens a pre-filled order ticket, and
-#: its third-party connections policy is explicit that outside apps cannot
-#: take action in the app. So this lands on the stock page; from there it is
-#: Trade -> Buy -> switch order type to Limit. The suggested limit price is
-#: put in the message text instead, so it is one glance away.
+#: The locale prefix (/us/en/) is Robinhood's canonical path and is used
+#: deliberately: iOS matches a tapped URL against the app's associated-domain
+#: paths *before* following redirects, so a URL that only works by
+#: redirecting can open Safari instead of the app.
 #:
-#: It is a template so a better link can be swapped in without code changes.
-DEFAULT_LINK_TEMPLATE = "https://robinhood.com/stocks/{symbol}"
+#: The stock page is as deep as Robinhood links go. There is no published
+#: deep link to a buy or order screen, and Robinhood's third-party
+#: connections policy is explicit that outside apps cannot take action in the
+#: app. From here it is one tap: Trade -> Buy -> switch order type to Limit.
+#: The suggested limit price is put in the message text instead.
+#:
+#: This is a template, so alternatives can be tried without code changes —
+#: see ALTERNATIVE_LINK_TEMPLATES.
+DEFAULT_LINK_TEMPLATE = "https://robinhood.com/us/en/stocks/{symbol}/"
+
+#: Undocumented alternatives worth testing on a real device. None of these is
+#: published by Robinhood, so any of them may do nothing, open Safari, or
+#: change without notice — which is exactly why the link is configurable
+#: rather than hardcoded. Tap one and see what the app does.
+ALTERNATIVE_LINK_TEMPLATES = {
+    "stock page (default)": DEFAULT_LINK_TEMPLATE,
+    "short form": "https://robinhood.com/stocks/{symbol}",
+    "custom scheme": "robinhood://stocks/{symbol}",
+    "custom scheme, instrument": "robinhood://instrument/{symbol}",
+}
 
 #: Placeholders always available, regardless of which indicators a rule uses.
 BASE_PLACEHOLDERS = ("symbol", "price", "limit_price", "rule", "session", "time")

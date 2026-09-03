@@ -46,18 +46,36 @@ momentum agreeing, at high priority).
 
 ## The Robinhood link — what it does and does not do
 
-Tapping the notification opens `https://robinhood.com/stocks/{symbol}`,
-which on iOS opens the Robinhood app to that stock via universal link.
+Tapping the notification opens `https://robinhood.com/us/en/stocks/{symbol}/`
+— the stock detail page, which on iOS opens the Robinhood app via universal
+link.
 
-**It cannot open a pre-filled Limit Buy ticket.** Robinhood publishes no
-deep link for order entry, and its third-party connections policy is
-explicit that outside apps cannot take action in the app. From the stock
-page it is Trade → Buy → change order type to Limit.
+**The stock page is as deep as it goes.** There is no published Robinhood
+link to a buy screen or an order ticket, pre-filled or otherwise, and their
+third-party connections policy is explicit that outside apps cannot take
+action in the app. Robinhood's own "buying a stock" article describes the
+flow as: stock detail page → **Trade** → **Buy** → choose Shares / order
+type. So the notification saves the symbol search; it cannot save the taps.
 
-The suggested limit price is therefore put in the *message text*, so it is
-one glance away rather than a calculation. `link_template` is configurable,
-so if a working deep link is ever found it is a settings change rather than
-a code change.
+The suggested limit price goes in the *message text* instead, so it is one
+glance rather than a calculation.
+
+### Why the locale prefix
+
+`/us/en/stocks/AAPL/` is Robinhood's canonical path, and using it is
+deliberate. iOS matches a tapped URL against the app's associated-domain
+paths **before** following any redirect, so a URL that only reaches the
+right page by redirecting can open Safari instead of the app.
+
+### Trying alternatives
+
+`link_template` is configurable, and `core.alerts.ALTERNATIVE_LINK_TEMPLATES`
+lists undocumented forms worth testing on a real device — the short path and
+two `robinhood://` custom-scheme guesses. None of them is published by
+Robinhood, so any may do nothing, open Safari, or break without notice.
+Studio shows them under "Other link forms to try": paste one in and tap a
+real alert to see what your phone actually does. That is a test only you can
+run.
 
 ## What
 

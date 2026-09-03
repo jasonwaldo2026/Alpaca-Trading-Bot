@@ -21,7 +21,13 @@ from core.client import AlpacaClient, Credentials
 from core.data import MarketDataFetcher
 from core.sessions import session_day_series
 from core.indicators import IndicatorParams, add_indicators, indicator_columns
-from core.alerts import AlertError, AlertTemplate, build_context
+from core.alerts import (
+    ALTERNATIVE_LINK_TEMPLATES,
+    DEFAULT_LINK_TEMPLATE,
+    AlertError,
+    AlertTemplate,
+    build_context,
+)
 from core.rules import VALID_OPS, Condition, Rule, RuleError
 from scanner.engine import Scanner
 
@@ -259,12 +265,19 @@ if st.session_state.alert_enabled:
                  "suggestion in text — nothing is ordered for you.",
         )
         st.text_input(
-            "Link template", value="https://robinhood.com/stocks/{symbol}",
-            key="alert_link",
+            "Link template", value=DEFAULT_LINK_TEMPLATE, key="alert_link",
             help="Tapping the notification opens this. Robinhood publishes no "
-                 "deep link to a pre-filled order ticket, so this lands on the "
+                 "deep link to a buy or order screen, so this lands on the "
                  "stock page: Trade → Buy → set order type to Limit.",
         )
+        with st.expander("Other link forms to try"):
+            st.caption(
+                "None of these is published by Robinhood, so any may do "
+                "nothing or open Safari. Paste one above and tap a real "
+                "alert to see what your phone does."
+            )
+            for label, template in ALTERNATIVE_LINK_TEMPLATES.items():
+                st.code(f"{label}:  {template}", language="text")
 
     with st.expander("Available placeholders"):
         st.code(

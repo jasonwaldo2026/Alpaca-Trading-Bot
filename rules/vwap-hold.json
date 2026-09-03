@@ -1,19 +1,35 @@
 {
   "name": "vwap hold",
-  "description": "Price has closed above VWAP for three consecutive 5-minute bars — the core strength signal.",
+  "description": "Price has closed above VWAP for three consecutive 5-minute bars \u2014 the core strength signal.",
   "universe": "sp500_liquid",
   "conditions": [
-    {"field": "close", "op": ">", "field2": "vwap", "for_bars": 3}
+    {
+      "field": "close",
+      "op": ">",
+      "field2": "vwap",
+      "for_bars": 3
+    }
   ],
   "alert": {
     "title": "Strong above VWAP",
-    "message": "{symbol} stock is strong and trading above VWAP\n\nPrice ${price}  •  VWAP ${vwap}\nSuggested limit: ${limit_price}\nRSI {rsi}  •  ATR {atr}",
+    "message": "{symbol} stock is strong and trading above VWAP\n\nPrice ${price}  \u2022  VWAP ${vwap}\nSuggested limit: ${limit_price}\nRSI {rsi}  \u2022  ATR {atr}",
     "priority": 0,
     "limit_offset_pct": 0.001
   },
   "params": {
-    "sma_fast": 10, "sma_slow": 30, "ema_periods": [9, 12, 200],
-    "rsi_period": 14, "volume_sma_period": 20, "atr_period": 14,
-    "macd_fast": 12, "macd_slow": 26, "macd_signal": 9, "bar_minutes": 5
+    "sma_fast": 10,
+    "sma_slow": 30,
+    "ema_periods": [
+      9,
+      12,
+      200
+    ],
+    "rsi_period": 14,
+    "volume_sma_period": 20,
+    "atr_period": 14,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "bar_minutes": 5
   }
 }

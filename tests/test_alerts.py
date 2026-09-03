@@ -83,8 +83,24 @@ def test_suggested_limit_price_sits_above_the_trigger():
 def test_the_link_opens_robinhood_for_that_symbol():
     context = build_context("TSLA", 250.0, "r", VWAP_ALERT)
     payload = VWAP_ALERT.render(context)
-    assert payload["url"] == "https://robinhood.com/stocks/TSLA"
+    assert payload["url"] == "https://robinhood.com/us/en/stocks/TSLA/"
     assert "TSLA" in payload["url_title"]
+
+
+def test_the_link_uses_robinhoods_canonical_locale_path():
+    """iOS matches a tapped URL against the app's associated-domain paths
+    before following redirects, so a URL that only works via a redirect can
+    open Safari instead of the app."""
+    assert DEFAULT_LINK_TEMPLATE == "https://robinhood.com/us/en/stocks/{symbol}/"
+
+
+def test_alternative_link_forms_are_offered_for_testing():
+    """Robinhood publishes none of these, so they must be swappable by
+    config rather than assumed to work."""
+    from core.alerts import ALTERNATIVE_LINK_TEMPLATES
+    assert DEFAULT_LINK_TEMPLATE in ALTERNATIVE_LINK_TEMPLATES.values()
+    for template in ALTERNATIVE_LINK_TEMPLATES.values():
+        assert "{symbol}" in template
 
 
 def test_the_link_template_is_configurable():
