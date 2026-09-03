@@ -1,0 +1,23 @@
+{
+  "name": "oscillator",
+  "description": "A stock cycling up and down rather than trending: several 5% legs so far today, a wide high-low range, and almost no net movement to show for it. The setup for trading the same name repeatedly in a session. This is a mean-reversion signal and the opposite of 'vwap hold' — if both fire on one symbol, trust neither.",
+  "universe": "sp500_liquid",
+  "conditions": [
+    {"field": "swings", "op": ">=", "value": 4},
+    {"field": "range_pct", "op": ">=", "value": 8},
+    {"field": "efficiency", "op": "<=", "value": 0.3},
+    {"field": "rvol", "op": ">=", "value": 1.5}
+  ],
+  "alert": {
+    "title": "Cyclical — trades both ways",
+    "message": "{symbol} is cycling, not trending\n\n{swings} swings of 5%+ today  •  {range_pct}% range\nEfficiency {efficiency} (near 0 = going nowhere net)\nPrice ${price}  •  VWAP ${vwap}\n\nRange trade: the risk is the range breaking. Size for that.",
+    "priority": 0,
+    "limit_offset_pct": 0.001
+  },
+  "params": {
+    "sma_fast": 10, "sma_slow": 30, "ema_periods": [9, 12, 200],
+    "rsi_period": 14, "volume_sma_period": 20, "atr_period": 14,
+    "roc_period": 2, "choppiness_period": 24, "swing_threshold_pct": 5.0,
+    "macd_fast": 12, "macd_slow": 26, "macd_signal": 9, "bar_minutes": 5
+  }
+}

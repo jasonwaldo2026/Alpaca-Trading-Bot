@@ -112,6 +112,9 @@ Four apps over one shared core. Paper trading only.
   (`ema_9`, `ema_12`, `ema_200`). Column lists come from
   `indicators.indicator_columns(params)`, not the fixed constant, so a new
   period is selectable in Studio with no app edit.
+- Oscillation detection needs all three of `efficiency`, `range_pct` and
+  `swings`. Efficiency alone cannot tell a 5% swing from a 0.1% wobble, and
+  amplitude alone cannot tell a range from a trend.
 - An alert scenario is a `Rule` plus an optional `AlertTemplate` in the same
   JSON file — detection and message together, so adding one is adding a file.
   Placeholders are validated against `Rule.available_fields()` at save time.

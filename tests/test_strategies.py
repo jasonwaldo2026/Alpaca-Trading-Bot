@@ -34,6 +34,7 @@ CONFIG = BotConfig(
     volume_sma_period=3, atr_period=3,
     ema_periods=(2, 4),
     macd_fast=2, macd_slow=4, macd_signal=2,
+    roc_period=2, choppiness_period=3,
     bar_limit=20,
 )
 

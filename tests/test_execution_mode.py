@@ -25,7 +25,7 @@ from core.sessions import SessionConfig
 
 SMALL = IndicatorParams(
     sma_fast=2, sma_slow=3, ema_periods=(9,), rsi_period=2,
-    volume_sma_period=2, atr_period=2,
+    volume_sma_period=2, atr_period=2, choppiness_period=3,
     macd_fast=2, macd_slow=3, macd_signal=2, bar_minutes=5,
 )
 

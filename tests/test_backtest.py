@@ -27,7 +27,7 @@ UTC = "UTC"
 # EMA is unrelated to the exit EMA, which lives on the management frame.
 SMALL = IndicatorParams(
     sma_fast=2, sma_slow=3, ema_periods=(2,), rsi_period=2,
-    volume_sma_period=2, atr_period=2,
+    volume_sma_period=2, atr_period=2, choppiness_period=3,
     macd_fast=2, macd_slow=3, macd_signal=2, bar_minutes=5,
 )
 MIN_BARS = SMALL.min_bars()          # 7

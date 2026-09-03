@@ -111,6 +111,19 @@ any may simply open Safari.
 | `vwap-hold.json` | Close above VWAP for 3 consecutive 5-minute bars |
 | `vwap-hold-confirmed.json` | The same, plus volume above baseline and EMA9 > EMA12 |
 | `momentum-runner.json` | Up ≥10% in 10 minutes, ≥3x relative volume, above VWAP |
+| `oscillator.json` | Cycling rather than trending — ≥4 swings of 5%+ today, ≥8% range, efficiency ≤0.3 |
+
+`oscillator` is a **mean-reversion** signal and the opposite of `vwap hold`,
+which is momentum. They describe different stocks; if both ever fire on the
+same symbol, trust neither. It uses three measures together, because none
+works alone:
+
+- `efficiency` — net move ÷ distance travelled. 1.0 is a straight line, near
+  0 means it covered ground and ended up where it started.
+- `range_pct` — high-to-low amplitude. Supplies "is it worth trading": a
+  0.1% wobble is just as inefficient as a 5% swing.
+- `swings` — completed 5% legs so far today, reset each session like VWAP.
+  The most literal reading of "up and down over and over".
 
 `momentum-runner` covers two of the four momentum criteria. **Low float and
 "spiked in the last 12 months" are not checked** — float is fundamental data

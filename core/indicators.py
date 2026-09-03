@@ -27,6 +27,9 @@ COL_MACD_SIGNAL = "macd_signal"
 COL_MACD_HIST = "macd_hist"
 COL_ROC = "roc"
 COL_RVOL = "rvol"
+COL_EFFICIENCY = "efficiency"
+COL_RANGE_PCT = "range_pct"
+COL_SWINGS = "swings"
 
 #: Columns that do not depend on configuration. EMA columns are named after
 #: their period (ema_9, ema_200, …) so several can coexist, so the full list
@@ -36,6 +39,7 @@ FIXED_INDICATOR_COLUMNS = (
     COL_RSI, COL_VOL_SMA, COL_ATR, COL_VWAP,
     COL_MACD, COL_MACD_SIGNAL, COL_MACD_HIST,
     COL_ROC, COL_RVOL,
+    COL_EFFICIENCY, COL_RANGE_PCT, COL_SWINGS,
 )
 
 
@@ -84,6 +88,15 @@ class IndicatorParams:
     #: Bars for the rate-of-change window. At 5-minute bars, 2 covers the
     #: last 10 minutes — "up 10% in 10 minutes" is `roc > 10` with roc_period=2.
     roc_period: int = 2
+
+    #: Window for the efficiency ratio and the high-low range percentage.
+    #: 24 bars is two hours at 5-minute resolution — long enough to contain
+    #: several swings, short enough to describe today rather than last week.
+    choppiness_period: int = 24
+
+    #: A reversal of at least this percent counts as one swing. 5.0 matches
+    #: "up and down 5% over and over".
+    swing_threshold_pct: float = 5.0
     atr_period: int = 14
     macd_fast: int = 12
     macd_slow: int = 26
@@ -101,7 +114,7 @@ class IndicatorParams:
     PERIOD_FIELDS = (
         "sma_fast", "sma_slow", "rsi_period",
         "volume_sma_period", "atr_period", "macd_fast", "macd_slow",
-        "macd_signal", "roc_period",
+        "macd_signal", "roc_period", "choppiness_period",
     )
 
     def __post_init__(self):
@@ -131,6 +144,7 @@ class IndicatorParams:
             self.rsi_period,
             self.volume_sma_period,
             self.atr_period,
+            self.choppiness_period,
             self.macd_slow + self.macd_signal,
         ) + 2
 
@@ -360,6 +374,132 @@ def relative_volume(volume: pd.Series, baseline: pd.Series) -> pd.Series:
     return volume / baseline.replace(0, float("nan"))
 
 
+def efficiency_ratio(series: pd.Series, period: int) -> pd.Series:
+    """
+    Kaufman's Efficiency Ratio: net movement divided by distance travelled.
+
+        |close - close[-period]| / sum(|bar-to-bar changes|)
+
+    1.0 is a straight line — every step went the same way. Near 0 means the
+    price covered a lot of ground and ended up where it started, which is
+    exactly the oscillating stock that can be traded repeatedly rather than
+    held.
+
+    On its own it does not distinguish a stock swinging 5% each way from one
+    wobbling 0.1%; both are inefficient. Pair it with `range_pct` for the
+    amplitude.
+    """
+    if period < 1:
+        raise ValueError(f"efficiency period must be >= 1; got {period}.")
+    net = (series - series.shift(period)).abs()
+    path = series.diff().abs().rolling(period).sum()
+    return net / path.replace(0, float("nan"))
+
+
+def range_pct(df: pd.DataFrame, period: int) -> pd.Series:
+    """
+    High-to-low range over the window, as a percent of the low.
+
+    The amplitude half of "cyclical": a 10% range is worth trading, a 0.5%
+    range is not, however inefficient the path.
+    """
+    if period < 1:
+        raise ValueError(f"range period must be >= 1; got {period}.")
+    highest = df["high"].rolling(period).max()
+    lowest = df["low"].rolling(period).min()
+    return (highest - lowest) / lowest.replace(0, float("nan")) * 100
+
+
+def _count_swings(prices, threshold_pct: float):
+    """
+    Running count of completed legs of at least `threshold_pct`.
+
+    A zigzag: track the extreme reached in the current direction, and when
+    price retraces from it by the threshold, that leg is complete — count it
+    and flip direction. The retracement is measured from the extreme, which
+    is what a trader means by "it pulled back 5%".
+    """
+    counts = []
+    extreme = None
+    direction = 0          # +1 rising, -1 falling, 0 not yet established
+    count = 0
+
+    for price in prices:
+        if price is None or pd.isna(price) or price <= 0:
+            counts.append(count)
+            continue
+        if extreme is None:
+            extreme = price
+            counts.append(count)
+            continue
+
+        if direction == 1:
+            if price > extreme:
+                extreme = price
+            elif (extreme - price) / extreme * 100 >= threshold_pct:
+                count += 1                 # the up leg completed
+                direction = -1
+                extreme = price
+        elif direction == -1:
+            if price < extreme:
+                extreme = price
+            elif (price - extreme) / extreme * 100 >= threshold_pct:
+                count += 1                 # the down leg completed
+                direction = 1
+                extreme = price
+        else:
+            # First move large enough to establish a direction.
+            if (price - extreme) / extreme * 100 >= threshold_pct:
+                count += 1
+                direction = 1
+                extreme = price
+            elif (extreme - price) / extreme * 100 >= threshold_pct:
+                count += 1
+                direction = -1
+                extreme = price
+
+        counts.append(count)
+
+    return counts
+
+
+def swing_count(
+    series: pd.Series,
+    threshold_pct: float = 5.0,
+    anchor: Optional[pd.Series] = None,
+) -> pd.Series:
+    """
+    How many times price has reversed by `threshold_pct`, so far today.
+
+    This is the most literal reading of "goes up and down 5% over and over":
+    each completed leg of at least that size adds one. A stock at 4 swings by
+    lunchtime has offered four entries; one at 0 has trended or gone nowhere.
+
+    `anchor` (from `core.sessions.session_day_series`) resets the count each
+    trading day — like VWAP, yesterday's swings are not today's opportunity.
+    Without it the count runs from the start of the frame.
+    """
+    if threshold_pct <= 0:
+        raise ValueError(f"swing threshold must be > 0; got {threshold_pct}.")
+
+    if anchor is None:
+        return pd.Series(
+            _count_swings(series.tolist(), threshold_pct),
+            index=series.index, name=COL_SWINGS,
+        )
+
+    if not series.index.equals(anchor.index):
+        raise ValueError(
+            "series and anchor must share an index; got "
+            f"{len(series)} and {len(anchor)} rows."
+        )
+    return series.groupby(anchor, sort=False).transform(
+        lambda group: pd.Series(
+            _count_swings(group.tolist(), threshold_pct), index=group.index
+        )
+    )
+
+
 def volume_sma_by_session(
     volume: pd.Series, sessions: pd.Series, period: int
 ) -> pd.Series:
@@ -435,6 +575,11 @@ def add_indicators(
     out[COL_VWAP] = vwap(out, anchor)
     out[COL_ROC] = roc(out["close"], params.roc_period)
     out[COL_RVOL] = relative_volume(out["volume"], out[COL_VOL_SMA])
+    out[COL_EFFICIENCY] = efficiency_ratio(out["close"], params.choppiness_period)
+    out[COL_RANGE_PCT] = range_pct(out, params.choppiness_period)
+    out[COL_SWINGS] = swing_count(
+        out["close"], params.swing_threshold_pct, anchor
+    )
 
     macd_result = macd(
         out["close"], params.macd_fast, params.macd_slow, params.macd_signal

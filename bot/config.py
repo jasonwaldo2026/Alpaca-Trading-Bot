@@ -80,6 +80,11 @@ class BotConfig:
     # ATR (volatility-based sizing)
     atr_period: int = 14
 
+    # Momentum and oscillation measures
+    roc_period: int = 2            # 2 bars = 10 minutes at 5-minute bars
+    choppiness_period: int = 24    # window for efficiency and range percent
+    swing_threshold_pct: float = 5.0
+
     # Market sessions
     #
     # Defaults to regular hours only (09:30–16:00 ET). Enable extended hours
@@ -173,6 +178,9 @@ class BotConfig:
             rsi_period=self.rsi_period,
             volume_sma_period=self.volume_sma_period,
             atr_period=self.atr_period,
+            roc_period=self.roc_period,
+            choppiness_period=self.choppiness_period,
+            swing_threshold_pct=self.swing_threshold_pct,
             macd_fast=self.macd_fast,
             macd_slow=self.macd_slow,
             macd_signal=self.macd_signal,
