@@ -50,10 +50,31 @@ the **same Wi-Fi**, open the **Network URL**. If nothing loads, the
 computer's firewall is the usual reason — allow inbound connections to
 Python, or start Studio with `--server.port 8501` and allow that port.
 
-Away from home Wi-Fi, deploy the repository to Streamlit Community Cloud
-(free), set the main file to `studio/app.py`, and paste the contents of
-your `.env` into the app's Secrets as `KEY = "value"` lines. Add the app
-to your home screen and it opens like an app.
+### 5. Reach it away from home: Tailscale
+
+Pushover alerts already reach the phone anywhere — the scanner runs at
+home and pushes to you. Studio is a web page served by the home computer,
+so from outside the house the phone needs a way in. Tailscale (free) makes
+the phone and the computer behave as if they were on the same Wi-Fi, over
+an encrypted link, with nothing opened to the public internet.
+
+1. Install Tailscale on the computer and on the phone; sign in to both
+   with the same account. Both should show **Connected**.
+2. In the Tailscale app on the phone, the computer appears in the device
+   list with a name (e.g. `jasons-mac`) and an address starting `100.`.
+3. On the computer, start Studio as usual: `streamlit run studio/app.py`.
+   It listens on every network interface, Tailscale's included.
+4. On the phone, anywhere, open `http://jasons-mac:8501` (or
+   `http://100.x.y.z:8501` using the address from step 2). Add it to the
+   home screen.
+
+If it loads at home but not away, the computer went to sleep — turn off
+sleep in System Settings while the scanner is running. If it does not
+load anywhere, the computer's firewall is blocking Python; allow it.
+
+Streamlit Community Cloud can host Studio instead, so the computer need
+not be on — but rules saved there vanish on restart, and the scanner (and
+so the alerts) still lives on the computer. Tailscale is the better fit.
 
 ---
 
