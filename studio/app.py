@@ -270,11 +270,13 @@ if st.session_state.alert_enabled:
                  "deep link to a buy or order screen, so this lands on the "
                  "stock page: Trade → Buy → set order type to Limit.",
         )
-        with st.expander("Other link forms to try"):
+        with st.expander("Other link forms"):
             st.caption(
-                "None of these is published by Robinhood, so any may do "
-                "nothing or open Safari. Paste one above and tap a real "
-                "alert to see what your phone does."
+                "The default is a custom URL scheme, verified on iOS — it "
+                "opens the app directly, already signed in. It is "
+                "undocumented, so if alerts stop opening the app, try a web "
+                "form below. A custom scheme does nothing when the app is "
+                "not installed; a web link falls back to the site."
             )
             for label, template in ALTERNATIVE_LINK_TEMPLATES.items():
                 st.code(f"{label}:  {template}", language="text")

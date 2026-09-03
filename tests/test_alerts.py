@@ -80,25 +80,30 @@ def test_suggested_limit_price_sits_above_the_trigger():
     assert context["limit_price"] == 100.10
 
 
-def test_the_link_opens_robinhood_for_that_symbol():
+def test_the_link_opens_the_robinhood_app_for_that_symbol():
+    """The custom scheme was verified on a real iPhone: it opens the app
+    directly, already signed in."""
     context = build_context("TSLA", 250.0, "r", VWAP_ALERT)
     payload = VWAP_ALERT.render(context)
-    assert payload["url"] == "https://robinhood.com/us/en/stocks/TSLA/"
+    assert payload["url"] == "robinhood://instrument/TSLA"
     assert "TSLA" in payload["url_title"]
 
 
-def test_the_link_uses_robinhoods_canonical_locale_path():
-    """iOS matches a tapped URL against the app's associated-domain paths
-    before following redirects, so a URL that only works via a redirect can
-    open Safari instead of the app."""
-    assert DEFAULT_LINK_TEMPLATE == "https://robinhood.com/us/en/stocks/{symbol}/"
+def test_a_web_fallback_form_is_available():
+    """A custom scheme does nothing without the app; the web link at least
+    reaches the site."""
+    from core.alerts import WEB_LINK_TEMPLATE
+    template = AlertTemplate(link_template=WEB_LINK_TEMPLATE)
+    payload = template.render(build_context("TSLA", 250.0, "r", template))
+    assert payload["url"] == "https://robinhood.com/us/en/stocks/TSLA/"
 
 
-def test_alternative_link_forms_are_offered_for_testing():
-    """Robinhood publishes none of these, so they must be swappable by
-    config rather than assumed to work."""
-    from core.alerts import ALTERNATIVE_LINK_TEMPLATES
+def test_alternative_link_forms_are_offered():
+    """All of these are undocumented, so they must be swappable by config
+    rather than assumed permanent."""
+    from core.alerts import ALTERNATIVE_LINK_TEMPLATES, WEB_LINK_TEMPLATE
     assert DEFAULT_LINK_TEMPLATE in ALTERNATIVE_LINK_TEMPLATES.values()
+    assert WEB_LINK_TEMPLATE in ALTERNATIVE_LINK_TEMPLATES.values()
     for template in ALTERNATIVE_LINK_TEMPLATES.values():
         assert "{symbol}" in template
 

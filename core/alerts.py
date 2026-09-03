@@ -26,33 +26,40 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set
 
-#: Opens the Robinhood app to the stock's page on iOS (universal link), or
-#: the website otherwise.
+#: Opens the Robinhood app directly to the stock, already signed in.
 #:
-#: The locale prefix (/us/en/) is Robinhood's canonical path and is used
-#: deliberately: iOS matches a tapped URL against the app's associated-domain
-#: paths *before* following redirects, so a URL that only works by
-#: redirecting can open Safari instead of the app.
+#: This is a custom URL scheme, not a published API — verified working on
+#: iOS by tapping it from a real alert. It is undocumented, so Robinhood may
+#: change or remove it without notice; if alerts suddenly stop opening the
+#: app, this is the first thing to suspect, and the https form below is the
+#: fallback.
 #:
-#: The stock page is as deep as Robinhood links go. There is no published
-#: deep link to a buy or order screen, and Robinhood's third-party
-#: connections policy is explicit that outside apps cannot take action in the
-#: app. From here it is one tap: Trade -> Buy -> switch order type to Limit.
-#: The suggested limit price is put in the message text instead.
+#: The trade-off against the https link: a custom scheme does nothing at all
+#: when the app is not installed, where a universal link would at least open
+#: the website. That is the right trade for a phone that has the app.
 #:
-#: This is a template, so alternatives can be tried without code changes —
-#: see ALTERNATIVE_LINK_TEMPLATES.
-DEFAULT_LINK_TEMPLATE = "https://robinhood.com/us/en/stocks/{symbol}/"
+#: The stock page is still as deep as it goes. Robinhood publishes no link to
+#: a buy screen or order ticket, and its third-party connections policy is
+#: explicit that outside apps cannot take action in the app. From here it is
+#: Trade -> Buy -> switch order type to Limit. The suggested limit price is
+#: carried in the message text instead.
+DEFAULT_LINK_TEMPLATE = "robinhood://instrument/{symbol}"
 
-#: Undocumented alternatives worth testing on a real device. None of these is
-#: published by Robinhood, so any of them may do nothing, open Safari, or
-#: change without notice — which is exactly why the link is configurable
-#: rather than hardcoded. Tap one and see what the app does.
+#: The web form. Slower — it resolves through Safari's universal-link
+#: handoff rather than straight into the app — but it degrades to the
+#: website if the app is missing. The locale prefix is deliberate: iOS
+#: matches a tapped URL against the app's associated-domain paths before
+#: following redirects, so a URL that only works via a redirect can land in
+#: Safari.
+WEB_LINK_TEMPLATE = "https://robinhood.com/us/en/stocks/{symbol}/"
+
+#: Forms worth trying if the default ever stops working. None is published
+#: by Robinhood, so any may break; that is why this is configuration.
 ALTERNATIVE_LINK_TEMPLATES = {
-    "stock page (default)": DEFAULT_LINK_TEMPLATE,
-    "short form": "https://robinhood.com/stocks/{symbol}",
-    "custom scheme": "robinhood://stocks/{symbol}",
-    "custom scheme, instrument": "robinhood://instrument/{symbol}",
+    "app, instrument (default)": DEFAULT_LINK_TEMPLATE,
+    "app, stocks path": "robinhood://stocks/{symbol}",
+    "web, canonical": WEB_LINK_TEMPLATE,
+    "web, short form": "https://robinhood.com/stocks/{symbol}",
 }
 
 #: Placeholders always available, regardless of which indicators a rule uses.
@@ -92,7 +99,7 @@ class AlertTemplate:
 
     #: Where tapping the notification goes.
     link_template: str = DEFAULT_LINK_TEMPLATE
-    link_title: str = "Open {symbol} in Robinhood"
+    link_title: str = "Buy {symbol} in Robinhood"
 
     #: Suggested limit price as an offset above the trigger price, so a buy
     #: is marketable rather than sitting behind the spread. 0.001 = +0.1%.

@@ -92,17 +92,17 @@ Missing credentials disable alerting without crashing. A setup that stays
 true is **one** alert, not one per scan — a lapsed setup that returns alerts
 again, because that is new. State survives restarts.
 
-**The notification link opens Robinhood to the stock page** —
-`robinhood.com/us/en/stocks/{symbol}/`, which opens the app on iOS. That is
-as deep as Robinhood links go: there is no published link to a buy screen or
-order ticket, and their third-party policy is explicit that outside apps
-cannot act in the app. From the stock page it is Trade → Buy → Limit, so the
-link saves the symbol search but not the taps. The suggested limit price is
-in the message text instead.
+**The notification link opens the Robinhood app directly** —
+`robinhood://instrument/{symbol}`, verified on iOS: it launches the app to
+that stock, already signed in. It is an undocumented custom scheme, so if it
+ever stops working, `core.alerts.WEB_LINK_TEMPLATE` is the fallback (slower,
+but degrades to the website when the app is missing).
 
-`link_template` is configurable, and Studio lists a few undocumented
-alternatives worth tapping on a real phone — none published by Robinhood, so
-any may simply open Safari.
+It still cannot open an order ticket — Robinhood publishes no link to a buy
+screen, and their third-party policy is explicit that outside apps cannot act
+in the app. From the stock page it is Trade → Buy → Limit. So the link saves
+the app launch and the symbol search, not the taps; the suggested limit price
+rides in the message text so both numbers you need are already on screen.
 
 ### Shipped scenarios
 
