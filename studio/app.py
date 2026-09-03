@@ -9,14 +9,17 @@ with its own logic — it calls core.rules and scanner.engine, so a rule that
 previews here behaves identically when the scanner runs it on a schedule.
 """
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
+from core.backtest import ExitPolicy, backtest
 from core.client import AlpacaClient, Credentials
 from core.data import MarketDataFetcher
-from core.indicators import IndicatorParams, indicator_columns
+from core.sessions import session_day_series
+from core.indicators import IndicatorParams, add_indicators, indicator_columns
 from core.rules import VALID_OPS, Condition, Rule, RuleError
 from scanner.engine import Scanner
 
@@ -36,13 +39,17 @@ def get_client():
 
 
 def _blank_condition() -> dict:
-    return {"field": "rsi", "op": "<", "mode": "value", "value": 30.0, "field2": "vol_sma"}
+    return {"field": "close", "op": ">", "mode": "field", "value": 0.0,
+            "field2": "vwap", "for_bars": 3}
 
 
 def _to_condition(row: dict) -> Condition:
+    for_bars = row.get("for_bars") or None
     if row["mode"] == "value":
-        return Condition(field=row["field"], op=row["op"], value=float(row["value"]))
-    return Condition(field=row["field"], op=row["op"], field2=row["field2"])
+        return Condition(field=row["field"], op=row["op"],
+                         value=float(row["value"]), for_bars=for_bars)
+    return Condition(field=row["field"], op=row["op"],
+                     field2=row["field2"], for_bars=for_bars)
 
 
 def _parse_ema_periods(text: str):
@@ -148,7 +155,7 @@ if _parse_ema_periods(st.session_state.ema_periods_text) is None:
 FIELDS = OHLCV_FIELDS + list(indicator_columns(_current_params()))
 
 for i, row in enumerate(st.session_state.conditions):
-    c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 3, 1])
+    c1, c2, c3, c4, c6, c5 = st.columns([3, 2, 2, 3, 1.4, 0.8])
     if row["field"] not in FIELDS:
         FIELDS.append(row["field"])      # keep a loaded rule's field selectable
     row["field"] = c1.selectbox("Field", FIELDS, index=FIELDS.index(row["field"]), key=f"f{i}")
@@ -173,6 +180,17 @@ for i, row in enumerate(st.session_state.conditions):
             FIELDS.append(row["field2"])
         row["field2"] = c4.selectbox(
             "Field", FIELDS, index=FIELDS.index(row["field2"]), key=f"f2{i}"
+        )
+
+    if is_cross:
+        # A crossover is a single-bar event; persistence is meaningless on it.
+        row["for_bars"] = 1
+        c6.markdown("&nbsp;\n\n—")
+    else:
+        row["for_bars"] = c6.number_input(
+            "For bars", min_value=1, max_value=200,
+            value=int(row.get("for_bars") or 1), key=f"fb{i}",
+            help="Consecutive bars the comparison must hold. 3 = three bars in a row.",
         )
 
     if c5.button("✕", key=f"del{i}", help="Remove this condition"):
@@ -239,6 +257,134 @@ with right:
         path.write_text(rule.to_json())
         st.success(f"Saved {path} — run it with `python -m scanner.cli {path}`")
 
+# ── Backtest ─────────────────────────────────────────────────────────────────
+
+st.divider()
+st.subheader("Backtest")
+st.caption(
+    "Replays the rule over history bar by bar with no lookahead. Entries fill "
+    "at the next bar's open; exits are managed on a finer timeframe."
+)
+
+bt1, bt2 = st.columns([1, 1])
+
+with bt1:
+    bt_symbol = st.text_input("Symbol", value="AAPL", key="bt_symbol").strip().upper()
+    bt_days = st.slider("Days of history", 5, 60, 20, key="bt_days")
+    manage_minutes = st.selectbox(
+        "Manage exits on", [1, 5, 15],
+        index=0, key="bt_manage",
+        format_func=lambda m: f"{m}-minute bars",
+        help=(
+            "The finer this is, the sooner an exit is noticed. It also changes "
+            "what the exit EMA means: a 9-period EMA is 9 minutes on 1-minute "
+            "bars but 45 minutes on 5-minute bars."
+        ),
+    )
+
+with bt2:
+    exit_ema = st.number_input("Exit EMA period", 2, 200, 9, key="bt_exit_ema")
+    use_stop = st.checkbox("ATR stop floor", value=True, key="bt_use_stop")
+    atr_mult = st.number_input(
+        "ATR multiple", 0.5, 10.0, 1.5, step=0.25, key="bt_atr_mult",
+        disabled=not use_stop,
+        help="Stop = entry price - ATR at entry x this. Caps gap risk.",
+    )
+
+st.caption(
+    f"Exit EMA({exit_ema}) on {manage_minutes}-minute bars spans "
+    f"{exit_ema * manage_minutes} minutes. On the {st.session_state.bar_minutes}-minute "
+    f"entry chart the same number would span {exit_ema * st.session_state.bar_minutes} "
+    f"minutes — a materially different exit, not just a faster one."
+)
+
+if st.button("📉 Run backtest", disabled=get_client() is None):
+    entry_minutes = st.session_state.bar_minutes
+    if manage_minutes > entry_minutes:
+        st.error(
+            f"The management timeframe ({manage_minutes} min) must be no coarser "
+            f"than the entry timeframe ({entry_minutes} min) — otherwise exits "
+            f"are noticed later than entries."
+        )
+    else:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=bt_days)
+        client = get_client()
+
+        with st.spinner(f"Fetching {bt_days} days of {bt_symbol}…"):
+            entry_raw = MarketDataFetcher(client, entry_minutes).get_bars_between(
+                [bt_symbol], start, end
+            ).get(bt_symbol)
+            manage_raw = (
+                entry_raw if manage_minutes == entry_minutes
+                else MarketDataFetcher(client, manage_minutes).get_bars_between(
+                    [bt_symbol], start, end
+                ).get(bt_symbol)
+            )
+
+        if entry_raw is None or entry_raw.empty:
+            st.warning(f"No bars returned for {bt_symbol} over that range.")
+        elif len(entry_raw) < rule.params.min_bars():
+            st.warning(
+                f"Only {len(entry_raw)} bars returned; this rule needs "
+                f"{rule.params.min_bars()} before its indicators are valid. "
+                f"Widen the range or shorten the periods."
+            )
+        else:
+            entry_bars = add_indicators(
+                entry_raw, rule.params,
+                anchor=session_day_series(entry_raw.index, bt_symbol),
+            )
+            # The exit EMA lives on the management frame, so that frame needs
+            # its own params at its own resolution.
+            manage_params = IndicatorParams(
+                ema_periods=(exit_ema,), atr_period=rule.params.atr_period,
+                bar_minutes=manage_minutes,
+            )
+            manage_bars = add_indicators(
+                manage_raw, manage_params,
+                anchor=session_day_series(manage_raw.index, bt_symbol),
+            )
+
+            result = backtest(
+                entry_bars, rule,
+                ExitPolicy(exit_ema, atr_mult if use_stop else None),
+                manage_bars, symbol=bt_symbol,
+            )
+
+            summary = result.summary()
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Trades", summary["trades"])
+            m2.metric("Win rate", f"{summary['win_rate_pct']}%")
+            m3.metric("Avg P&L", f"{summary['avg_pnl_pct']:+.3f}%")
+            m4.metric("Max drawdown", f"{summary['max_drawdown_pct']:.2f}%")
+
+            m5, m6, m7 = st.columns(3)
+            m5.metric("Total return", f"{summary['total_return_pct']:+.2f}%")
+            m6.metric("Median P&L", f"{summary['median_pnl_pct']:+.3f}%")
+            m7.metric("Avg hold", f"{summary['avg_holding_minutes']:.0f} min")
+
+            if result.trades:
+                st.caption(f"Exits: {result.exit_reasons()}")
+                st.dataframe(
+                    result.trades_frame(), use_container_width=True, hide_index=True
+                )
+                equity = (
+                    1 + result.trades_frame()["pnl_pct"] / 100
+                ).cumprod()
+                st.line_chart(equity, height=180)
+            else:
+                st.info(
+                    f"No trades over {bt_days} days. The rule never matched, or "
+                    f"matched only where there were no bars left to fill."
+                )
+
+            st.warning(
+                "Signal quality only — no commission, no slippage, one position "
+                "at a time, fully invested. Treat the return as an upper bound, "
+                "and a few dozen trades as a small sample rather than an edge."
+            )
+
 # ── Load an existing rule ────────────────────────────────────────────────────
 
 st.divider()
@@ -258,7 +404,8 @@ if existing:
                     "op": c.op,
                     "mode": "value" if c.field2 is None else "field",
                     "value": c.value if c.value is not None else 0.0,
-                    "field2": c.field2 or "vol_sma",
+                    "field2": c.field2 or "vwap",
+                    "for_bars": c.for_bars or 1,
                 }
                 for c in loaded.conditions
             ]

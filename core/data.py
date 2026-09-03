@@ -273,6 +273,53 @@ class MarketDataFetcher:
 
         return out
 
+    def get_bars_between(
+        self,
+        symbols: Iterable[str],
+        start: datetime,
+        end: Optional[datetime] = None,
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Fetch a historical date range rather than the most recent N bars.
+
+        This is what a backtest needs: `limit=N` walks back from now, which
+        makes the window depend on when you run it. A range is reproducible.
+
+        Alpaca paginates internally, so a long range is a single call here
+        but several over the wire — expect it to be slow for months of
+        1-minute data.
+        """
+        stocks, crypto = universe.split_by_asset_class(symbols)
+        out: Dict[str, pd.DataFrame] = {}
+        timeframe = self.timeframe
+
+        for batch in _chunked(stocks, MAX_SYMBOLS_PER_REQUEST):
+            try:
+                req = StockBarsRequest(
+                    symbol_or_symbols=batch, timeframe=timeframe,
+                    start=start, end=end,
+                    **({"feed": self.feed} if self.feed else {}),
+                )
+                bars = self.client.stock_data.get_stock_bars(req)
+                frame = bars.df if hasattr(bars, "df") else pd.DataFrame()
+                out.update(split_frame_by_symbol(self._finalize(frame), batch))
+            except Exception as exc:
+                log.warning("Historical stock fetch failed for %s: %s", batch, exc)
+
+        for batch in _chunked(crypto, MAX_SYMBOLS_PER_REQUEST):
+            try:
+                req = CryptoBarsRequest(
+                    symbol_or_symbols=batch, timeframe=timeframe,
+                    start=start, end=end,
+                )
+                bars = self.client.crypto_data.get_crypto_bars(req)
+                frame = bars.df if hasattr(bars, "df") else pd.DataFrame()
+                out.update(split_frame_by_symbol(self._finalize(frame), batch))
+            except Exception as exc:
+                log.warning("Historical crypto fetch failed for %s: %s", batch, exc)
+
+        return out
+
     def get_stock_bars(self, symbols: List[str], limit: int = 60) -> pd.DataFrame:
         """Raw MultiIndex frame — used by strategies that slice it themselves."""
         return self._finalize(self._fetch_stocks(symbols, self.timeframe, limit))

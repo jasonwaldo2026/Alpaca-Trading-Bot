@@ -47,6 +47,8 @@ core/                 shared by everything — no app imports allowed
   universe.py         symbol lists, stock-vs-crypto routing
   rules.py            scan rule model (Studio writes it, Scanner reads it)
   sessions.py         market sessions, scan cadence, horizon conversion
+  persistence.py      run lengths — "true for N bars in a row"
+  backtest.py         lookahead-free replay with dual-timeframe exits
 
 bot/                  config, strategies, risk, orders, poll loop
 dashboard.py          Streamlit account + chart view
@@ -224,6 +226,35 @@ Scan once per *completed* bar, shortly after it closes —
 09:36 → 16:01 at 5 minutes).
 
 Full detail: `docs/specs/core/market-sessions.md`.
+
+---
+
+## Strategies and backtesting
+
+Build a rule in Studio, then backtest it there before it trades anything.
+Conditions support persistence, so "price has held above VWAP" is one
+condition rather than a crossing:
+
+```json
+{"field": "close", "op": ">", "field2": "vwap", "for_bars": 3}
+```
+
+Studio's backtest panel replays the rule over history with no lookahead —
+entries fill at the next bar's open, and exits are managed on a finer
+timeframe (1-minute) so an adverse move is caught within a minute rather
+than up to five. The exit is a close below an EMA, with an optional ATR stop
+underneath as a floor against gaps.
+
+**The management timeframe changes what the exit means.** EMA(9) spans 9
+minutes on 1-minute bars and 45 minutes on 5-minute bars — a materially
+tighter exit, not merely a faster one. Studio states the span for whatever
+you pick.
+
+Results are signal quality only: no commission, no slippage, one position at
+a time. The ATR stop assumes a fill at its trigger price, which a real gap
+would beat. Treat the return as an upper bound.
+
+See `docs/specs/studio/vwap-trend-strategy.md`.
 
 ---
 

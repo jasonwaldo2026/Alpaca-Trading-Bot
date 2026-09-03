@@ -14,8 +14,14 @@ either a literal number or another field:
     {"field": "volume",   "op": ">",  "field2": "vol_sma"}
     {"field": "sma_fast", "op": "crosses_above", "field2": "sma_slow"}
 
-Crossover operators need the previous bar as well, which is why evaluation
-takes the whole indicator-enriched frame rather than a single row.
+A condition may also require persistence — "true for the last N bars" —
+via `for_bars`, which is how "price has held above VWAP for a while" is
+expressed rather than "price crossed VWAP on this exact bar":
+
+    {"field": "close", "op": ">", "field2": "vwap", "for_bars": 6}
+
+Crossover and persistence operators need earlier bars as well, which is why
+evaluation takes the whole indicator-enriched frame rather than a single row.
 """
 
 import json
@@ -25,6 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import pandas as pd
 
 from core.indicators import IndicatorParams, add_indicators
+from core.persistence import consecutive_true
 
 # Operators that compare the latest bar only.
 _POINT_OPS = {
@@ -55,11 +62,28 @@ class Condition:
     value: Optional[float] = None
     field2: Optional[str] = None
 
+    #: Require the comparison to have held for this many consecutive bars,
+    #: ending at the latest one. 1 (or None) means "true right now".
+    #: Persistence turns a momentary touch into a sustained condition, which
+    #: is the difference between "crossed above VWAP" and "has been above
+    #: VWAP for half an hour".
+    for_bars: Optional[int] = None
+
     def validate(self) -> None:
         if self.op not in VALID_OPS:
             raise RuleError(
                 f"Unknown operator {self.op!r}. Valid: {', '.join(VALID_OPS)}"
             )
+        if self.for_bars is not None:
+            if self.for_bars < 1:
+                raise RuleError(
+                    f"for_bars must be >= 1; got {self.for_bars}."
+                )
+            if self.op in _CROSS_OPS:
+                raise RuleError(
+                    f"Operator {self.op!r} describes a single-bar event, so "
+                    f"'for_bars' is meaningless on it."
+                )
         if (self.value is None) == (self.field2 is None):
             raise RuleError(
                 f"Condition on {self.field!r} must set exactly one of "
@@ -77,6 +101,18 @@ class Condition:
         right = self.value if self.field2 is None else row[self.field2]
         return left, right
 
+    def _series_mask(self, df: pd.DataFrame) -> pd.Series:
+        """Row-wise truth of this comparison across the whole frame."""
+        left = df[self.field]
+        right = self.value if self.field2 is None else df[self.field2]
+        mask = _POINT_OPS[self.op](left, right)
+        # A NaN comparison is False in pandas already, but an operand that is
+        # NaN must break a run rather than silently continue it.
+        valid = left.notna()
+        if self.field2 is not None:
+            valid &= df[self.field2].notna()
+        return mask & valid
+
     def evaluate(self, df: pd.DataFrame) -> bool:
         """Evaluate against the last row of an indicator-enriched frame."""
         self.validate()
@@ -87,6 +123,12 @@ class Condition:
                     f"Unknown field {name!r}. Available: "
                     f"{', '.join(map(str, df.columns))}"
                 )
+
+        if self.for_bars and self.for_bars > 1:
+            if len(df) < self.for_bars:
+                return False
+            run = consecutive_true(self._series_mask(df)).iloc[-1]
+            return bool(run >= self.for_bars)
 
         curr = df.iloc[-1]
 
@@ -109,7 +151,10 @@ class Condition:
 
     def describe(self) -> str:
         right = self.field2 if self.field2 is not None else self.value
-        return f"{self.field} {self.op} {right}"
+        text = f"{self.field} {self.op} {right}"
+        if self.for_bars and self.for_bars > 1:
+            text += f" for {self.for_bars} bars"
+        return text
 
 
 @dataclass

@@ -4,7 +4,7 @@ Four apps over one shared core. Paper trading only.
 
 | Directory | What it is | Run it with |
 |---|---|---|
-| `core/` | Shared library. Credentials, bar fetching, indicator math, scan-rule model, market sessions. | — (imported) |
+| `core/` | Shared library. Credentials, bar fetching, indicator math, scan-rule model, market sessions, backtesting. | — (imported) |
 | `bot/` | Live trading bot — strategies, risk, orders, poll loop. | `python trading_bot.py` |
 | `dashboard/` → `dashboard.py` | Streamlit read-only view of account, positions, charts. | `streamlit run dashboard.py` |
 | `scanner/` | Runs saved rules across a symbol universe. | `python -m scanner.cli` |
@@ -22,7 +22,13 @@ Four apps over one shared core. Paper trading only.
    live trading. If a task seems to require it, stop and ask.
 4. **Studio and Scanner share `core/rules.py`.** Studio writes rule JSON;
    Scanner reads it. Neither may define its own rule dialect or evaluation
-   logic — both call `Rule.matches()`.
+   logic — both call `Rule.matches()`. A strategy belongs in a rule wherever
+   it can be expressed as one, so it stays editable and backtestable in
+   Studio rather than hardcoded in an app.
+12. **Backtests never look ahead.** At bar *i* a rule sees `bars[:i+1]` and
+    nothing later, and a signal at a bar's close fills at the *next* bar's
+    open. `core/backtest.py` enforces both; a test asserts the window handed
+    to the rule ends at the current bar.
 5. **Asset-class routing goes through `core/universe.py:is_crypto()`.**
    Never test for `"/" in symbol` inline.
 6. **Horizons are wall-clock, never bar counts.** A bar is not a duration:
@@ -93,6 +99,12 @@ Four apps over one shared core. Paper trading only.
   (`ema_9`, `ema_12`, `ema_200`). Column lists come from
   `indicators.indicator_columns(params)`, not the fixed constant, so a new
   period is selectable in Studio with no app edit.
+- Persistence ("true for N bars in a row") is `Condition.for_bars`, backed by
+  `core/persistence.py`. NaN breaks a run, so a warming-up indicator never
+  counts as satisfying a condition.
+- An exit EMA read on a finer management timeframe is a **different** exit,
+  not a faster one: EMA(9) is 9 minutes on 1-minute bars and 45 on 5-minute.
+  Say which is meant.
 - Changing `bar_minutes` changes what the indicator periods mean —
   `sma_slow=30` is 30 hours of hourly bars but 150 minutes of 5-minute bars.
   Say so explicitly when changing it; do not treat it as a tuning knob.

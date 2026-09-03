@@ -1,0 +1,20 @@
+{
+  "name": "vwap hold",
+  "description": "Price has closed above VWAP for three consecutive 5-minute bars. Alert threshold for the VWAP-trend strategy; exit is managed separately on 1-minute bars (see docs/specs/studio/vwap-trend-strategy.md).",
+  "universe": "sp500_liquid",
+  "conditions": [
+    {"field": "close", "op": ">", "field2": "vwap", "for_bars": 3}
+  ],
+  "params": {
+    "sma_fast": 10,
+    "sma_slow": 30,
+    "ema_periods": [9, 12, 200],
+    "rsi_period": 14,
+    "volume_sma_period": 20,
+    "atr_period": 14,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "bar_minutes": 5
+  }
+}
