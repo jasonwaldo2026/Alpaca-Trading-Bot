@@ -168,43 +168,56 @@ class AlertNotifier:
         while it is still being tuned.
         """
         new = self.state.new_matches(matches)
-        # Always record current truth, even when delivery is off, so enabling
-        # alerts later does not dump every standing setup at once.
-        self.state.update(matches)
-        self.state.save()
 
-        if not self.enabled or not new:
-            return 0
-
-        alertable = [m for m in new if rules_by_name.get(m.rule_name, None)
-                     and rules_by_name[m.rule_name].alert is not None]
+        # Deliver first, then record. A match whose notification failed to
+        # send is left out of the seen set so it is tried again next scan —
+        # recording it first would silently lose the alert until the setup
+        # lapsed and came back.
+        undelivered: Set[Tuple[str, str]] = set()
         sent = 0
-        now = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-        for match in alertable[: self.max_per_run]:
-            rule = rules_by_name[match.rule_name]
-            try:
-                context = build_context(
-                    symbol=match.symbol, price=match.price,
-                    rule_name=match.rule_name, template=rule.alert,
-                    values=match.values, session=session, time_label=now,
-                )
-                payload = rule.alert.render(context)
-            except AlertError as exc:
-                log.error("Could not render alert for %s: %s", match.symbol, exc)
-                continue
+        if self.enabled and new:
+            alertable = [m for m in new if rules_by_name.get(m.rule_name, None)
+                         and rules_by_name[m.rule_name].alert is not None]
+            now = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-            if self.transport.send(payload):
-                sent += 1
+            for match in alertable[: self.max_per_run]:
+                rule = rules_by_name[match.rule_name]
+                try:
+                    context = build_context(
+                        symbol=match.symbol, price=match.price,
+                        rule_name=match.rule_name, template=rule.alert,
+                        values=match.values, session=session, time_label=now,
+                    )
+                    payload = rule.alert.render(context)
+                except AlertError as exc:
+                    # A template that cannot render will not render next
+                    # time either; retrying it would only repeat the error.
+                    log.error("Could not render alert for %s: %s", match.symbol, exc)
+                    continue
 
-        overflow = len(alertable) - self.max_per_run
-        if overflow > 0:
-            symbols = ", ".join(m.symbol for m in alertable[self.max_per_run:])
-            if self.transport.send({
-                "title": f"{overflow} more matches",
-                "message": f"Also matched: {symbols}",
-                "priority": -1,
-            }):
-                sent += 1
+                if self.transport.send(payload):
+                    sent += 1
+                else:
+                    undelivered.add((match.rule_name, match.symbol))
 
+            overflow = alertable[self.max_per_run:]
+            if overflow:
+                symbols = ", ".join(m.symbol for m in overflow)
+                if self.transport.send({
+                    "title": f"{len(overflow)} more matches",
+                    "message": f"Also matched: {symbols}",
+                    "priority": -1,
+                }):
+                    sent += 1
+                else:
+                    undelivered.update((m.rule_name, m.symbol) for m in overflow)
+
+        # Record current truth — even when delivery is off, so enabling
+        # alerts later does not dump every standing setup at once — minus
+        # whatever failed to send.
+        self.state.update(
+            m for m in matches if (m.rule_name, m.symbol) not in undelivered
+        )
+        self.state.save()
         return sent

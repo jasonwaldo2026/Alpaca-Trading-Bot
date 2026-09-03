@@ -22,7 +22,22 @@ from core.fundamentals import (
     FloatProvider,
     NullFloatProvider,
 )
-from core.indicators import add_indicators
+from core.enrich import enrich
+from core.indicators import (
+    COL_ATR,
+    COL_EFFICIENCY,
+    COL_MACD,
+    COL_MACD_SIGNAL,
+    COL_ROC,
+    COL_RSI,
+    COL_RVOL,
+    COL_SMA_FAST,
+    COL_SMA_SLOW,
+    COL_SWING_TOTAL,
+    COL_SWINGS,
+    COL_VOL_SMA,
+    COL_VWAP,
+)
 from core.rules import Rule
 from core.sessions import (
     DEFAULT_BAR_MINUTES,
@@ -31,8 +46,6 @@ from core.sessions import (
     SessionConfig,
     is_tradable,
     session_at,
-    session_day_series,
-    session_series,
 )
 
 log = logging.getLogger(__name__)
@@ -76,9 +89,9 @@ class ScanResult:
 #: Values reported alongside a match. Derived per-rule so a rule's EMA
 #: periods show up automatically.
 _REPORTED_FIXED = (
-    "rsi", "atr", "vwap", "macd", "macd_signal", "sma_fast", "sma_slow",
-    "vol_sma", "roc", "rvol", "efficiency", "swings", "swing_total_pct",
-    COL_FLOAT_MILLIONS,
+    COL_RSI, COL_ATR, COL_VWAP, COL_MACD, COL_MACD_SIGNAL, COL_SMA_FAST,
+    COL_SMA_SLOW, COL_VOL_SMA, COL_ROC, COL_RVOL, COL_EFFICIENCY, COL_SWINGS,
+    COL_SWING_TOTAL, COL_FLOAT_MILLIONS,
 )
 
 
@@ -131,6 +144,17 @@ class Scanner:
         rules = list(rules)
         for rule in rules:
             rule.validate()
+            if rule.params.bar_minutes != self.bar_minutes:
+                # Periods are bar counts. Evaluating a rule written for
+                # 5-minute bars on hourly data makes sma_slow=30 mean 30
+                # hours instead of 150 minutes — a different strategy, not
+                # a different sample rate.
+                raise ValueError(
+                    f"Rule {rule.name!r} was written for "
+                    f"{rule.params.bar_minutes}-minute bars but this scanner "
+                    f"fetches {self.bar_minutes}-minute bars. Run it at its "
+                    f"own bar size, or re-save it in Studio at this one."
+                )
 
         if symbols is None:
             wanted: List[str] = []
@@ -193,13 +217,7 @@ class Scanner:
                             f"only {len(df)} bars, need {rule.params.min_bars()}"
                         )
                         continue
-                    sessions = anchor = None
-                    if isinstance(df.index, pd.DatetimeIndex):
-                        # VWAP needs its daily reset at every resolution.
-                        anchor = session_day_series(df.index, sym, self.calendar)
-                        if self.sessions.requires_extended_hours_orders():
-                            sessions = session_series(df.index, sym, self.calendar)
-                    enriched = add_indicators(df, rule.params, sessions, anchor)
+                    enriched = enrich(df, rule.params, sym, self.calendar)
                     shares = self.fundamentals.float_shares(sym)
                     enriched[COL_FLOAT_SHARES] = (
                         float(shares) if shares else float("nan")

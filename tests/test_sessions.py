@@ -96,7 +96,11 @@ def test_crypto_is_always_tradable():
     assert S.is_tradable(et(2026, 9, 5, 3), "BTC/USD", cfg)
 
 
-# ── Cadence ──────────────────────────────────────────────────────────────────
+# ── Cadence (hourly bars) ────────────────────────────────────────────────────
+# These document the arithmetic at HOUR_1, so they pass it explicitly; the
+# shipped default is 5-minute bars (see test_default_bar_size_is_five_minutes).
+
+HOUR = S.HOUR_1
 
 @pytest.mark.parametrize("cfg,expected", [
     (S.SessionConfig.regular_only(), 7),   # 09:30–16:00 → hours 9..15
@@ -104,18 +108,18 @@ def test_crypto_is_always_tradable():
     (S.SessionConfig.extended(), 16),      # 04:00–20:00 → hours 4..19
 ])
 def test_bars_per_day_by_config(cfg, expected):
-    assert S.bars_per_day("AAPL", cfg, day=WED) == expected
+    assert S.bars_per_day("AAPL", cfg, day=WED, bar_minutes=HOUR) == expected
 
 
 def test_crypto_bars_per_day_is_24():
-    assert S.bars_per_day("BTC/USD") == 24
+    assert S.bars_per_day("BTC/USD", bar_minutes=HOUR) == 24
 
 
 def test_overlapping_sessions_merge_into_one_bar():
     """09:00–09:30 (pre) and 09:30–10:00 (regular) are one clock-hour bucket,
     so enabling pre-market adds 5 bars, not 6."""
-    regular = S.bars_per_day("AAPL", S.SessionConfig.regular_only(), day=WED)
-    with_pre = S.bars_per_day("AAPL", S.SessionConfig(pre=True, regular=True), day=WED)
+    regular = S.bars_per_day("AAPL", S.SessionConfig.regular_only(), day=WED, bar_minutes=HOUR)
+    with_pre = S.bars_per_day("AAPL", S.SessionConfig(pre=True, regular=True), day=WED, bar_minutes=HOUR)
     assert with_pre - regular == 5
 
 
@@ -124,24 +128,24 @@ def test_no_bars_on_a_weekend():
 
 
 def test_scan_times_land_after_each_bar_closes():
-    times = S.scan_times("AAPL", S.SessionConfig.regular_only(), day=WED)
+    times = S.scan_times("AAPL", S.SessionConfig.regular_only(), day=WED, bar_minutes=HOUR)
     assert times[0] == time(10, 2), "first scan reads the 09:30–10:00 bar"
     assert times[-1] == time(16, 2), "last scan reads the 15:00–16:00 bar"
     assert len(times) == 7
 
 
 def test_after_hours_scan_times_extend_to_2002():
-    times = S.scan_times("AAPL", S.SessionConfig.after_hours(), day=WED)
+    times = S.scan_times("AAPL", S.SessionConfig.after_hours(), day=WED, bar_minutes=HOUR)
     assert times[-1] == time(20, 2)
     assert len(times) == 11
 
 
 def test_crypto_scans_every_hour():
-    assert len(S.scan_times("BTC/USD")) == 24
+    assert len(S.scan_times("BTC/USD", bar_minutes=HOUR)) == 24
 
 
 def test_cycles_per_day_reports_both_classes():
-    out = S.cycles_per_day(["AAPL", "BTC/USD"], S.SessionConfig.regular_only())
+    out = S.cycles_per_day(["AAPL", "BTC/USD"], S.SessionConfig.regular_only(), bar_minutes=HOUR)
     assert out == {"stock": 7, "crypto": 24}
 
 
@@ -151,34 +155,42 @@ def test_same_horizon_is_different_bar_counts_per_asset():
     """This is the whole point: '1 day' is 7 bars for an RTH equity and 24
     for crypto. A shared '+20 bars' column compares unlike things."""
     cfg = S.SessionConfig.regular_only()
-    assert S.horizon_to_bars("1d", "AAPL", cfg) == 7
-    assert S.horizon_to_bars("1d", "BTC/USD", cfg) == 24
+    assert S.horizon_to_bars("1d", "AAPL", cfg, bar_minutes=HOUR) == 7
+    assert S.horizon_to_bars("1d", "BTC/USD", cfg, bar_minutes=HOUR) == 24
 
 
 def test_multi_day_horizons_scale():
     cfg = S.SessionConfig.regular_only()
-    assert S.horizon_to_bars("5d", "AAPL", cfg) == 35
-    assert S.horizon_to_bars("20d", "AAPL", cfg) == 140
+    assert S.horizon_to_bars("5d", "AAPL", cfg, bar_minutes=HOUR) == 35
+    assert S.horizon_to_bars("20d", "AAPL", cfg, bar_minutes=HOUR) == 140
 
 
 def test_hour_horizons_are_one_bar_each():
-    assert S.horizon_to_bars("1h", "AAPL") == 1
-    assert S.horizon_to_bars("4h", "BTC/USD") == 4
+    assert S.horizon_to_bars("1h", "AAPL", bar_minutes=HOUR) == 1
+    assert S.horizon_to_bars("4h", "BTC/USD", bar_minutes=HOUR) == 4
 
 
 def test_enabling_after_hours_changes_a_day_horizon():
-    assert S.horizon_to_bars("1d", "AAPL", S.SessionConfig.regular_only()) == 7
-    assert S.horizon_to_bars("1d", "AAPL", S.SessionConfig.after_hours()) == 11
+    assert S.horizon_to_bars("1d", "AAPL", S.SessionConfig.regular_only(), bar_minutes=HOUR) == 7
+    assert S.horizon_to_bars("1d", "AAPL", S.SessionConfig.after_hours(), bar_minutes=HOUR) == 11
 
 
 def test_unknown_horizon_raises_rather_than_guessing():
     with pytest.raises(KeyError, match="Unknown horizon"):
-        S.horizon_to_bars("3w", "AAPL")
+        S.horizon_to_bars("3w", "AAPL", bar_minutes=HOUR)
 
 
 def test_describe_horizon_labels_a_column():
-    label = S.describe_horizon("1d", "AAPL", S.SessionConfig.regular_only())
+    label = S.describe_horizon("1d", "AAPL", S.SessionConfig.regular_only(), bar_minutes=HOUR)
     assert label == "1d (7 bars)"
+
+
+def test_default_bar_size_is_five_minutes():
+    """Every app ships at 5-minute bars. A different default in core is how a
+    caller that forgets to pass bar_minutes evaluates 5-minute rules on
+    hourly data without anything complaining."""
+    assert S.DEFAULT_BAR_MINUTES == S.MINUTE_5
+    assert S.horizon_to_bars("1d", "AAPL", S.SessionConfig.regular_only()) == 78
 
 
 # ── Session-aware volume baseline ────────────────────────────────────────────
@@ -416,3 +428,15 @@ def test_invalid_bar_minutes_is_rejected():
     from bot.config import BotConfig
     with pytest.raises(ValueError, match="divide evenly"):
         BotConfig(api_key="k", api_secret="s", bar_minutes=7).validate()
+
+
+def test_session_baseline_is_defined_from_a_sessions_first_bar():
+    """The window restarts with each session. Requiring a full period there
+    would leave the first 95 minutes after the open — the time of day the
+    volume gate matters most — with no baseline at all."""
+    df = _extended_hours_frame()
+    series = S.session_series(df.index, "AAPL")
+    grouped = add_indicators(df, IndicatorParams(volume_sma_period=20), series)
+    first_regular = df.index[series == S.REGULAR][0]
+    assert not np.isnan(grouped.loc[first_regular, "vol_sma"])
+    assert grouped.loc[first_regular, "vol_sma"] == df.loc[first_regular, "volume"]

@@ -117,6 +117,29 @@ def asset_class(symbol: str) -> str:
     return CRYPTO if is_crypto(symbol) else STOCK
 
 
+#: Quote currencies Alpaca crypto pairs settle in. Longest first so that
+#: "USDT" and "USDC" are matched before "USD".
+CRYPTO_QUOTES: Tuple[str, ...] = ("USDT", "USDC", "USD", "BTC")
+
+
+def canonical_symbol(symbol: str, crypto: bool) -> str:
+    """
+    The watchlist form of a symbol Alpaca reported.
+
+    Alpaca quotes, trades and lists crypto as "BTC/USD" but reports held
+    positions as "BTCUSD". Every lookup in the bot is keyed by the watchlist
+    form, so a position left in Alpaca's form never matches: its exit is
+    never evaluated, its SELL is never approved, and a second entry is not
+    blocked. Equities are returned unchanged.
+    """
+    if not crypto or "/" in symbol:
+        return symbol
+    for quote in CRYPTO_QUOTES:
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            return f"{symbol[:-len(quote)]}/{quote}"
+    return symbol
+
+
 def split_by_asset_class(symbols: Iterable[str]) -> Tuple[List[str], List[str]]:
     """Partition a mixed symbol list into (stocks, crypto), order preserved."""
     stocks: List[str] = []

@@ -136,6 +136,8 @@ export FMP_API_KEY=...
 ```
 
 Alternatively maintain `floats.json` by hand (copy `floats.example.json`).
+Studio's preview uses the same source, and warns when a rule has a float
+condition and no source is configured.
 **Without either, low-float conditions cannot be met** — unknown float fails
 closed, so the scenario simply never fires rather than matching everything.
 

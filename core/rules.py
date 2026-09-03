@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import pandas as pd
 
 from core.alerts import AlertTemplate
-from core.indicators import IndicatorParams, add_indicators, indicator_columns
+from core.indicators import COL_RSI, IndicatorParams, add_indicators, indicator_columns
 from core.persistence import consecutive_true
 
 # Operators that compare the latest bar only.
@@ -194,6 +194,21 @@ class Rule:
             | set(indicator_columns(self.params))
         )
 
+    def needs_float(self) -> bool:
+        """
+        True when any condition reads a float column.
+
+        Float is per-symbol data from an outside provider rather than an
+        indicator; a rule that needs it cannot match without one configured,
+        and both the CLI and Studio warn about that using this one test.
+        """
+        from core.fundamentals import COL_FLOAT_MILLIONS, COL_FLOAT_SHARES
+        float_columns = {COL_FLOAT_SHARES, COL_FLOAT_MILLIONS}
+        return any(
+            c.field in float_columns or c.field2 in float_columns
+            for c in self.conditions
+        )
+
     def matches(self, bars: pd.DataFrame) -> bool:
         """
         True when every condition holds on the latest bar.
@@ -206,7 +221,7 @@ class Rule:
         if bars is None or bars.empty or len(bars) < self.params.min_bars():
             return False
         enriched = (
-            bars if "rsi" in bars.columns else add_indicators(bars, self.params)
+            bars if COL_RSI in bars.columns else add_indicators(bars, self.params)
         )
         return all(cond.evaluate(enriched) for cond in self.conditions)
 

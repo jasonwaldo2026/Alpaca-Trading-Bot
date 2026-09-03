@@ -21,7 +21,20 @@ try:
 except ImportError:  # pragma: no cover - environment guard
     raise SystemExit("Run:  pip install -r requirements.txt")
 
+from core import universe
+
 log = logging.getLogger(__name__)
+
+
+def _secret_or_env(secrets, key: str) -> str:
+    """A Streamlit secret if one is set, else the environment, else ''."""
+    try:
+        value = secrets.get(key)
+    except Exception:            # noqa: BLE001 - no secrets file at all
+        value = None
+    if value:
+        return str(value)
+    return os.getenv(key, "")
 
 
 @dataclass(frozen=True)
@@ -49,12 +62,15 @@ class Credentials:
         Streamlit Cloud injects secrets rather than a .env file, so the
         dashboard and studio need this path; `secrets` is passed in rather
         than imported so core stays free of a streamlit dependency.
+
+        `st.secrets` is not a plain mapping: when no secrets.toml exists at
+        all, even `.get()` raises rather than returning the default. Running
+        locally with a `.env` and no secrets file is the documented setup,
+        so that case must fall through to the environment, not crash.
         """
         return cls(
-            api_key=secrets.get("ALPACA_API_KEY", os.getenv("ALPACA_API_KEY", "")),
-            api_secret=secrets.get(
-                "ALPACA_API_SECRET", os.getenv("ALPACA_API_SECRET", "")
-            ),
+            api_key=_secret_or_env(secrets, "ALPACA_API_KEY"),
+            api_secret=_secret_or_env(secrets, "ALPACA_API_SECRET"),
             paper=paper,
         )
 
@@ -92,7 +108,19 @@ class AlpacaClient:
         return float(self.get_account().portfolio_value)
 
     def get_positions(self) -> Dict[str, object]:
-        return {p.symbol: p for p in self.trading.get_all_positions()}
+        """
+        Open positions keyed by watchlist symbol.
+
+        Alpaca reports crypto positions as "BTCUSD" while everything else in
+        this codebase says "BTC/USD"; the key is canonicalised so a held
+        crypto position is found by the strategy that opened it.
+        """
+        out: Dict[str, object] = {}
+        for p in self.trading.get_all_positions():
+            klass = getattr(p, "asset_class", None)
+            crypto = str(getattr(klass, "value", klass or "")).lower() == "crypto"
+            out[universe.canonical_symbol(p.symbol, crypto)] = p
+        return out
 
     # ── Orders ───────────────────────────────────────────────────────────────
 

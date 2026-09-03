@@ -232,3 +232,28 @@ def test_scanner_reports_sparse_symbols():
     )
     result = Scanner(FakeFetcher(), bar_minutes=5, skip_closed=False).scan([rule])
     assert "AAPL" in result.sparse
+
+
+def test_an_overnight_close_is_not_a_gap():
+    """A 300-bar fetch at 5 minutes necessarily crosses a session break.
+    Counting those hours as missing bars flags every symbol as sparse and
+    buries the pre-market thinness the measure exists to surface."""
+    day1 = pd.date_range("2026-09-01 04:00", periods=192, freq="5min", tz=ET)
+    day2 = pd.date_range("2026-09-02 04:00", periods=108, freq="5min", tz=ET)
+    idx = day1.append(day2)
+    df = pd.DataFrame(
+        {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0},
+        index=idx,
+    )
+    coverage = bar_coverage(df, 5)
+    assert coverage.bars == 300
+    assert coverage.expected_bars == 300
+    assert not coverage.is_sparse()
+    assert coverage.largest_gap_minutes == 5, "the overnight break is not reported as a gap"
+
+
+def test_a_weekend_is_not_a_gap_either():
+    fri = pd.date_range("2026-09-04 14:00", periods=24, freq="5min", tz=ET)
+    mon = pd.date_range("2026-09-07 09:30", periods=24, freq="5min", tz=ET)
+    df = pd.DataFrame({"close": 1.0, "volume": 1.0}, index=fri.append(mon))
+    assert not bar_coverage(df, 5).is_sparse()

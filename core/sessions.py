@@ -191,7 +191,11 @@ MINUTE_15 = 15
 MINUTE_30 = 30
 HOUR_1 = 60
 
-DEFAULT_BAR_MINUTES = HOUR_1
+#: The resolution every app ships with. BotConfig, the scanner CLI and Studio
+#: all default to 5-minute bars; a different default here is how a caller
+#: that forgets to pass bar_minutes silently evaluates 5-minute rules on
+#: hourly data.
+DEFAULT_BAR_MINUTES = MINUTE_5
 
 
 def _minutes_since_midnight(t: time) -> int:

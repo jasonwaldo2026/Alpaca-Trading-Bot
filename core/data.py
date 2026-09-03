@@ -30,9 +30,11 @@ log = logging.getLogger(__name__)
 # Alpaca rejects very large symbol batches; sweep in chunks this size.
 MAX_SYMBOLS_PER_REQUEST = 100
 
-#: A gap this many times the bar size suggests missing data rather than a
-#: normal session break.
-GAP_WARN_MULTIPLE = 3
+#: A gap at least this long is a session break (overnight, weekend), not
+#: missing data. The longest stretch pre-market can go without a trade is
+#: the whole pre-market session, 04:00-09:30, which is under this; the
+#: shortest break between sessions, 20:00-04:00, is over it.
+SESSION_BREAK_MINUTES = 6 * 60
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,10 @@ class BarCoverage:
     of N bars can span far more wall-clock time than N * bar_minutes. Every
     rolling indicator is affected — an SMA(30) over sparse 5-minute
     pre-market bars may reach back hours rather than 150 minutes.
+
+    Session breaks are not gaps. A 300-bar fetch at 5 minutes necessarily
+    crosses an overnight close; counting those hours as missing bars would
+    flag every symbol as sparse and bury the real signal.
     """
 
     bars: int
@@ -84,13 +90,22 @@ def bar_coverage(df: pd.DataFrame, bar_minutes: int) -> Optional[BarCoverage]:
     stamps = df.index.sort_values()
     span = (stamps[-1] - stamps[0]).total_seconds() / 60
     deltas = stamps.to_series().diff().dropna().dt.total_seconds() / 60
-    expected = int(span // bar_minutes) + 1
+    within_session = deltas[deltas < SESSION_BREAK_MINUTES]
+
+    # A bar after a session break accounts for itself only; a bar after an
+    # intra-session gap of d minutes stands where d / bar_minutes bars
+    # should have been.
+    expected = 1 + int((within_session // bar_minutes).sum()) + int(
+        (deltas >= SESSION_BREAK_MINUTES).sum()
+    )
 
     return BarCoverage(
         bars=len(df),
         span_minutes=span,
         expected_bars=max(expected, len(df)),
-        largest_gap_minutes=float(deltas.max()) if not deltas.empty else 0.0,
+        largest_gap_minutes=(
+            float(within_session.max()) if not within_session.empty else 0.0
+        ),
     )
 
 

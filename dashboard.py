@@ -7,9 +7,7 @@ Shows live account data, open positions, indicator charts, and the bot log.
 All data comes directly from Alpaca — no bot process needs to be running.
 """
 
-import math
-import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -23,13 +21,12 @@ try:
     from core import universe
     from core.client import AlpacaClient, Credentials
     from core.data import MarketDataFetcher
+    from core.enrich import enrich
     from core.indicators import (
         IndicatorParams,
-        add_indicators,
         crossed_down,
         crossed_up,
     )
-    from core.sessions import session_day_series
 except ImportError:
     st.error("Missing packages — run:  pip install -r requirements.txt")
     st.stop()
@@ -132,11 +129,7 @@ def compute_indicators(
         macd_signal=macd_signal,
         bar_minutes=bar_minutes,
     )
-    anchor = (
-        session_day_series(df.index, symbol)
-        if isinstance(df.index, pd.DatetimeIndex) else None
-    )
-    return add_indicators(df, params, anchor=anchor)
+    return enrich(df, params, symbol)
 
 
 def read_log(path="bot.log", max_lines=200) -> list[str]:
@@ -378,13 +371,13 @@ else:
             signal_label = f"🔴 SELL signal  |  RSI {curr['rsi']:.1f}  |  Volume confirmed"
             signal_color = RED
         elif golden and not high_vol:
-            signal_label = f"🟡 Golden cross but LOW VOLUME — signal not confirmed"
+            signal_label = "🟡 Golden cross but LOW VOLUME — signal not confirmed"
             signal_color = YELLOW
         elif golden and not not_overbought:
             signal_label = f"🟡 Golden cross but RSI OVERBOUGHT ({curr['rsi']:.1f}) — signal not confirmed"
             signal_color = YELLOW
         elif death and not high_vol:
-            signal_label = f"🟡 Death cross but LOW VOLUME — signal not confirmed"
+            signal_label = "🟡 Death cross but LOW VOLUME — signal not confirmed"
             signal_color = YELLOW
         elif death and not not_oversold:
             signal_label = f"🟡 Death cross but RSI OVERSOLD ({curr['rsi']:.1f}) — signal not confirmed"

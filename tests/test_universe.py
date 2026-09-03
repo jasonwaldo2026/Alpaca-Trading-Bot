@@ -41,3 +41,30 @@ def test_resolve_explicit_list_passes_through():
 def test_resolve_unknown_name_lists_valid_options():
     with pytest.raises(KeyError, match="sp500_liquid"):
         universe.resolve("nope")
+
+
+# ── Position symbols ─────────────────────────────────────────────────────────
+
+def test_crypto_positions_are_keyed_by_the_watchlist_form():
+    """Alpaca reports a held BTC/USD position as "BTCUSD". Left that way, the
+    bot never matches it against its own watchlist: the exit is never
+    evaluated and a second entry is not blocked."""
+    from core.universe import canonical_symbol
+    assert canonical_symbol("BTCUSD", crypto=True) == "BTC/USD"
+    assert canonical_symbol("ETHUSDT", crypto=True) == "ETH/USDT"
+    assert canonical_symbol("SOLUSDC", crypto=True) == "SOL/USDC"
+    assert canonical_symbol("ETHBTC", crypto=True) == "ETH/BTC"
+
+
+def test_already_canonical_and_equity_symbols_pass_through():
+    from core.universe import canonical_symbol
+    assert canonical_symbol("BTC/USD", crypto=True) == "BTC/USD"
+    assert canonical_symbol("AAPL", crypto=False) == "AAPL"
+    # An equity that happens to end in USD is not a pair.
+    assert canonical_symbol("FUSD", crypto=False) == "FUSD"
+
+
+def test_an_unrecognised_crypto_symbol_is_left_alone():
+    from core.universe import canonical_symbol
+    assert canonical_symbol("USD", crypto=True) == "USD"
+    assert canonical_symbol("WEIRD", crypto=True) == "WEIRD"

@@ -346,3 +346,24 @@ def test_the_strength_alert_uses_the_requested_wording():
         {"roc": 12.4, "rvol": 4.1, "vwap": 5.02, "float_millions": 8.2},
     ))
     assert "ABCD stock is strong and trading above VWAP" in payload["message"]
+
+
+def test_a_failed_delivery_is_retried_on_the_next_scan(tmp_path):
+    """Recording the match as seen before it was delivered would silently
+    lose the alert until the setup lapsed and came back."""
+    state = AlertState(tmp_path / "state.json")
+    failing = AlertNotifier(FakeTransport(succeed=False), state)
+    assert failing.notify([_match()], {"vwap hold": _rule()}) == 0
+
+    working = FakeTransport()
+    assert AlertNotifier(working, state).notify([_match()], {"vwap hold": _rule()}) == 1
+    assert len(working.sent) == 1
+
+
+def test_a_delivered_match_is_not_resent(tmp_path):
+    state = AlertState(tmp_path / "state.json")
+    transport = FakeTransport()
+    notifier = AlertNotifier(transport, state)
+    notifier.notify([_match()], {"vwap hold": _rule()})
+    notifier.notify([_match()], {"vwap hold": _rule()})
+    assert len(transport.sent) == 1

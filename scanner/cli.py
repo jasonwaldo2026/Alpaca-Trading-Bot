@@ -44,8 +44,13 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--bars", type=int, default=300, help="Bars to fetch per symbol")
     parser.add_argument(
-        "--bar-minutes", type=int, default=5,
-        help="Bar size in minutes (5, 15, 30, 60). Must divide into 1440.",
+        "--bar-minutes", type=int, default=None,
+        help=(
+            "Bar size in minutes (5, 15, 30, 60). Default: the size the "
+            "rules were saved at. Periods are bar counts, so a rule is only "
+            "ever evaluated at the size it was written for; a mismatch is "
+            "an error, not a warning."
+        ),
     )
     parser.add_argument(
         "--feed", choices=["iex", "sip"], default=None,
@@ -114,6 +119,31 @@ def main(argv=None) -> int:
         print(f"Could not load rules: {exc}", file=sys.stderr)
         return 1
 
+    sizes = sorted({r.params.bar_minutes for r in rules})
+    if args.bar_minutes is None:
+        if len(sizes) > 1:
+            listing = ", ".join(f"{r.name}: {r.params.bar_minutes} min" for r in rules)
+            print(
+                f"These rules were saved at different bar sizes ({listing}). "
+                f"Run them separately — periods are bar counts, so one "
+                f"fetch cannot serve both.",
+                file=sys.stderr,
+            )
+            return 1
+        args.bar_minutes = sizes[0]
+    elif sizes != [args.bar_minutes]:
+        wrong = ", ".join(
+            f"{r.name} ({r.params.bar_minutes} min)"
+            for r in rules if r.params.bar_minutes != args.bar_minutes
+        )
+        print(
+            f"--bar-minutes {args.bar_minutes} does not match {wrong}. A rule "
+            f"is evaluated only at the bar size it was written for; re-save "
+            f"it in Studio at {args.bar_minutes} minutes to change that.",
+            file=sys.stderr,
+        )
+        return 1
+
     creds = Credentials.from_env()
     if not creds.is_complete():
         print("Missing ALPACA_API_KEY / ALPACA_API_SECRET.", file=sys.stderr)
@@ -133,10 +163,7 @@ def main(argv=None) -> int:
         use_fmp=args.fmp_floats or None,
     )
     print(f"Float source: {type(floats).__name__}")
-    needs_float = any(
-        c.field.startswith("float") or (c.field2 or "").startswith("float")
-        for r in rules for c in r.conditions
-    )
+    needs_float = any(r.needs_float() for r in rules)
     if needs_float and isinstance(floats, NullFloatProvider):
         print(
             "\nNo float source configured, and a rule needs one. Those "

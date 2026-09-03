@@ -132,3 +132,15 @@ def test_shared_params_reuse_enriched_frame(fetcher):
     IndicatorParams being hashable and comparing equal."""
     assert IndicatorParams() == IndicatorParams()
     assert hash(IndicatorParams()) == hash(IndicatorParams())
+
+
+def test_a_rule_is_only_evaluated_at_the_bar_size_it_was_written_for():
+    """Periods are bar counts: sma_slow=30 is 150 minutes at 5-minute bars
+    and 30 hours at hourly. Silently fetching the wrong size changes the
+    strategy, so the engine refuses."""
+    hourly = Rule(
+        name="hourly", conditions=[Condition("close", ">", value=0)],
+        params=IndicatorParams(bar_minutes=60),
+    )
+    with pytest.raises(ValueError, match="written for 60-minute bars"):
+        _scanner(FakeFetcher({"AAPL": _bars()}), bar_minutes=5).scan([hourly], ["AAPL"])

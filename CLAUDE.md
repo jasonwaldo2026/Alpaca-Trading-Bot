@@ -95,10 +95,24 @@ Four apps over one shared core. Paper trading only.
   and rejects fractional/notional quantities. A market order sent then is
   silently queued to the next open. `OrderManager` routes on session; do not
   bypass it. See `docs/specs/core/market-sessions.md`.
-- **When extended hours are enabled, volume baselines must be per session.**
-  Pass `core.sessions.session_series(...)` to `add_indicators()`. A flat
-  rolling average across sessions turns `volume > vol_sma` into "is it
-  regular hours".
+- **Apps enrich bars through `core/enrich.py:enrich()`, never by calling
+  `add_indicators()` directly.** It supplies the VWAP day anchor and the
+  per-session volume baseline from the frame's own timestamps. Alpaca
+  returns pre- and after-market bars for intraday timeframes whether or
+  not the config enables them, so the baseline must be per session
+  *always* — a flat rolling average across sessions turns
+  `volume > vol_sma` into "is it regular hours". The intra-session
+  baseline is defined from a session's first bar; its limits and the
+  time-of-day alternative are in `docs/specs/core/relative-volume.md`.
+- **A rule is evaluated only at the bar size it was written for.**
+  `Scanner` raises when `rule.params.bar_minutes` differs from its own,
+  and the CLI takes its bar size from the rules by default. Studio
+  restores a loaded rule's params, so "load, tweak, save" keeps the file's
+  periods and bar size.
+- **Alpaca reports crypto positions as `BTCUSD`, not `BTC/USD`.**
+  `AlpacaClient.get_positions()` re-keys them through
+  `core/universe.py:canonical_symbol()`; nothing downstream should see the
+  slash-less form.
 - Cadence is one scan per *completed* bar. At hourly bars: 7/day regular
   hours, 11 with after-hours, 24 for crypto. At 5-minute bars: 78/day regular
   hours, 192 across the full extended session (04:06 → 20:01 ET), which is

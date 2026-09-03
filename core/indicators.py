@@ -115,7 +115,7 @@ class IndicatorParams:
     #: sma_slow=30 is 30 hours of hourly bars but 150 minutes of 5-minute
     #: bars. Recording the intended resolution is what makes rescaled_to()
     #: possible and stops the mismatch from being silent.
-    bar_minutes: int = 60
+    bar_minutes: int = 5
 
     #: Period fields, for rescaling and validation. Not every field on this
     #: dataclass is a period, so they are named rather than inferred.
@@ -557,6 +557,15 @@ def volume_sma_by_session(
 
     Grouping by session compares each bar against its own session's
     baseline, so an unusually busy after-hours bar is detectable as such.
+
+    The window restarts with each session, so it is allowed to be short:
+    with a full `period` required, the first `period - 1` bars of every
+    session — the 95 minutes after the open, at 20 bars of 5 minutes — would
+    have no baseline at all, and a volume condition could never be met at
+    the one time of day it matters most. The baseline at a session's first
+    bar is that bar's own volume, so a spike is not visible until the
+    second bar; that is the honest limit of an intra-session baseline. See
+    docs/specs/core/relative-volume.md for the time-of-day alternative.
     """
     if not volume.index.equals(sessions.index):
         raise ValueError(
@@ -564,7 +573,7 @@ def volume_sma_by_session(
             f"{len(volume)} and {len(sessions)} rows."
         )
     return volume.groupby(sessions, sort=False).transform(
-        lambda g: g.rolling(period).mean()
+        lambda g: g.rolling(period, min_periods=1).mean()
     )
 
 

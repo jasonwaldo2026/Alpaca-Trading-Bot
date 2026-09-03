@@ -140,3 +140,10 @@ def test_describe_is_human_readable():
         Condition("volume", ">", field2="vol_sma"),
     ])
     assert rule.describe() == "rsi < 30 AND volume > vol_sma"
+
+
+def test_needs_float_is_decided_by_the_float_columns():
+    from core.fundamentals import COL_FLOAT_MILLIONS, COL_FLOAT_SHARES
+    assert Rule(name="f", conditions=[Condition(COL_FLOAT_MILLIONS, "<=", value=50)]).needs_float()
+    assert Rule(name="f", conditions=[Condition("volume", ">", field2=COL_FLOAT_SHARES)]).needs_float()
+    assert not Rule(name="f", conditions=[Condition("rsi", "<", value=30)]).needs_float()

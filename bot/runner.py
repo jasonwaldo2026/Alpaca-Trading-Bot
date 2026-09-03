@@ -12,8 +12,8 @@ from bot.risk import RiskManager
 from bot.strategies import BaseStrategy, EnhancedSMAStrategy
 from core.client import AlpacaClient
 from core.data import MarketDataFetcher
-from core.indicators import add_indicators
-from core.sessions import is_tradable, session_at, session_day_series
+from core.enrich import enrich
+from core.sessions import is_tradable, session_at
 
 log = logging.getLogger(__name__)
 
@@ -91,11 +91,7 @@ class TradingBot:
                     len(df), sym, params.min_bars(),
                 )
                 continue
-            anchor = (
-                session_day_series(df.index, sym, self.config.calendar)
-                if hasattr(df.index, "tz") else None
-            )
-            enriched[sym] = add_indicators(df, params, anchor=anchor)
+            enriched[sym] = enrich(df, params, sym, self.config.calendar)
         return enriched
 
     def run_once(self):
