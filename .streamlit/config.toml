@@ -1,0 +1,6 @@
+# Studio's Load button restores a saved rule into widgets that also declare
+# a default. Streamlit logs a one-time warning about that pattern; it is the
+# intended pattern here (see _apply_loaded in studio/app.py), so the warning
+# is noise. secrets.toml lives beside this file and is gitignored.
+[global]
+disableWidgetStateDuplicationWarning = true

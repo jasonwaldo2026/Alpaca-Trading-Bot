@@ -1,0 +1,38 @@
+name: tests
+
+# Once per change: pull requests run on the PR event, and main runs on
+# push. Unscoped `push` would run every PR commit twice.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install
+        run: pip install -r requirements-dev.txt
+
+      # Unused imports and undefined names. Deliberately pyflakes rather than
+      # a style linter: the repo has no formatting convention to enforce, and
+      # a red check for line length would teach people to ignore red checks.
+      - name: Lint
+        run: python -m pyflakes core bot scanner studio tests dashboard.py trading_bot.py start.py
+
+      # No network and no credentials: every test drives a fake fetcher.
+      - name: Test
+        run: python -m pytest
+        env:
+          ALPACA_API_KEY: ""
+          ALPACA_API_SECRET: ""

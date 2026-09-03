@@ -7,10 +7,7 @@ Shows live account data, open positions, indicator charts, and the bot log.
 All data comes directly from Alpaca — no bot process needs to be running.
 """
 
-import os
-import math
-import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -21,10 +18,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 try:
-    from alpaca.trading.client import TradingClient
-    from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
-    from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
-    from alpaca.data.timeframe import TimeFrame
+    from core import universe
+    from core.client import AlpacaClient, Credentials
+    from core.data import MarketDataFetcher
+    from core.enrich import enrich
+    from core.indicators import (
+        IndicatorParams,
+        crossed_down,
+        crossed_up,
+    )
 except ImportError:
     st.error("Missing packages — run:  pip install -r requirements.txt")
     st.stop()
@@ -57,17 +59,15 @@ def _arrow(value: float) -> str:
 # ── Alpaca connection (cached so it doesn't reconnect on every rerun) ─────────
 
 @st.cache_resource
-def get_clients():
-    key    = st.secrets.get("ALPACA_API_KEY",    os.getenv("ALPACA_API_KEY",    ""))
-    secret = st.secrets.get("ALPACA_API_SECRET", os.getenv("ALPACA_API_SECRET", ""))
-    if not key or not secret:
-        return None, None, None
-    trading     = TradingClient(key, secret, paper=True)
-    stock_data  = StockHistoricalDataClient(key, secret)
-    crypto_data = CryptoHistoricalDataClient(key, secret)
-    return trading, stock_data, crypto_data
+def get_client():
+    """Shared AlpacaClient, or None when credentials are absent."""
+    creds = Credentials.from_streamlit(st.secrets, paper=True)
+    if not creds.is_complete():
+        return None
+    return AlpacaClient(creds)
 
-trading_client, stock_data_client, crypto_data_client = get_clients()
+client = get_client()
+trading_client = client.trading if client else None
 
 # ── Data fetchers (cached per symbol for 60 seconds) ─────────────────────────
 
@@ -87,50 +87,50 @@ def fetch_orders(limit=20):
     return trading_client.get_orders(req)
 
 @st.cache_data(ttl=300)
-def fetch_bars(symbol: str, is_crypto: bool, bar_limit: int = 100):
+def fetch_bars(symbol: str, bar_limit: int = 100, bar_minutes: int = 60):
+    """Hourly OHLCV for one symbol. Asset class is routed by core.universe."""
     try:
-        if is_crypto:
-            req  = CryptoBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Hour, limit=bar_limit)
-            bars = crypto_data_client.get_crypto_bars(req)
-        else:
-            req  = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Hour, limit=bar_limit)
-            bars = stock_data_client.get_stock_bars(req)
-        df = bars.df
-        if isinstance(df.index, pd.MultiIndex):
-            df = df.xs(symbol, level="symbol")
-        return df.reset_index()
+        frames = MarketDataFetcher(client, bar_minutes).get_bars(
+            [symbol], limit=bar_limit
+        )
+        df = frames.get(symbol)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        # Keep the DatetimeIndex: VWAP's daily reset is derived from it.
+        return df
     except Exception as e:
         st.warning(f"Could not fetch bars for {symbol}: {e}")
         return pd.DataFrame()
 
-def compute_indicators(df: pd.DataFrame, sma_fast=10, sma_slow=30,
-                        rsi_period=14, vol_sma_period=20, atr_period=14) -> pd.DataFrame:
-    df = df.copy()
-    df["sma_fast"] = df["close"].rolling(sma_fast).mean()
-    df["sma_slow"] = df["close"].rolling(sma_slow).mean()
+def compute_indicators(
+    df: pd.DataFrame,
+    symbol: str,
+    sma_fast=10, sma_slow=30, rsi_period=14, vol_sma_period=20, atr_period=14,
+    ema_periods=(4, 9, 12, 200),
+    macd_fast=12, macd_slow=26, macd_signal=9,
+    bar_minutes=60,
+) -> pd.DataFrame:
+    """
+    Thin wrapper over core.indicators so the chart shows exactly the values
+    the bot and scanner act on. Do not inline indicator math here.
 
-    # RSI
-    delta    = df["close"].diff()
-    gain     = delta.clip(lower=0)
-    loss     = -delta.clip(upper=0)
-    avg_gain = gain.ewm(com=rsi_period - 1, min_periods=rsi_period).mean()
-    avg_loss = loss.ewm(com=rsi_period - 1, min_periods=rsi_period).mean()
-    rs       = avg_gain / avg_loss.replace(0, float("nan"))
-    df["rsi"] = 100 - (100 / (1 + rs))
+    The VWAP anchor is derived from the frame's DatetimeIndex so VWAP resets
+    each trading day, as it does on every charting platform.
+    """
+    params = IndicatorParams(
+        sma_fast=sma_fast,
+        sma_slow=sma_slow,
+        ema_periods=tuple(ema_periods),
+        rsi_period=rsi_period,
+        volume_sma_period=vol_sma_period,
+        atr_period=atr_period,
+        macd_fast=macd_fast,
+        macd_slow=macd_slow,
+        macd_signal=macd_signal,
+        bar_minutes=bar_minutes,
+    )
+    return enrich(df, params, symbol)
 
-    # Volume SMA
-    df["vol_sma"] = df["volume"].rolling(vol_sma_period).mean()
-
-    # ATR
-    prev_close  = df["close"].shift()
-    tr          = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - prev_close).abs(),
-        (df["low"]  - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    df["atr"]   = tr.ewm(com=atr_period - 1, min_periods=atr_period).mean()
-
-    return df
 
 def read_log(path="bot.log", max_lines=200) -> list[str]:
     try:
@@ -146,23 +146,13 @@ with st.sidebar:
     st.title("⚙️ Dashboard Settings")
     st.divider()
 
-    all_symbols = {
-        "AAPL":    False,
-        "MSFT":    False,
-        "NVDA":    False,
-        "SPY":     False,
-        "QQQ":     False,
-        "BTC/USD": True,
-        "ETH/USD": True,
-        "SOL/USD": True,
-    }
+    all_symbols = list(universe.DEFAULT_STOCKS) + list(universe.DEFAULT_CRYPTO)
 
     selected_symbol = st.selectbox(
         "Inspect symbol",
-        list(all_symbols.keys()),
+        all_symbols,
         index=0,
     )
-    is_crypto = all_symbols[selected_symbol]
 
     st.divider()
     st.subheader("Indicator settings")
@@ -171,7 +161,35 @@ with st.sidebar:
     rsi_period     = st.slider("RSI period",        5,  30, 14)
     vol_sma_period = st.slider("Volume SMA period", 5,  50, 20)
     atr_period     = st.slider("ATR period",        5,  30, 14)
-    bar_limit      = st.slider("Bars to load",     60, 500, 120)
+
+    st.caption("EMA / MACD")
+    ema_text       = st.text_input("EMA periods", value="4, 9, 12, 200",
+                                   help="Comma-separated; one line per period.")
+    try:
+        ema_periods = tuple(int(p.strip()) for p in ema_text.split(",") if p.strip())
+    except ValueError:
+        ema_periods = ()
+    if not ema_periods:
+        st.error("EMA periods must be comma-separated whole numbers, "
+                 "e.g. 4, 9, 12, 200")
+        st.stop()
+    macd_fast      = st.slider("MACD fast",         3,  40, 12)
+    macd_slow      = st.slider("MACD slow",         5,  80, 26)
+    macd_signal    = st.slider("MACD signal",       2,  30,  9)
+
+    st.divider()
+    bar_minutes = st.selectbox(
+        "Bar size",
+        [5, 15, 30, 60],
+        index=3,
+        format_func=lambda m: f"{m} min" if m < 60 else "1 hour",
+        help=(
+            "Periods above are bar counts, so their wall-clock meaning changes "
+            "with this. SMA(30) is 30 hours of hourly bars but 150 minutes of "
+            "5-minute bars."
+        ),
+    )
+    bar_limit      = st.slider("Bars to load",     60, 1000, 120)
 
     st.divider()
     if st.button("🔄 Refresh data"):
@@ -182,7 +200,7 @@ with st.sidebar:
 
 # ── Guard: credentials ────────────────────────────────────────────────────────
 
-if trading_client is None:
+if client is None:
     st.error("No API credentials found. Add ALPACA_API_KEY and ALPACA_API_SECRET to your .env file.")
     st.stop()
 
@@ -321,21 +339,27 @@ st.markdown(
     """
 )
 
-df_raw = fetch_bars(selected_symbol, is_crypto, bar_limit)
+df_raw = fetch_bars(selected_symbol, bar_limit, bar_minutes)
 
 if df_raw.empty:
     st.warning(f"No bar data returned for {selected_symbol}.")
 else:
-    df = compute_indicators(df_raw, sma_fast, sma_slow, rsi_period, vol_sma_period, atr_period)
+    df = compute_indicators(
+        df_raw, selected_symbol,
+        sma_fast, sma_slow, rsi_period, vol_sma_period, atr_period,
+        ema_periods, macd_fast, macd_slow, macd_signal, bar_minutes,
+    )
 
     # Determine current signal
+    # A long EMA (200) stays NaN far longer than the rest; requiring it here
+    # would blank the whole panel, so the signal check uses the SMA set only.
     clean = df.dropna(subset=["sma_fast", "sma_slow", "rsi", "vol_sma", "atr"])
     signal_label = "⬜ HOLD — waiting for a confirmed signal"
     signal_color = GREY
     if len(clean) >= 2:
         prev, curr = clean.iloc[-2], clean.iloc[-1]
-        golden = prev["sma_fast"] <= prev["sma_slow"] and curr["sma_fast"] > curr["sma_slow"]
-        death  = prev["sma_fast"] >= prev["sma_slow"] and curr["sma_fast"] < curr["sma_slow"]
+        golden = crossed_up(prev, curr, "sma_fast", "sma_slow")
+        death  = crossed_down(prev, curr, "sma_fast", "sma_slow")
         high_vol      = curr["volume"] > curr["vol_sma"]
         not_overbought = curr["rsi"] < 70
         not_oversold   = curr["rsi"] > 30
@@ -347,13 +371,13 @@ else:
             signal_label = f"🔴 SELL signal  |  RSI {curr['rsi']:.1f}  |  Volume confirmed"
             signal_color = RED
         elif golden and not high_vol:
-            signal_label = f"🟡 Golden cross but LOW VOLUME — signal not confirmed"
+            signal_label = "🟡 Golden cross but LOW VOLUME — signal not confirmed"
             signal_color = YELLOW
         elif golden and not not_overbought:
             signal_label = f"🟡 Golden cross but RSI OVERBOUGHT ({curr['rsi']:.1f}) — signal not confirmed"
             signal_color = YELLOW
         elif death and not high_vol:
-            signal_label = f"🟡 Death cross but LOW VOLUME — signal not confirmed"
+            signal_label = "🟡 Death cross but LOW VOLUME — signal not confirmed"
             signal_color = YELLOW
         elif death and not not_oversold:
             signal_label = f"🟡 Death cross but RSI OVERSOLD ({curr['rsi']:.1f}) — signal not confirmed"
@@ -369,11 +393,17 @@ else:
 
     # ── Four-panel chart ──────────────────────────────────────────────────────
     fig = make_subplots(
-        rows=4, cols=1,
+        rows=5, cols=1,
         shared_xaxes=True,
-        row_heights=[0.50, 0.18, 0.18, 0.14],
-        vertical_spacing=0.04,
-        subplot_titles=("Price + SMAs", "RSI (14)", "Volume", "ATR — Volatility"),
+        row_heights=[0.42, 0.16, 0.15, 0.15, 0.12],
+        vertical_spacing=0.035,
+        subplot_titles=(
+            "Price + SMAs, EMAs & VWAP",
+            f"RSI ({rsi_period})",
+            f"MACD ({macd_fast}/{macd_slow}/{macd_signal})",
+            "Volume",
+            f"ATR ({atr_period}) — Volatility",
+        ),
     )
 
     ts = df["timestamp"] if "timestamp" in df.columns else df.index
@@ -385,6 +415,22 @@ else:
         increasing_line_color=GREEN, decreasing_line_color=RED,
         increasing_fillcolor=GREEN, decreasing_fillcolor=RED,
     ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=ts, y=df["vwap"], name="VWAP",
+        line=dict(color=YELLOW, width=2, dash="dot"),
+    ), row=1, col=1)
+
+    ema_palette = ["#b48ead", "#d08770", "#88c0d0", "#a3be8c", "#ebcb8b"]
+    for i, period in enumerate(sorted(ema_periods)):
+        col = f"ema_{period}"
+        if col not in df.columns:
+            continue
+        fig.add_trace(go.Scatter(
+            x=ts, y=df[col], name=f"EMA {period}",
+            line=dict(color=ema_palette[i % len(ema_palette)],
+                      width=1.6 if period >= 100 else 1.2),
+        ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
         x=ts, y=df["sma_fast"], name=f"Fast SMA ({sma_fast})",
@@ -415,27 +461,43 @@ else:
     fig.add_hrect(y0=70, y1=100, fillcolor=RED,   opacity=0.07, row=2, col=1, line_width=0)
     fig.add_hrect(y0=0,  y1=30,  fillcolor=GREEN, opacity=0.07, row=2, col=1, line_width=0)
 
+    # — MACD —
+    hist_colors = [GREEN if h >= 0 else RED for h in df["macd_hist"].fillna(0)]
+    fig.add_trace(go.Bar(
+        x=ts, y=df["macd_hist"], name="Histogram",
+        marker_color=hist_colors, showlegend=False, opacity=0.55,
+    ), row=3, col=1)
+    fig.add_trace(go.Scatter(
+        x=ts, y=df["macd"], name="MACD",
+        line=dict(color=BLUE, width=1.5),
+    ), row=3, col=1)
+    fig.add_trace(go.Scatter(
+        x=ts, y=df["macd_signal"], name="Signal",
+        line=dict(color=YELLOW, width=1.2),
+    ), row=3, col=1)
+    fig.add_hline(y=0, line_width=1, line_color=GREY, row=3, col=1)
+
     # — Volume (coloured by above/below average) —
     vol_colors = [BLUE if v > a else GREY
                   for v, a in zip(df["volume"], df["vol_sma"])]
     fig.add_trace(go.Bar(
         x=ts, y=df["volume"], name="Volume",
         marker_color=vol_colors, showlegend=False,
-    ), row=3, col=1)
+    ), row=4, col=1)
     fig.add_trace(go.Scatter(
         x=ts, y=df["vol_sma"], name=f"Vol SMA ({vol_sma_period})",
         line=dict(color=YELLOW, width=1.2, dash="dot"),
-    ), row=3, col=1)
+    ), row=4, col=1)
 
     # — ATR —
     fig.add_trace(go.Scatter(
         x=ts, y=df["atr"], name=f"ATR ({atr_period})",
         line=dict(color="#fb923c", width=1.5),
         fill="tozeroy", fillcolor="rgba(251,146,60,0.12)",
-    ), row=4, col=1)
+    ), row=5, col=1)
 
     fig.update_layout(
-        height=780,
+        height=920,
         xaxis_rangeslider_visible=False,
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
@@ -466,6 +528,25 @@ else:
                   f"${curr['atr']:,.4f}",
                   delta=f"{atr_pct:.2f}% of price",
                   delta_color="off")
+
+        d1, d2, d3, d4, d5 = st.columns(5)
+        vwap_gap = (curr["close"] - curr["vwap"]) / curr["vwap"] * 100
+        d1.metric("VWAP (today)", f"${curr['vwap']:,.4f}",
+                  delta=f"{vwap_gap:+.2f}% vs price", delta_color="off")
+        shown = [p for p in sorted(ema_periods) if f"ema_{p}" in clean.columns][:2]
+        for col_box, period in zip((d2, d3), shown):
+            col_box.metric(f"EMA {period}", f"${curr[f'ema_{period}']:,.4f}")
+        d4.metric("MACD", f"{curr['macd']:,.4f}")
+        hist = curr["macd_hist"]
+        d5.metric("MACD Signal", f"{curr['macd_signal']:,.4f}",
+                  delta=f"hist {hist:+.4f}",
+                  delta_color="normal" if hist >= 0 else "inverse")
+
+        st.caption(
+            f"Periods are bar counts at the selected {bar_minutes}-minute resolution. "
+            f"SMA({sma_slow}) spans {sma_slow * bar_minutes} minutes here. "
+            f"VWAP resets each trading day."
+        )
 
 st.divider()
 
