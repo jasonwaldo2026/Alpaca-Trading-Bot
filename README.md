@@ -27,7 +27,23 @@ pip install -r requirements.txt
 cp .env.example .env   # paste your keys in
 ```
 
-### 3. Run whichever app you want
+### 3. Run it
+
+The one-click way — starts the scanner in watch mode (alerts to your
+phone) **and** Studio (charts and rule builder) together:
+
+```bash
+python start.py
+```
+
+On a Mac, double-click `start.command` instead; on Windows,
+`start.bat`. It prints the addresses Studio can be opened from, including
+the Tailscale one for your phone, keeps the computer from idling to
+sleep, and stops everything with Ctrl-C. `--studio` or `--scanner` runs
+just one; `--dry-run` shows what would run.
+
+Each app can also be started on its own:
+
 ```bash
 python trading_bot.py            # the bot
 streamlit run dashboard.py       # the dashboard
@@ -62,8 +78,8 @@ an encrypted link, with nothing opened to the public internet.
    with the same account. Both should show **Connected**.
 2. In the Tailscale app on the phone, the computer appears in the device
    list with a name (e.g. `jasons-mac`) and an address starting `100.`.
-3. On the computer, start Studio as usual: `streamlit run studio/app.py`.
-   It listens on every network interface, Tailscale's included.
+3. On the computer, run `python start.py` (or double-click
+   `start.command`). It prints the Tailscale address to use.
 4. On the phone, anywhere, open `http://jasons-mac:8501` (or
    `http://100.x.y.z:8501` using the address from step 2). Add it to the
    home screen.

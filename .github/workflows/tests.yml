@@ -28,7 +28,7 @@ jobs:
       # a style linter: the repo has no formatting convention to enforce, and
       # a red check for line length would teach people to ignore red checks.
       - name: Lint
-        run: python -m pyflakes core bot scanner studio tests dashboard.py trading_bot.py
+        run: python -m pyflakes core bot scanner studio tests dashboard.py trading_bot.py start.py
 
       # No network and no credentials: every test drives a fake fetcher.
       - name: Test
