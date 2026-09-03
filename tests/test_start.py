@@ -40,3 +40,9 @@ def test_studio_only_and_scanner_only(capsys, monkeypatch):
     assert "scanner:" not in capsys.readouterr().out
     start.main(["--dry-run", "--scanner"])
     assert "studio:" not in capsys.readouterr().out
+
+
+def test_keep_awake_is_a_no_op_off_windows():
+    # On Mac/Linux caffeinate does the job; this must not raise there.
+    start.keep_awake_windows(True)
+    start.keep_awake_windows(False)

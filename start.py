@@ -10,9 +10,10 @@ Double-click `start.command` on a Mac or `start.bat` on Windows to run
 this without opening a terminal yourself.
 
 The scanner prints matches here and sends Pushover alerts; Studio runs
-quietly and logs to studio.log. Both stop together on Ctrl-C. On a Mac,
-`caffeinate` keeps the computer from idling to sleep while this runs —
-a sleeping computer scans nothing and alerts nobody.
+quietly and logs to studio.log. Both stop together on Ctrl-C. While this
+runs the computer is kept from idling to sleep — `caffeinate` on a Mac,
+SetThreadExecutionState on Windows — because a sleeping computer scans
+nothing and alerts nobody.
 """
 
 import os
@@ -29,9 +30,30 @@ ROOT = Path(__file__).resolve().parent
 STUDIO_PORT = 8501
 STUDIO_LOG = ROOT / "studio.log"
 
-# Tailscale's CLI lives here on a Mac when installed from the App Store;
-# on Linux and Windows it is on PATH.
-TAILSCALE_MAC = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+# Tailscale's CLI is on PATH on Linux, and usually on Windows; the Mac App
+# Store build keeps it inside the app bundle, and a fresh Windows install
+# may not have refreshed PATH yet.
+TAILSCALE_PATHS = (
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    r"C:\Program Files\Tailscale\tailscale.exe",
+)
+
+# Windows: SetThreadExecutionState flags.
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def keep_awake_windows(enable: bool) -> None:
+    """Stop (or allow) idle sleep while the scanner runs. Display may still
+    turn off; that is fine."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        flags = ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if enable else 0)
+        ctypes.windll.kernel32.SetThreadExecutionState(flags)
+    except Exception:                       # noqa: BLE001 - best effort
+        pass
 
 
 def scanner_command(env: Dict[str, str], python: str = sys.executable) -> List[str]:
@@ -61,7 +83,7 @@ def studio_command(python: str = sys.executable, port: int = STUDIO_PORT) -> Lis
 
 def tailscale_ip() -> Optional[str]:
     """This machine's Tailscale address, or None when Tailscale is absent."""
-    for exe in (shutil.which("tailscale"), TAILSCALE_MAC):
+    for exe in (shutil.which("tailscale"), *TAILSCALE_PATHS):
         if not exe or not Path(exe).exists():
             continue
         try:
@@ -137,6 +159,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         if shutil.which("caffeinate"):
             caffeinate = subprocess.Popen(["caffeinate", "-i"])
+        keep_awake_windows(True)
         for name, cmd, log in plans:
             if log:
                 handle = open(log, "a")
@@ -174,6 +197,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 proc.kill()
         if caffeinate and caffeinate.poll() is None:
             caffeinate.terminate()
+        keep_awake_windows(False)
         for handle in log_handles:
             handle.close()
 
