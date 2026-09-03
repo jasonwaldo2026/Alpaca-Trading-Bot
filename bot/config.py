@@ -83,7 +83,7 @@ class BotConfig:
     # Momentum and oscillation measures
     roc_period: int = 2            # 2 bars = 10 minutes at 5-minute bars
     choppiness_period: int = 24    # window for efficiency and range percent
-    swing_threshold_pct: float = 5.0
+    swing_threshold_pct: float = 1.0
 
     # Market sessions
     #

@@ -325,25 +325,24 @@ def test_zero_baseline_volume_does_not_divide_by_zero():
     assert relative_volume(pd.Series([100.0]), pd.Series([0.0])).isna().all()
 
 
-def test_the_momentum_runner_scenario_loads_and_validates():
+def test_the_strength_scenario_carries_the_rules_of_engagement():
     from core.rules import load_rules
-    rule = load_rules(["rules/momentum-runner.json"])[0]
+    rule = load_rules(["rules/strong-above-vwap.json"])[0]
     rule.validate()
     assert rule.params.roc_period == 2
     assert rule.params.bar_minutes == 5
-    assert "roc >= 10" in rule.describe()
-    assert "rvol >= 3" in rule.describe()
+    described = rule.describe()
+    assert "close > vwap for 3 bars" in described
+    assert "roc >= 10" in described
+    assert "rvol >= 3" in described
+    assert "float_millions <= 50" in described
 
 
-def test_the_momentum_alert_says_what_it_cannot_check():
-    """An alert must not be mistaken for a full screen when two of the four
-    criteria are not evaluated."""
+def test_the_strength_alert_uses_the_requested_wording():
     from core.rules import load_rules
-    rule = load_rules(["rules/momentum-runner.json"])[0]
+    rule = load_rules(["rules/strong-above-vwap.json"])[0]
     payload = rule.alert.render(build_context(
         "ABCD", 5.20, rule.name, rule.alert,
-        {"roc": 12.4, "rvol": 4.1, "vwap": 5.02},
+        {"roc": 12.4, "rvol": 4.1, "vwap": 5.02, "float_millions": 8.2},
     ))
-    assert "ABCD is running" in payload["message"]
-    assert "float" in payload["message"].lower()
-    assert "12 months" in payload["message"]
+    assert "ABCD stock is strong and trading above VWAP" in payload["message"]

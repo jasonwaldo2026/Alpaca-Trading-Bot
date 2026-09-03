@@ -1,0 +1,5 @@
+{
+  "_comment": "Float per symbol. Values under 100000 are read as millions, so 8.2 means 8.2M shares; larger values are read as raw share counts. Copy to floats.json (gitignored) and maintain the names you actually watch.",
+  "ABCD": 8.2,
+  "WXYZ": 45.0
+}

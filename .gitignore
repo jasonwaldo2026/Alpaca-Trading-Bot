@@ -29,6 +29,11 @@ bot.log
 # Scanner run state
 .scanner-state.json
 .scanner-alerts.json
+.alpaca-assets.json
+.float-cache.json
+
+# Your float watchlist (copy floats.example.json)
+floats.json
 
 # OS
 .DS_Store

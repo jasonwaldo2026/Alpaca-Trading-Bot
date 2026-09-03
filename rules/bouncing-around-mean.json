@@ -1,0 +1,22 @@
+{
+  "name": "bouncing around the mean",
+  "description": "Legs of any size added together reach 10% of travel with almost no net movement to show for it — a stock worth trading repeatedly through the day rather than holding. Mean reversion, and the opposite of 'strong above VWAP'; if both fire on one symbol, trust neither.",
+  "universe": "all_tradable",
+  "conditions": [
+    {"field": "swing_total_pct", "op": ">=", "value": 10},
+    {"field": "swings", "op": ">=", "value": 2},
+    {"field": "efficiency", "op": "<=", "value": 0.35}
+  ],
+  "alert": {
+    "title": "Bouncing around the mean",
+    "message": "{symbol} stock is repeatedly bouncing at least 10% around the mean price\n\n{swings} legs totalling {swing_total_pct}% travelled today\nPrice ${price}  •  VWAP ${vwap}  •  suggested limit ${limit_price}",
+    "priority": 0,
+    "limit_offset_pct": 0.001
+  },
+  "params": {
+    "sma_fast": 10, "sma_slow": 30, "ema_periods": [9, 12, 200],
+    "rsi_period": 14, "volume_sma_period": 20, "atr_period": 14,
+    "roc_period": 2, "choppiness_period": 24, "swing_threshold_pct": 1.0,
+    "macd_fast": 12, "macd_slow": 26, "macd_signal": 9, "bar_minutes": 5
+  }
+}

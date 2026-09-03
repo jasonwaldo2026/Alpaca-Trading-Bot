@@ -30,6 +30,7 @@ COL_RVOL = "rvol"
 COL_EFFICIENCY = "efficiency"
 COL_RANGE_PCT = "range_pct"
 COL_SWINGS = "swings"
+COL_SWING_TOTAL = "swing_total_pct"
 
 #: Columns that do not depend on configuration. EMA columns are named after
 #: their period (ema_9, ema_200, …) so several can coexist, so the full list
@@ -39,7 +40,7 @@ FIXED_INDICATOR_COLUMNS = (
     COL_RSI, COL_VOL_SMA, COL_ATR, COL_VWAP,
     COL_MACD, COL_MACD_SIGNAL, COL_MACD_HIST,
     COL_ROC, COL_RVOL,
-    COL_EFFICIENCY, COL_RANGE_PCT, COL_SWINGS,
+    COL_EFFICIENCY, COL_RANGE_PCT, COL_SWINGS, COL_SWING_TOTAL,
 )
 
 
@@ -94,9 +95,13 @@ class IndicatorParams:
     #: several swings, short enough to describe today rather than last week.
     choppiness_period: int = 24
 
-    #: A reversal of at least this percent counts as one swing. 5.0 matches
-    #: "up and down 5% over and over".
-    swing_threshold_pct: float = 5.0
+    #: Noise floor, not the pattern. A reversal smaller than this is not
+    #: treated as a leg at all, which stops tick-level jitter from being
+    #: counted as a bounce. The *pattern* is defined by how much the legs add
+    #: up to (`swing_total_pct`), not by any individual leg's size — a stock
+    #: that moves 2% eight times is bouncing just as much as one that moves
+    #: 8% twice.
+    swing_threshold_pct: float = 1.0
     atr_period: int = 14
     macd_fast: int = 12
     macd_slow: int = 26
@@ -410,82 +415,78 @@ def range_pct(df: pd.DataFrame, period: int) -> pd.Series:
     return (highest - lowest) / lowest.replace(0, float("nan")) * 100
 
 
-def _count_swings(prices, threshold_pct: float):
+def _walk_swings(prices, threshold_pct: float):
     """
-    Running count of completed legs of at least `threshold_pct`.
+    Walk a price series as a zigzag, returning running (count, total_pct).
 
-    A zigzag: track the extreme reached in the current direction, and when
-    price retraces from it by the threshold, that leg is complete — count it
-    and flip direction. The retracement is measured from the extreme, which
-    is what a trader means by "it pulled back 5%".
+    A leg runs from the last pivot to the extreme reached before price
+    retraced by `threshold_pct`. When that happens the leg is complete: its
+    size is measured pivot-to-extreme, added to the total, and the extreme
+    becomes the next pivot.
+
+    Measuring the retracement from the extreme is what a trader means by
+    "it pulled back"; measuring the leg pivot-to-extreme is what they mean by
+    "it moved 8%".
     """
-    counts = []
-    extreme = None
+    counts, totals = [], []
+    pivot = extreme = None
     direction = 0          # +1 rising, -1 falling, 0 not yet established
-    count = 0
+    count, total = 0, 0.0
+
+    def complete_leg(new_pivot):
+        nonlocal count, total, pivot
+        if pivot:
+            total += abs(new_pivot - pivot) / pivot * 100
+        count += 1
+        pivot = new_pivot
 
     for price in prices:
         if price is None or pd.isna(price) or price <= 0:
             counts.append(count)
+            totals.append(total)
             continue
-        if extreme is None:
-            extreme = price
+        if pivot is None:
+            pivot = extreme = price
             counts.append(count)
+            totals.append(total)
             continue
 
         if direction == 1:
             if price > extreme:
                 extreme = price
             elif (extreme - price) / extreme * 100 >= threshold_pct:
-                count += 1                 # the up leg completed
+                complete_leg(extreme)
                 direction = -1
                 extreme = price
         elif direction == -1:
             if price < extreme:
                 extreme = price
             elif (price - extreme) / extreme * 100 >= threshold_pct:
-                count += 1                 # the down leg completed
+                complete_leg(extreme)
                 direction = 1
                 extreme = price
         else:
-            # First move large enough to establish a direction.
             if (price - extreme) / extreme * 100 >= threshold_pct:
-                count += 1
                 direction = 1
                 extreme = price
             elif (extreme - price) / extreme * 100 >= threshold_pct:
-                count += 1
                 direction = -1
                 extreme = price
 
         counts.append(count)
+        totals.append(total)
 
-    return counts
+    return counts, totals
 
 
-def swing_count(
-    series: pd.Series,
-    threshold_pct: float = 5.0,
-    anchor: Optional[pd.Series] = None,
-) -> pd.Series:
-    """
-    How many times price has reversed by `threshold_pct`, so far today.
-
-    This is the most literal reading of "goes up and down 5% over and over":
-    each completed leg of at least that size adds one. A stock at 4 swings by
-    lunchtime has offered four entries; one at 0 has trended or gone nowhere.
-
-    `anchor` (from `core.sessions.session_day_series`) resets the count each
-    trading day — like VWAP, yesterday's swings are not today's opportunity.
-    Without it the count runs from the start of the frame.
-    """
+def _swing_series(series, threshold_pct, anchor, which: int, name: str):
     if threshold_pct <= 0:
         raise ValueError(f"swing threshold must be > 0; got {threshold_pct}.")
 
     if anchor is None:
         return pd.Series(
-            _count_swings(series.tolist(), threshold_pct),
-            index=series.index, name=COL_SWINGS,
+            _walk_swings(series.tolist(), threshold_pct)[which],
+            index=series.index, name=name,
         )
 
     if not series.index.equals(anchor.index):
@@ -495,9 +496,48 @@ def swing_count(
         )
     return series.groupby(anchor, sort=False).transform(
         lambda group: pd.Series(
-            _count_swings(group.tolist(), threshold_pct), index=group.index
+            _walk_swings(group.tolist(), threshold_pct)[which], index=group.index
         )
     )
+
+
+def swing_count(
+    series: pd.Series,
+    threshold_pct: float = 1.0,
+    anchor: Optional[pd.Series] = None,
+) -> pd.Series:
+    """
+    How many legs of at least `threshold_pct` have completed so far today.
+
+    The threshold is a noise floor, not the pattern: it stops jitter being
+    counted as a bounce. How *far* the stock has travelled is
+    `swing_total_pct`, which is the measure that says whether the bouncing is
+    worth trading.
+
+    `anchor` (from `core.sessions.session_day_series`) resets each trading
+    day — like VWAP, yesterday's swings are not today's opportunity.
+    """
+    return _swing_series(series, threshold_pct, anchor, 0, COL_SWINGS)
+
+
+def swing_total_pct(
+    series: pd.Series,
+    threshold_pct: float = 1.0,
+    anchor: Optional[pd.Series] = None,
+) -> pd.Series:
+    """
+    Total percent travelled in completed legs so far today.
+
+    This is the measure that matters for "bouncing enough to trade". Legs of
+    any size add up: eight 2% moves and two 8% moves both reach roughly 16%,
+    and both give the same opportunity. Pinning the pattern to a specific leg
+    size would miss whichever shape the stock happens to have.
+
+    Pair it with `efficiency` to tell bouncing from trending — 10% travelled
+    in one direction is a trend, 10% travelled ending where it started is a
+    range.
+    """
+    return _swing_series(series, threshold_pct, anchor, 1, COL_SWING_TOTAL)
 
 
 def volume_sma_by_session(
@@ -578,6 +618,9 @@ def add_indicators(
     out[COL_EFFICIENCY] = efficiency_ratio(out["close"], params.choppiness_period)
     out[COL_RANGE_PCT] = range_pct(out, params.choppiness_period)
     out[COL_SWINGS] = swing_count(
+        out["close"], params.swing_threshold_pct, anchor
+    )
+    out[COL_SWING_TOTAL] = swing_total_pct(
         out["close"], params.swing_threshold_pct, anchor
     )
 

@@ -187,8 +187,11 @@ class Rule:
 
     def available_fields(self) -> set:
         """Every column a match on this rule can reference, for templates."""
-        return {"open", "high", "low", "close", "volume"} | set(
-            indicator_columns(self.params)
+        from core.fundamentals import COL_FLOAT_MILLIONS, COL_FLOAT_SHARES
+        return (
+            {"open", "high", "low", "close", "volume",
+             COL_FLOAT_SHARES, COL_FLOAT_MILLIONS}
+            | set(indicator_columns(self.params))
         )
 
     def matches(self, bars: pd.DataFrame) -> bool:

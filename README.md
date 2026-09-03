@@ -104,32 +104,40 @@ in the app. From the stock page it is Trade → Buy → Limit. So the link saves
 the app launch and the symbol search, not the taps; the suggested limit price
 rides in the message text so both numbers you need are already on screen.
 
-### Shipped scenarios
+### The two scenarios
 
-| File | Looks for |
+| File | Alert |
 |---|---|
-| `vwap-hold.json` | Close above VWAP for 3 consecutive 5-minute bars |
-| `vwap-hold-confirmed.json` | The same, plus volume above baseline and EMA9 > EMA12 |
-| `momentum-runner.json` | Up ≥10% in 10 minutes, ≥3x relative volume, above VWAP |
-| `oscillator.json` | Cycling rather than trending — ≥4 swings of 5%+ today, ≥8% range, efficiency ≤0.3 |
+| `strong-above-vwap.json` | *"XXXX stock is strong and trading above VWAP"* |
+| `bouncing-around-mean.json` | *"XXXX stock is repeatedly bouncing at least 10% around the mean price"* |
 
-`oscillator` is a **mean-reversion** signal and the opposite of `vwap hold`,
-which is momentum. They describe different stocks; if both ever fire on the
-same symbol, trust neither. It uses three measures together, because none
-works alone:
+**Strong above VWAP** fires when price has held above VWAP for three
+consecutive 5-minute bars *and* the rules of engagement agree: up ≥10% in the
+last 10 minutes, ≥3x normal volume, float ≤50M.
 
-- `efficiency` — net move ÷ distance travelled. 1.0 is a straight line, near
-  0 means it covered ground and ended up where it started.
-- `range_pct` — high-to-low amplitude. Supplies "is it worth trading": a
-  0.1% wobble is just as inefficient as a 5% swing.
-- `swings` — completed 5% legs so far today, reset each session like VWAP.
-  The most literal reading of "up and down over and over".
+**Bouncing around the mean** adds up legs of *any* size — the pattern is the
+total travelled, not any particular swing. When completed legs reach 10% with
+almost no net movement to show for it, the stock has offered repeated
+entries. It is mean reversion and the opposite of the first; if both ever
+fire on one symbol, trust neither.
 
-`momentum-runner` covers two of the four momentum criteria. **Low float and
-"spiked in the last 12 months" are not checked** — float is fundamental data
-Alpaca does not serve, and the prior spike needs daily bars as a universe
-filter. The alert message says so. See
-`docs/specs/core/missing-fundamentals.md`.
+Both scan `all_tradable` — every US equity Alpaca lists. Any stock can fit
+any scenario, so nothing is restricted by default. That is ~11,000 symbols;
+see `docs/specs/scanner/universe-size.md` for what a sweep that wide costs.
+
+### Float
+
+Low-float conditions need a source Alpaca does not provide. Financial
+Modeling Prep has one, free, with a bulk endpoint that covers the whole
+market in a few requests:
+
+```bash
+export FMP_API_KEY=...
+```
+
+Alternatively maintain `floats.json` by hand (copy `floats.example.json`).
+**Without either, low-float conditions cannot be met** — unknown float fails
+closed, so the scenario simply never fires rather than matching everything.
 
 ## Scanner and Studio
 

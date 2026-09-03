@@ -1,6 +1,6 @@
 # Float and prior-spike screening
 
-**Status:** blocked — the data is not available from Alpaca
+**Status:** float done via FMP; prior-spike screening still open
 **Touches:** would need a new data source
 
 ## Why this is a spec and not a feature
@@ -8,26 +8,38 @@
 Two of the four rules of engagement cannot be evaluated from Alpaca's market
 data API:
 
-### Low float
+### Low float — solved
 
-Float — shares actually available to trade — is fundamental data. Alpaca's
-market data API serves bars, quotes and trades; it does not serve shares
-outstanding or float. There is no column to compute it from.
+Float is fundamental data. Alpaca's market data API serves bars, quotes and
+trades, not shares outstanding, so it has to come from elsewhere.
 
-Float matters here precisely because it is not derivable from price and
-volume: it is why a given amount of buying moves a small-cap far more than
-a mega-cap, which is the whole premise of the setup.
+**Financial Modeling Prep** provides it, on the free tier, and — critically —
+has a **bulk endpoint**. `stable/all-shares-float` returns the whole market
+in a few paged requests, which is the only shape that works when the scan
+universe is 11,000 symbols. One lookup per symbol would be 11,000 requests a
+scan.
 
-Options, none free and all needing a decision:
+```bash
+export FMP_API_KEY=...        # free tier is enough
+python -m scanner.cli --watch
+```
 
-- A fundamentals provider (Financial Modeling Prep, Polygon, Finnhub) —
-  another API key, another rate limit, and float updates slowly so it can be
-  cached daily rather than fetched per scan.
-- A hand-maintained watchlist of low-float names, refreshed occasionally.
-  Crude, but for a universe of a few dozen candidates it is honest and free.
+`core/fundamentals.py` has three providers, chosen in this order:
 
-The second is probably right to start: the scan universe is already a curated
-list, so curate it for float.
+| Provider | Source | When |
+|---|---|---|
+| `StaticFloatProvider` | a JSON file you maintain | present — explicit and cannot fail |
+| `FMPFloatProvider` | FMP, bulk + cached daily | `FMP_API_KEY` is set |
+| `YahooFloatProvider` | yfinance, one symbol at a time | `--yahoo-floats` |
+
+**Everything fails closed.** Unknown float becomes NaN in the scan frame,
+and a NaN comparison is False, so a low-float condition *skips* a symbol
+whose float is unknown rather than matching it. Silently matching everything
+because a lookup failed is the dangerous direction, and a test pins it.
+`ScanResult.missing_float` records the symbols that had no data.
+
+The FMP key travels in the query string, so `_scrub()` removes it from any
+logged error message.
 
 ### Spiked in the previous 12 months
 
@@ -42,20 +54,19 @@ than evaluated on every 5-minute scan.
 
 ## What is implemented instead
 
-`rules/momentum-runner.json` covers the two that are expressible:
+`rules/strong-above-vwap.json` covers three of the four:
 
 | Rule of engagement | Condition |
 |---|---|
 | Up ~10% in 10 minutes | `roc >= 10` with `roc_period: 2` at 5-minute bars |
 | High relative volume | `rvol >= 3` |
 | (added) holding above VWAP | `close > vwap` |
-| Low float | **not checked** |
+| Low float | `float_millions <= 50`, from FMP |
 | Spiked in last 12 months | **not checked** |
 
-The alert message says so explicitly, so an alert is never mistaken for a
-full screen:
-
-> Check by hand: float, and whether it spiked in the last 12 months.
+Only the 12-month prior spike is still unchecked. It is a universe filter
+rather than a per-bar condition — it changes rarely, so it should be computed
+once a day from daily bars and used to narrow the symbol list.
 
 ## A caveat on `rvol`
 
@@ -74,7 +85,7 @@ symbol, bucketed by minute-of-session. Worth doing; not done.
 
 ## Done when
 
-- [ ] A decision on the float source (provider vs curated list)
+- [x] Float via FMP, with a static file as the explicit alternative
 - [ ] Prior-spike computed daily from daily bars, applied as a universe filter
 - [ ] Time-of-day relative volume, or a documented decision to keep the
       per-bar version

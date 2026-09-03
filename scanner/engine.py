@@ -16,6 +16,12 @@ import pandas as pd
 
 from core import universe
 from core.data import MarketDataFetcher, bar_coverage
+from core.fundamentals import (
+    COL_FLOAT_MILLIONS,
+    COL_FLOAT_SHARES,
+    FloatProvider,
+    NullFloatProvider,
+)
 from core.indicators import add_indicators
 from core.rules import Rule
 from core.sessions import (
@@ -52,6 +58,8 @@ class ScanResult:
     matches: List[Match] = field(default_factory=list)
     scanned: int = 0
     skipped: Dict[str, str] = field(default_factory=dict)  # symbol → why
+    #: Symbols skipped because a rule needed float and none was available.
+    missing_float: List[str] = field(default_factory=list)
     #: symbol → coverage description, for series with visible gaps. Thin
     #: pre-market tape (or a narrow feed like IEX) produces far fewer bars
     #: than the clock suggests, which stretches every rolling indicator.
@@ -69,7 +77,8 @@ class ScanResult:
 #: periods show up automatically.
 _REPORTED_FIXED = (
     "rsi", "atr", "vwap", "macd", "macd_signal", "sma_fast", "sma_slow",
-    "vol_sma",
+    "vol_sma", "roc", "rvol", "efficiency", "swings", "swing_total_pct",
+    COL_FLOAT_MILLIONS,
 )
 
 
@@ -91,6 +100,7 @@ class Scanner:
         calendar: SessionCalendar = DEFAULT_CALENDAR,
         skip_closed: bool = True,
         bar_minutes: int = DEFAULT_BAR_MINUTES,
+        fundamentals: Optional[FloatProvider] = None,
     ):
         self.fetcher = fetcher
         self.bar_limit = bar_limit
@@ -100,6 +110,11 @@ class Scanner:
         # Backtests and Studio previews scan regardless of the clock; a
         # scheduled sweep should not waste calls on a closed market.
         self.skip_closed = skip_closed
+        # Float is a per-symbol constant, not a per-bar indicator, so it is
+        # attached as a column here rather than computed in core.indicators.
+        # Unknown float becomes NaN, and a NaN comparison is False — a rule
+        # requiring low float skips the symbol rather than matching it.
+        self.fundamentals = fundamentals or NullFloatProvider()
 
     def scan(
         self,
@@ -144,6 +159,14 @@ class Scanner:
             if not wanted:
                 return result
 
+        # One bulk float load per scan rather than a lookup per symbol.
+        warm = getattr(self.fundamentals, "warm", None)
+        if callable(warm):
+            try:
+                warm(wanted)
+            except Exception as exc:                 # noqa: BLE001
+                log.warning("Float pre-load failed, continuing without: %s", exc)
+
         bars = self.fetcher.get_bars(wanted, limit=self.bar_limit)
 
         # Cache enriched frames per (symbol, params) so two rules sharing
@@ -176,9 +199,17 @@ class Scanner:
                         anchor = session_day_series(df.index, sym, self.calendar)
                         if self.sessions.requires_extended_hours_orders():
                             sessions = session_series(df.index, sym, self.calendar)
-                    enriched_cache[key] = add_indicators(
-                        df, rule.params, sessions, anchor
+                    enriched = add_indicators(df, rule.params, sessions, anchor)
+                    shares = self.fundamentals.float_shares(sym)
+                    enriched[COL_FLOAT_SHARES] = (
+                        float(shares) if shares else float("nan")
                     )
+                    enriched[COL_FLOAT_MILLIONS] = (
+                        float(shares) / 1_000_000 if shares else float("nan")
+                    )
+                    if shares is None and sym not in result.missing_float:
+                        result.missing_float.append(sym)
+                    enriched_cache[key] = enriched
 
                 enriched = enriched_cache.get(key)
                 if enriched is None:

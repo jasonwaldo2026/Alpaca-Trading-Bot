@@ -1,0 +1,23 @@
+{
+  "name": "strong above VWAP",
+  "description": "Price has held above VWAP for three consecutive 5-minute bars, with the rules of engagement agreeing: up at least 10% in the last 10 minutes, at least 3x its usual volume, and a float under 50 million shares. Float requires a data source — without one the condition cannot be met and this scenario will not fire. See docs/specs/core/missing-fundamentals.md.",
+  "universe": "all_tradable",
+  "conditions": [
+    {"field": "close", "op": ">", "field2": "vwap", "for_bars": 3},
+    {"field": "roc", "op": ">=", "value": 10},
+    {"field": "rvol", "op": ">=", "value": 3},
+    {"field": "float_millions", "op": "<=", "value": 50}
+  ],
+  "alert": {
+    "title": "Strong above VWAP",
+    "message": "{symbol} stock is strong and trading above VWAP\n\nPrice ${price}  •  VWAP ${vwap}  •  suggested limit ${limit_price}\nUp {roc}% in 10 min  •  {rvol}x volume  •  float {float_millions}M",
+    "priority": 1,
+    "limit_offset_pct": 0.002
+  },
+  "params": {
+    "sma_fast": 10, "sma_slow": 30, "ema_periods": [9, 12, 200],
+    "rsi_period": 14, "volume_sma_period": 20, "atr_period": 14,
+    "roc_period": 2, "choppiness_period": 24, "swing_threshold_pct": 1.0,
+    "macd_fast": 12, "macd_slow": 26, "macd_signal": 9, "bar_minutes": 5
+  }
+}
