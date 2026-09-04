@@ -37,10 +37,13 @@ python start.py
 ```
 
 On a Mac, double-click `start.command` instead; on Windows,
-`start.bat`. It prints the addresses Studio can be opened from, including
-the Tailscale one for your phone, keeps the computer from idling to
-sleep, and stops everything with Ctrl-C. `--studio` or `--scanner` runs
-just one; `--dry-run` shows what would run.
+`start.bat`. It first pulls the latest version from GitHub (and
+reinstalls requirements if they changed), so the whole update routine is
+"merge on GitHub, then double-click start". It then prints the addresses
+Studio can be opened from, including the Tailscale one for your phone,
+keeps the computer from idling to sleep, and stops everything with
+Ctrl-C. `--studio` or `--scanner` runs just one; `--no-update` skips the
+pull; `--dry-run` shows what would run.
 
 Each app can also be started on its own:
 

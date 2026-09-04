@@ -5,6 +5,12 @@ Start everything with one command.
     python start.py --studio   # Studio only
     python start.py --scanner  # scanner only
     python start.py --dry-run  # show what would run, run nothing
+    python start.py --no-update  # skip pulling the latest version first
+
+On every start it first pulls the latest version of the project from
+GitHub (fast-forward only, so it can never clobber local edits) and
+reinstalls requirements if they changed. That is the whole update routine:
+merge on GitHub, then double-click start.
 
 Double-click `start.command` on a Mac or `start.bat` on Windows to run
 this without opening a terminal yourself.
@@ -16,6 +22,7 @@ SetThreadExecutionState on Windows — because a sleeping computer scans
 nothing and alerts nobody.
 """
 
+import glob
 import os
 import shutil
 import signal
@@ -38,6 +45,65 @@ TAILSCALE_PATHS = (
     r"C:\Program Files\Tailscale\tailscale.exe",
     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps", "tailscale.exe"),
 )
+
+#: GitHub Desktop bundles its own git, which is not on PATH. These are the
+#: places it keeps it, so "I only have GitHub Desktop" is enough to update.
+GIT_BUNDLED = (
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "GitHubDesktop", "app-*",
+                 "resources", "app", "git", "cmd", "git.exe"),
+    "/Applications/GitHub Desktop.app/Contents/Resources/app/git/bin/git",
+)
+
+
+def git_executable() -> Optional[str]:
+    exe = shutil.which("git")
+    if exe:
+        return exe
+    for pattern in GIT_BUNDLED:
+        found = sorted(glob.glob(pattern))
+        if found:
+            return found[-1]          # newest GitHub Desktop version
+    return None
+
+
+def _run(cmd: List[str], timeout: float = 90) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=timeout)
+
+
+def self_update(python: str = sys.executable) -> str:
+    """
+    Pull the latest project from GitHub before starting.
+
+    Fast-forward only: if this copy has local edits that diverge, git
+    refuses and we start what is here rather than merge anything. If
+    requirements.txt changed, reinstall so a new dependency does not turn
+    into a crash on launch.
+    """
+    git = git_executable()
+    if not git:
+        return "Update skipped: git not found (install GitHub Desktop or git)."
+    try:
+        before = _run([git, "rev-parse", "HEAD"]).stdout.strip()
+        pulled = _run([git, "pull", "--ff-only"])
+        if pulled.returncode != 0:
+            reason = (pulled.stderr.strip() or pulled.stdout.strip()).splitlines()[-1:]
+            return "Update skipped: " + (reason[0] if reason else "git pull failed") + \
+                   " (starting the version already here)"
+        after = _run([git, "rev-parse", "HEAD"]).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"Update skipped: {exc} (starting the version already here)"
+
+    if before == after:
+        return "Already up to date."
+
+    changed = _run([git, "diff", "--name-only", before, after]).stdout.split()
+    note = f"Updated to the latest version ({len(changed)} file(s) changed)."
+    if "requirements.txt" in changed:
+        install = _run([python, "-m", "pip", "install", "-r", "requirements.txt"], timeout=600)
+        note += (" Requirements reinstalled." if install.returncode == 0
+                 else " Requirements changed but reinstall failed — run: pip install -r requirements.txt")
+    return note
+
 
 # Windows: SetThreadExecutionState flags.
 ES_CONTINUOUS = 0x80000000
@@ -153,6 +219,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     dry_run = "--dry-run" in argv
 
     os.chdir(ROOT)
+    if not dry_run and "--no-update" not in argv:
+        print(f"Checking for updates… {self_update()}")
     try:
         from dotenv import load_dotenv
         load_dotenv(ROOT / ".env")
