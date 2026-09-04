@@ -46,3 +46,27 @@ def test_keep_awake_is_a_no_op_off_windows():
     # On Mac/Linux caffeinate does the job; this must not raise there.
     start.keep_awake_windows(True)
     start.keep_awake_windows(False)
+
+
+def test_tailscale_addresses_are_the_cgnat_range_only():
+    assert start.is_tailscale_address("100.101.102.103")
+    assert start.is_tailscale_address("100.64.0.1")
+    assert start.is_tailscale_address("100.127.255.254")
+    assert not start.is_tailscale_address("100.128.0.1")
+    assert not start.is_tailscale_address("192.168.1.23")
+    assert not start.is_tailscale_address("10.0.0.5")
+
+
+def test_tailscale_ip_is_found_from_interfaces_without_the_cli(monkeypatch):
+    monkeypatch.setattr(start.socket, "getaddrinfo", lambda *a, **k: [
+        (None, None, None, None, ("192.168.1.23", 0)),
+        (None, None, None, None, ("100.90.1.2", 0)),
+    ])
+    assert start.tailscale_ip() == "100.90.1.2"
+
+
+def test_missing_tailscale_is_explained_not_silent(monkeypatch):
+    monkeypatch.setattr(start, "tailscale_ip", lambda: None)
+    urls = start.studio_urls(8501)
+    assert any("localhost:8501" in u for u in urls)
+    assert any("Tailscale not detected" in u for u in urls)

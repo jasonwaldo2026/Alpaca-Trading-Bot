@@ -144,3 +144,19 @@ def test_a_rule_is_only_evaluated_at_the_bar_size_it_was_written_for():
     )
     with pytest.raises(ValueError, match="written for 60-minute bars"):
         _scanner(FakeFetcher({"AAPL": _bars()}), bar_minutes=5).scan([hourly], ["AAPL"])
+
+
+def test_a_closed_market_scan_is_explained_rather_than_reported_as_zero():
+    from core.sessions import SessionConfig
+    from scanner.cli import closed_market_note, scan_window
+    from scanner.engine import ScanResult
+
+    closed = ScanResult(skipped={"AAPL": "market closed (closed session)",
+                                 "TSLA": "market closed (closed session)"})
+    note = closed_market_note(closed, SessionConfig.extended())
+    assert "Market closed" in note and "04:00-20:00 ET" in note
+
+    # A scan that touched symbols, or skipped them for another reason, is not "closed".
+    assert closed_market_note(ScanResult(scanned=3), SessionConfig.extended()) == ""
+    assert closed_market_note(ScanResult(skipped={"X": "no data returned"}), SessionConfig()) == ""
+    assert scan_window(SessionConfig.regular_only()) == "09:30-16:00 ET"

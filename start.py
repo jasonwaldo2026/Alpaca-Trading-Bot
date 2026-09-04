@@ -36,6 +36,7 @@ STUDIO_LOG = ROOT / "studio.log"
 TAILSCALE_PATHS = (
     "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
     r"C:\Program Files\Tailscale\tailscale.exe",
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps", "tailscale.exe"),
 )
 
 # Windows: SetThreadExecutionState flags.
@@ -81,8 +82,33 @@ def studio_command(python: str = sys.executable, port: int = STUDIO_PORT) -> Lis
     ]
 
 
+def is_tailscale_address(ip: str) -> bool:
+    """Tailscale hands out addresses in 100.64.0.0/10 — 100.64.x.x through
+    100.127.x.x. Ordinary home networks never use that range."""
+    parts = ip.split(".")
+    return (len(parts) == 4 and parts[0] == "100" and parts[1].isdigit()
+            and 64 <= int(parts[1]) <= 127)
+
+
+def tailscale_ip_from_interfaces() -> Optional[str]:
+    """The Tailscale address as the OS sees it, no CLI needed. Works when
+    the app is installed but its command-line tool is not on PATH."""
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except socket.gaierror:
+        return None
+    for info in infos:
+        ip = info[4][0]
+        if is_tailscale_address(ip):
+            return ip
+    return None
+
+
 def tailscale_ip() -> Optional[str]:
     """This machine's Tailscale address, or None when Tailscale is absent."""
+    found = tailscale_ip_from_interfaces()
+    if found:
+        return found
     for exe in (shutil.which("tailscale"), *TAILSCALE_PATHS):
         if not exe or not Path(exe).exists():
             continue
@@ -93,7 +119,7 @@ def tailscale_ip() -> Optional[str]:
         except (OSError, subprocess.TimeoutExpired):
             continue
         ip = out.stdout.strip().splitlines()[0] if out.stdout.strip() else ""
-        if ip.startswith("100."):
+        if is_tailscale_address(ip):
             return ip
     return None
 
@@ -107,6 +133,12 @@ def studio_urls(port: int = STUDIO_PORT) -> List[str]:
         urls.append(f"http://{host}:{port}   (phone, anywhere, via Tailscale)")
         urls.append(f"http://{ip}:{port}   (same, by address)")
     urls.append(f"http://localhost:{port}   (this computer)")
+    if not ip:
+        urls.append(
+            "Tailscale not detected on this computer. If it is installed and "
+            "connected, use the address shown for this computer in the "
+            f"phone's Tailscale app, with :{port} on the end."
+        )
     return urls
 
 
