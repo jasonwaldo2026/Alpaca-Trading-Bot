@@ -21,11 +21,42 @@ from core.data import MarketDataFetcher
 from core.rules import RuleError, load_rules
 from core import universe
 from core.fundamentals import NullFloatProvider, load_provider
-from core.sessions import DEFAULT_CALENDAR, SessionConfig, session_at
+from core.sessions import (
+    DEFAULT_CALENDAR,
+    ET,
+    SESSION_BOUNDS,
+    SessionConfig,
+    session_at,
+)
 from scanner.alerts import AlertNotifier
 from scanner.engine import Scanner
 
 DEFAULT_RULE_GLOB = "rules/*.json"
+
+
+def scan_window(config: SessionConfig) -> str:
+    """The wall-clock span this config scans, e.g. '04:00-20:00 ET'."""
+    enabled = [name for name in ("pre", "regular", "after") if name in config.enabled()]
+    if not enabled:
+        return "no sessions enabled"
+    start = SESSION_BOUNDS[enabled[0]][0]
+    end = SESSION_BOUNDS[enabled[-1]][1]
+    return f"{start:%H:%M}-{end:%H:%M} ET"
+
+
+def closed_market_note(result, config: SessionConfig) -> str:
+    """
+    One line explaining a scan that touched nothing because the market is
+    shut. 'Scanned 0 symbols' at 10 pm reads like a fault; it is not.
+    """
+    if result.scanned or not result.skipped:
+        return ""
+    if not all(why.startswith("market closed") for why in result.skipped.values()):
+        return ""
+    return (
+        f"Market closed — nothing to scan. Scanning resumes when the "
+        f"{scan_window(config)} session opens (Mon-Fri). Leave this running."
+    )
 
 
 def main(argv=None) -> int:
@@ -207,12 +238,15 @@ def main(argv=None) -> int:
 
     def one_pass() -> int:
         result = scanner.scan(rules, symbols)
-        stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        stamp = datetime.now(ET).strftime("%H:%M:%S ET")
         print(f"\n[{stamp}] Scanned {result.scanned} symbols "
               f"against {len(rules)} rule(s).")
 
+        note = closed_market_note(result, sessions)
         grouped = result.by_rule()
-        if not grouped:
+        if note:
+            print(note)
+        elif not grouped:
             print("No matches.")
         for rule_name, matches in grouped.items():
             print(f"── {rule_name}  ({len(matches)} match{'es' if len(matches) != 1 else ''})")
