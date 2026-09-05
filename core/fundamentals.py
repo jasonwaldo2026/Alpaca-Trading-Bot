@@ -171,9 +171,18 @@ class FMPFloatProvider(FloatProvider):
     raising — a float provider must never take the scanner down.
     """
 
-    BULK_URL = "https://financialmodelingprep.com/stable/all-shares-float"
+    #: FMP's "All Shares Float" endpoint. Paged; the documented page size is
+    #: 1,000, and the whole US market is ~14 pages.
+    BULK_URL = "https://financialmodelingprep.com/stable/shares-float-all"
     SINGLE_URL = "https://financialmodelingprep.com/stable/shares-float"
-    PAGE_LIMIT = 5000
+    PAGE_LIMIT = 1000
+    MAX_PAGES = 30
+
+    #: When the bulk load is unavailable, per-symbol lookups are allowed only
+    #: for a watchlist-sized universe. Falling back to one call per symbol
+    #: across the whole market would be ~13,000 calls per scan — the free
+    #: plan allows 250 a day.
+    SINGLE_LOOKUP_MAX_UNIVERSE = 100
 
     def __init__(
         self,
@@ -186,6 +195,9 @@ class FMPFloatProvider(FloatProvider):
         self.timeout = timeout
         self.cache: Dict[str, Optional[float]] = {}
         self._bulk_loaded = False
+        self._bulk_attempted = False
+        self._single_allowed = True
+        self._plan_error = False
         self._load_cache()
 
     # ── Cache ────────────────────────────────────────────────────────────
@@ -222,6 +234,25 @@ class FMPFloatProvider(FloatProvider):
         try:
             with urllib.request.urlopen(f"{url}?{query}", timeout=self.timeout) as r:
                 return json.loads(r.read().decode())
+        except urllib.error.HTTPError as exc:
+            # 402/403 mean the key is fine but the plan does not include this
+            # endpoint; 429 means the daily or per-minute quota is spent.
+            # Say so once, plainly — "float unknown" on its own reads like a
+            # data problem when it is a billing one.
+            if exc.code in (401, 402, 403, 429) and not self._plan_error:
+                self._plan_error = True
+                what = {401: "the API key was rejected",
+                        402: "this endpoint is not included in your FMP plan",
+                        403: "this endpoint is not included in your FMP plan",
+                        429: "the FMP call quota is used up"}[exc.code]
+                log.warning(
+                    "FMP returned HTTP %d for %s: %s. Float will be unknown "
+                    "until that changes, so low-float conditions cannot match.",
+                    exc.code, url.rsplit("/", 1)[-1], what,
+                )
+            else:
+                log.warning("FMP request failed (%s): HTTP %d", url, exc.code)
+            return None
         except (urllib.error.URLError, OSError, TimeoutError,
                 json.JSONDecodeError, ValueError) as exc:
             # The key is in the query string, so anything derived from the
@@ -243,12 +274,15 @@ class FMPFloatProvider(FloatProvider):
 
     # ── Loading ──────────────────────────────────────────────────────────
 
-    def load_all(self, max_pages: int = 10) -> int:
+    def load_all(self, max_pages: Optional[int] = None) -> int:
         """
         Fill the cache from the bulk endpoint. Returns symbols loaded.
 
-        Bounded by `max_pages` so a paging bug cannot loop forever.
+        Bounded by `max_pages` so a paging bug cannot loop forever. Tried
+        once per provider instance: a bulk load that fails is not retried
+        for every symbol that follows.
         """
+        self._bulk_attempted = True
         if not self.api_key:
             log.warning(
                 "FMP_API_KEY is not set — float is unknown, so low-float "
@@ -257,7 +291,7 @@ class FMPFloatProvider(FloatProvider):
             return 0
 
         loaded = 0
-        for page in range(max_pages):
+        for page in range(max_pages or self.MAX_PAGES):
             rows = self._get(self.BULK_URL, {
                 "page": str(page), "limit": str(self.PAGE_LIMIT),
             })
@@ -281,11 +315,11 @@ class FMPFloatProvider(FloatProvider):
         key = symbol.upper()
         if key in self.cache:
             return self.cache[key]
-        if not self._bulk_loaded:
+        if not self._bulk_loaded and not self._bulk_attempted:
             self.load_all()
             if key in self.cache:
                 return self.cache[key]
-        if not self.api_key:
+        if not self.api_key or not self._single_allowed or self._plan_error:
             return None
 
         rows = self._get(self.SINGLE_URL, {"symbol": key})
@@ -294,9 +328,25 @@ class FMPFloatProvider(FloatProvider):
         return value
 
     def warm(self, symbols: Iterable[str]) -> None:
-        """Populate the cache before a scan, so it is one bulk call not N."""
-        if not self._bulk_loaded:
+        """
+        Populate the cache before a scan, so it is one bulk call not N.
+
+        If the bulk load is unavailable and the universe is wider than a
+        watchlist, per-symbol lookups are switched off for this scan rather
+        than spending thousands of calls to learn nothing.
+        """
+        symbols = list(symbols)
+        if not self._bulk_loaded and not self._bulk_attempted:
             self.load_all()
+        if not self._bulk_loaded:
+            self._single_allowed = len(symbols) <= self.SINGLE_LOOKUP_MAX_UNIVERSE
+            if not self._single_allowed:
+                log.warning(
+                    "Bulk float from FMP is unavailable and the universe is "
+                    "%d symbols, so per-symbol float lookups are off for this "
+                    "scan. Float is unknown; low-float conditions cannot match.",
+                    len(symbols),
+                )
 
 
 def load_provider(

@@ -14,7 +14,7 @@ Float is fundamental data. Alpaca's market data API serves bars, quotes and
 trades, not shares outstanding, so it has to come from elsewhere.
 
 **Financial Modeling Prep** provides it, on the free tier, and — critically —
-has a **bulk endpoint**. `stable/all-shares-float` returns the whole market
+has a **bulk endpoint**. `stable/shares-float-all` (paged, 1,000 per page) returns the whole market
 in a few paged requests, which is the only shape that works when the scan
 universe is 11,000 symbols. One lookup per symbol would be 11,000 requests a
 scan.
