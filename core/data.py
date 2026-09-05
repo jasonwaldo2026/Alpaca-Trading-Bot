@@ -109,6 +109,29 @@ def bar_coverage(df: pd.DataFrame, bar_minutes: int) -> Optional[BarCoverage]:
     )
 
 
+def feed_from_env(value: Optional[str] = None) -> Optional[DataFeed]:
+    """
+    The equity data feed named in ALPACA_DATA_FEED, or None for the account
+    default.
+
+    Unset or blank means "whatever the plan gives" — IEX on the free plan.
+    `sip` is the consolidated tape and needs Algo Trader Plus; setting it
+    without that plan makes every bar request fail with a 403, so the value
+    is validated here and an unknown name is reported rather than passed on.
+    """
+    import os
+    name = (value if value is not None else os.getenv("ALPACA_DATA_FEED", "")).strip().lower()
+    if not name:
+        return None
+    try:
+        return DataFeed(name)
+    except ValueError:
+        raise ValueError(
+            f"ALPACA_DATA_FEED={name!r} is not a feed Alpaca knows. "
+            f"Use 'iex' (free plan), 'sip' (Algo Trader Plus), or leave it blank."
+        )
+
+
 def alpaca_timeframe(bar_minutes: int) -> TimeFrame:
     """Map a bar size in minutes onto an Alpaca TimeFrame."""
     if bar_minutes <= 0 or 1440 % bar_minutes:

@@ -17,7 +17,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from core.client import AlpacaClient, Credentials
-from core.data import MarketDataFetcher
+from core.data import MarketDataFetcher, feed_from_env
 from core.rules import RuleError, load_rules
 from core import universe
 from core.fundamentals import NullFloatProvider, load_provider
@@ -86,7 +86,8 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--feed", choices=["iex", "sip"], default=None,
         help=(
-            "Equity data feed. Default is your account's, which on free and "
+            "Equity data feed. Default: ALPACA_DATA_FEED from .env, else "
+            "your account's, which on free and "
             "basic plans is IEX — one venue, thin in pre-market, so many "
             "5-minute windows produce no bar at all. 'sip' is the "
             "consolidated tape and needs a paid Alpaca data plan."
@@ -182,10 +183,11 @@ def main(argv=None) -> int:
 
     client = AlpacaClient(creds)
 
-    feed = None
-    if args.feed:
-        from alpaca.data.enums import DataFeed
-        feed = DataFeed(args.feed)
+    try:
+        feed = feed_from_env(args.feed)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     sessions = SessionConfig.extended() if args.extended_hours else SessionConfig()
     floats = load_provider(
