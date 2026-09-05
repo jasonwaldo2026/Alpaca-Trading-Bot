@@ -34,7 +34,10 @@ CHECKS: List[Tuple[str, str, Dict[str, str]]] = [
     ("Biggest gainers", "biggest-gainers", {}),
     ("Daily history", "historical-price-eod/full", {"symbol": "AAPL"}),
     ("5-minute bars", "historical-chart/5min", {"symbol": "AAPL"}),
+    ("5-minute bars, extended", "historical-chart/5min", {"symbol": "AAPL", "extended": "true"}),
     ("1-minute bars", "historical-chart/1min", {"symbol": "AAPL"}),
+    ("1-minute bars, extended", "historical-chart/1min", {"symbol": "AAPL", "extended": "true"}),
+    ("Aftermarket quote", "aftermarket-quote", {"symbol": "AAPL"}),
     ("Aftermarket trade", "aftermarket-trade", {"symbol": "AAPL"}),
     ("Stock news", "news/stock", {"symbols": "AAPL", "limit": "5"}),
     ("Earnings calendar", "earnings-calendar", {}),
@@ -69,7 +72,7 @@ def describe(label: str, data: Any) -> str:
     if label == "Bulk float, page 0":
         with_float = sum(1 for r in data if r.get("floatShares"))
         return f"{n} rows, {with_float} with a float figure"
-    if label in ("5-minute bars", "1-minute bars", "Daily history"):
+    if label.startswith(("5-minute bars", "1-minute bars")) or label == "Daily history":
         stamps = sorted(str(r.get("date", "")) for r in data if r.get("date"))
         if not stamps:
             return f"{n} rows, no dates"
