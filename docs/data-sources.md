@@ -87,7 +87,7 @@ About 230 endpoints. Grouped by what they are good for here.
 | **Stock price change** | % change over 1 day, 5 days, 1 month, 3 months, 6 months, YTD, 1 year, 3 years, 5 years, 10 years, max. | "Has this stock spiked in the last 12 months" comes from here, per symbol, or from daily history. |
 | **Aftermarket trade / quote** (+ batch) | Post-market trades and bid/ask. | After-hours activity without a paid Alpaca feed. |
 | **Historical price (end of day)** — light / full / unadjusted / dividend-adjusted | Daily open/high/low/close/volume, VWAP, change, going back years. | Free plan: yes. The 12-month spike check, and any daily-chart context. |
-| **Intraday charts** — 1 min, 5 min, 15 min, 30 min, 1 hour, 4 hour | Intraday bars. | **Premium plan** and up for intraday; **Ultimate** for 1-minute. On Basic/Starter this is not available, which is why Alpaca is the intraday source. |
+| **Intraday charts** — 1 min, 5 min, 15 min, 30 min, 1 hour, 4 hour | Intraday bars, **regular hours only (09:30–16:00)** — confirmed with `scanner.probe`: no pre-market or after-hours bars at any interval. 5-minute reaches back ~10 sessions, 1-minute ~3. Prices are **15 minutes delayed**. | Available on Premium, 1-minute included. Not a substitute for Alpaca for the live trigger (delay) or for pre-market (absent). |
 | **Company profile** | Sector, industry, market cap, price, beta, average volume, exchange, IPO date, description, CEO, employees, is-ETF, is-actively-trading. | Sector filters; "how new is this company". |
 | **Market cap** (single, batch, historical) | Market capitalisation. | |
 | **Earnings calendar** / **Earnings** | Upcoming and past report dates, EPS/revenue estimate vs actual. | "Earnings today" is a catalyst flag — or a reason to stay out. |
@@ -113,6 +113,14 @@ downloads of most of the above.
 One from that list worth a thought later: **insider trading** and **8-K
 filings** are the two feeds that most often precede the moves your two
 scenarios look for.
+
+### What this key can do (checked 2026-09-04 with `python -m scanner.probe`)
+
+Premium. Every endpoint above answered: profile, quote, batch quote,
+price change (1D…10Y and max), bulk float (1,000 rows a page, ~86% with
+a float figure), screener, most actives, gainers, daily history (5 years
+returned by default), 5- and 1-minute bars (regular hours only),
+aftermarket trade, news, earnings calendar (4,000 rows).
 
 ### Plans
 
@@ -166,10 +174,12 @@ scan.
   snapshots for a cheap whole-market "what moved today" pass. Its two
   screener endpoints already answer "most volume" and "biggest gainers"
   in one call each, from all-exchange data, on the free plan.
-- **FMP is the fact sheet.** Float, market cap, sector, average volume,
-  earnings date, news, and a screener that shrinks the universe before
-  Alpaca is asked for a single bar. Used sparingly, because of the daily
-  call budget.
+- **FMP is the fact sheet and the candidate finder.** Float, market cap,
+  sector, average volume, earnings date, news, 12-month price change, and
+  a screener that shrinks the universe before Alpaca is asked for a
+  single bar. Its prices are 15 minutes delayed and its intraday bars stop
+  at the regular session, so it never fires an alert itself and cannot
+  help before 09:30.
 - **Pushover has more headroom than we use.** A distinct sound per
   scenario, high priority for the strongest setups, and a chart image in
   the alert are all one field each.

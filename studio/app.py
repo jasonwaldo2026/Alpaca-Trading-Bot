@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 
 from core.backtest import ExitPolicy, backtest
 from core.client import AlpacaClient, Credentials
-from core.data import MarketDataFetcher
+from core.data import MarketDataFetcher, feed_from_env
 from core.enrich import enrich
 from core.fundamentals import NullFloatProvider, load_provider
 from core import universe
@@ -482,7 +482,7 @@ with left:
                 st.warning(too_wide)
         with st.spinner("Scanning…"):
             result = Scanner(
-                MarketDataFetcher(get_client(), bar_minutes),
+                MarketDataFetcher(get_client(), bar_minutes, feed=feed_from_env()),
                 bar_limit=bar_limit,
                 bar_minutes=bar_minutes,
                 sessions=SessionConfig.extended(),
@@ -537,7 +537,7 @@ st.subheader("Charts")
 def _chart_bars(symbol: str, bar_minutes: int, limit: int):
     """Bars with indicators, ready to draw. Cached so a grid of four does not
     refetch on every widget change."""
-    frames = MarketDataFetcher(get_client(), bar_minutes).get_bars(
+    frames = MarketDataFetcher(get_client(), bar_minutes, feed=feed_from_env()).get_bars(
         [symbol], limit=limit
     )
     raw = frames.get(symbol)
@@ -678,12 +678,12 @@ if st.button("📉 Run backtest", disabled=get_client() is None):
         client = get_client()
 
         with st.spinner(f"Fetching {bt_days} days of {bt_symbol}…"):
-            entry_raw = MarketDataFetcher(client, entry_minutes).get_bars_between(
+            entry_raw = MarketDataFetcher(client, entry_minutes, feed=feed_from_env()).get_bars_between(
                 [bt_symbol], start, end
             ).get(bt_symbol)
             manage_raw = (
                 entry_raw if manage_minutes == entry_minutes
-                else MarketDataFetcher(client, manage_minutes).get_bars_between(
+                else MarketDataFetcher(client, manage_minutes, feed=feed_from_env()).get_bars_between(
                     [bt_symbol], start, end
                 ).get(bt_symbol)
             )

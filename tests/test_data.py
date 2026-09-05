@@ -146,3 +146,29 @@ def test_fetcher_timeframe_follows_bar_minutes():
     df = _frame(datetime(2026, 9, 2, 10, tzinfo=UTC), 3)
     assert str(MarketDataFetcher(_StubClient(df), 5).timeframe) == "5Min"
     assert str(MarketDataFetcher(_StubClient(df), 60).timeframe) == "1Hour"
+
+
+# ── Feed setting ─────────────────────────────────────────────────────────────
+
+def test_blank_feed_means_account_default(monkeypatch):
+    from core.data import feed_from_env
+    monkeypatch.delenv("ALPACA_DATA_FEED", raising=False)
+    assert feed_from_env() is None
+    monkeypatch.setenv("ALPACA_DATA_FEED", "  ")
+    assert feed_from_env() is None
+
+
+def test_sip_and_iex_are_understood(monkeypatch):
+    from alpaca.data.enums import DataFeed
+    from core.data import feed_from_env
+    monkeypatch.setenv("ALPACA_DATA_FEED", "SIP")
+    assert feed_from_env() is DataFeed.SIP
+    assert feed_from_env("iex") is DataFeed.IEX
+
+
+def test_an_unknown_feed_is_named_in_the_error(monkeypatch):
+    import pytest
+    from core.data import feed_from_env
+    monkeypatch.setenv("ALPACA_DATA_FEED", "bloomberg")
+    with pytest.raises(ValueError, match="bloomberg"):
+        feed_from_env()
