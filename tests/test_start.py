@@ -146,3 +146,12 @@ def test_a_diverged_local_copy_is_not_clobbered(monkeypatch):
     monkeypatch.setattr(start, "_run", fake_run)
     note = start.self_update()
     assert note.startswith("Update skipped") and "already here" in note
+
+
+def test_a_studio_already_running_is_reported_not_crashed(capsys, monkeypatch):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_API_SECRET", "s")
+    monkeypatch.setattr(start, "port_in_use", lambda port: True)
+    monkeypatch.setattr(start, "self_update", lambda: "Already up to date.")
+    assert start.main(["--studio"]) == 0
+    assert "already running" in capsys.readouterr().out
