@@ -242,3 +242,66 @@ def test_a_known_low_float_does_match(tmp_path):
 
     assert len(result.matches) == 1
     assert result.matches[0].values["float_millions"] == pytest.approx(8.2)
+
+
+# ── Bulk endpoint correctness and call budget ────────────────────────────────
+
+def test_bulk_url_is_fmps_all_shares_float_endpoint():
+    """FMP's endpoint is `shares-float-all`, paged 1,000 at a time. The
+    earlier spelling returned 404 on every scan, which silently fell
+    through to one call per symbol."""
+    assert FMPFloatProvider.BULK_URL.endswith("/stable/shares-float-all")
+    assert FMPFloatProvider.PAGE_LIMIT == 1000
+
+
+def test_a_failed_bulk_load_is_not_retried_for_every_symbol(tmp_path):
+    provider = FakeFMP([None] + [None] * 10, cache_path=tmp_path / "c.json")
+    provider.warm(["A", "B", "C"])
+    for sym in ("A", "B", "C"):
+        provider.float_shares(sym)
+    bulk_calls = [u for u, _ in provider.requests if u == provider.BULK_URL]
+    assert len(bulk_calls) == 1
+
+
+def test_a_wide_universe_never_falls_back_to_per_symbol_lookups(tmp_path):
+    """13,000 single lookups per scan would burn the free plan's 250-call
+    day in the first minute and learn nothing."""
+    provider = FakeFMP([None], cache_path=tmp_path / "c.json")
+    universe = [f"S{i}" for i in range(500)]
+    provider.warm(universe)
+    for sym in universe:
+        assert provider.float_shares(sym) is None
+    assert len(provider.requests) == 1, "only the one bulk attempt"
+
+
+def test_a_watchlist_may_fall_back_to_per_symbol_lookups(tmp_path):
+    provider = FakeFMP([None, [{"symbol": "ABCD", "floatShares": 5_000_000}]],
+                       cache_path=tmp_path / "c.json")
+    provider.warm(["ABCD", "WXYZ"])
+    assert provider.float_shares("ABCD") == 5_000_000
+    assert any(u == provider.SINGLE_URL for u, _ in provider.requests)
+
+
+def test_a_plan_refusal_is_explained_once_and_stops_further_calls(tmp_path, caplog, monkeypatch):
+    """402/403 mean the key works but the plan lacks the endpoint. That is a
+    billing fact, not a data fault, so it is said once in those words — and
+    no per-symbol calls follow, since they would be refused too."""
+    import io
+    import urllib.error
+    import urllib.request
+
+    calls = []
+
+    def refuse(url, timeout=None):
+        calls.append(url)
+        raise urllib.error.HTTPError(url, 402, "Payment Required", {}, io.BytesIO(b""))
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    provider = FMPFloatProvider(api_key="SECRET", cache_path=tmp_path / "c.json")
+    with caplog.at_level("WARNING", logger="core.fundamentals"):
+        provider.warm(["ABCD", "WXYZ"])
+        assert provider.float_shares("ABCD") is None
+        assert provider.float_shares("WXYZ") is None
+    assert caplog.text.count("not included in your FMP plan") == 1
+    assert "SECRET" not in caplog.text
+    assert len(calls) == 1, "after a plan refusal, no per-symbol calls either"
