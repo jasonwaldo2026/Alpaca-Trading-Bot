@@ -208,6 +208,14 @@ def studio_urls(port: int = STUDIO_PORT) -> List[str]:
     return urls
 
 
+def port_in_use(port: int) -> bool:
+    """True when something is already listening on the port — usually a
+    Studio from another start window."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_socket:
+        probe_socket.settimeout(0.5)
+        return probe_socket.connect_ex(("127.0.0.1", port)) == 0
+
+
 def missing_keys(env: Dict[str, str]) -> List[str]:
     return [k for k in ("ALPACA_API_KEY", "ALPACA_API_SECRET") if not env.get(k)]
 
@@ -239,6 +247,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if want_scanner and not (env.get("PUSHOVER_TOKEN") and env.get("PUSHOVER_USER")):
         print("Pushover keys not set: matches will print here but not reach your phone.")
+
+    if want_studio and not dry_run and port_in_use(STUDIO_PORT):
+        print(
+            f"Studio is already running on port {STUDIO_PORT} — probably in "
+            f"another start window. Leaving that one be."
+        )
+        want_studio = False
+        if not want_scanner:
+            return 0
 
     plans = []
     if want_scanner:
