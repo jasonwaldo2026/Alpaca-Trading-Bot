@@ -13,6 +13,7 @@ import pytest
 from core.indicators import IndicatorParams, add_indicators
 from studio.charts import (
     CHART_EMA_PERIODS,
+    CHART_TIMEFRAMES,
     DARK,
     EMA_DASHES,
     LIGHT,
@@ -221,3 +222,14 @@ def test_no_dual_axis_anywhere(bars):
     fig = build_chart(bars, "X", ChartOptions(), LIGHT)
     axes = [k for k in fig.layout if k.startswith("yaxis")]
     assert len(axes) == 3, "one y-axis per panel, no overlaying axis"
+
+
+# ── Chart timeframe ──────────────────────────────────────────────────────────
+
+def test_the_chart_offers_a_one_minute_view():
+    """A rule is evaluated at the size it was written for, but the chart is
+    for looking — and the moment an alert fires, the useful view is the
+    finer one the exit is managed on."""
+    assert 1 in CHART_TIMEFRAMES
+    assert list(CHART_TIMEFRAMES) == sorted(CHART_TIMEFRAMES)
+    assert 5 in CHART_TIMEFRAMES, "the rule's own size must stay available"

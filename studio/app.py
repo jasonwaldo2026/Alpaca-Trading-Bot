@@ -46,6 +46,7 @@ from core.rules import VALID_OPS, Condition, Rule, RuleError
 from scanner.engine import Scanner
 from studio.charts import (
     CHART_EMA_PERIODS,
+    CHART_TIMEFRAMES,
     ChartOptions,
     build_chart,
     palette_for,
@@ -533,17 +534,33 @@ st.divider()
 st.subheader("Charts")
 
 
-@st.cache_data(ttl=120)
-def _chart_bars(symbol: str, bar_minutes: int, limit: int):
-    """Bars with indicators, ready to draw. Cached so a grid of four does not
-    refetch on every widget change."""
+def _chart_params(bar_minutes: int) -> IndicatorParams:
+    """
+    The rule's indicator periods, read at the chart's own resolution.
+
+    Periods stay the same bar counts, which is what a trader means: a 9 EMA
+    is a 9 EMA on whichever chart you are looking at. It is a different line
+    in wall-clock terms — 9 minutes here, 45 on the 5-minute chart — and the
+    caption under the picker says so.
+    """
+    return replace(_current_params(), bar_minutes=bar_minutes)
+
+
+@st.cache_data(ttl=60)
+def _chart_bars(symbol: str, bar_minutes: int, limit: int, params_key: str):
+    """
+    Bars with indicators, ready to draw. Cached so a grid of four does not
+    refetch on every widget change; `params_key` is in the signature only so
+    that changing a period invalidates the cache.
+    """
+    del params_key
     frames = MarketDataFetcher(get_client(), bar_minutes, feed=feed_from_env()).get_bars(
         [symbol], limit=limit
     )
     raw = frames.get(symbol)
     if raw is None or raw.empty:
         return None
-    return enrich(raw, _current_params(), symbol)
+    return enrich(raw, _chart_params(bar_minutes), symbol)
 
 
 def _theme() -> str:
@@ -567,6 +584,22 @@ with c2:
 
 chart_symbols = [s.strip().upper() for s in chart_symbols_text.split(",") if s.strip()]
 
+t1, t2 = st.columns([3, 2])
+with t1:
+    chart_minutes = st.radio(
+        "Timeframe", list(CHART_TIMEFRAMES), horizontal=True, key="chart_minutes",
+        index=list(CHART_TIMEFRAMES).index(st.session_state.get("bar_minutes", 5))
+        if st.session_state.get("bar_minutes", 5) in CHART_TIMEFRAMES else 1,
+        format_func=lambda m: f"{m} min" if m < 60 else "1 hour",
+    )
+with t2:
+    st.caption(
+        f"Periods are bar counts, so on the {chart_minutes}-minute chart the "
+        f"9 EMA spans {9 * chart_minutes} minutes and the 200 spans "
+        f"{200 * chart_minutes // 60} hours. The scanner still evaluates rules "
+        f"at their own bar size."
+    )
+
 o1, o2, o3, o4 = st.columns(4)
 show_emas = o1.checkbox("EMAs", value=True, key="chart_emas")
 show_vwap = o2.checkbox("VWAP", value=True, key="chart_vwap")
@@ -584,7 +617,7 @@ elif not chart_symbols:
     st.info("Enter at least one symbol.")
 else:
     palette = palette_for(_theme())
-    params = _current_params()
+    params = _chart_params(chart_minutes)
     # Enough history for the longest EMA, plus the window being displayed.
     fetch_limit = max(params.min_bars() + visible_bars, 300)
 
@@ -601,7 +634,7 @@ else:
     )
 
     def _draw(symbol: str, container) -> None:
-        frame = _chart_bars(symbol, params.bar_minutes, fetch_limit)
+        frame = _chart_bars(symbol, chart_minutes, fetch_limit, repr(params))
         if frame is None:
             container.warning(f"No bars for {symbol}.")
             return
