@@ -88,6 +88,12 @@ CHART_EMA_PERIODS = (4, 12, 200)
 #: Dash pattern per EMA period, so identity survives when hue does not.
 EMA_DASHES = {4: "solid", 12: "dash", 200: "longdash"}
 
+#: Timeframes the chart can be drawn at. 1-minute is here and not in the
+#: rule's bar-size list on purpose: a rule is evaluated at the size it was
+#: written for, but the chart is for looking — and the moment an alert
+#: fires, the useful view is the finer one the exit is managed on.
+CHART_TIMEFRAMES = (1, 5, 15, 30, 60)
+
 LIGHT = Palette(
     surface="#fcfcfb", text="#0b0b0b", muted="#52514e",
     grid="rgba(11,11,11,0.08)",
