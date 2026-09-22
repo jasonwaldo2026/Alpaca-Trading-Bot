@@ -173,8 +173,28 @@ def prepare(raw: pd.DataFrame, macd: Macd) -> pd.DataFrame:
     return session
 
 
-def add_conditions(session: pd.DataFrame) -> pd.DataFrame:
-    """The five buy conditions, plus the bar where an alert would fire."""
+def parse_clock(text: str) -> time:
+    """'09:30' -> a time. Rejects anything else loudly."""
+    try:
+        hh, mm = (int(part) for part in text.split(":"))
+        return time(hh, mm)
+    except ValueError:
+        raise SystemExit(f"--from wants a clock time like 09:30 (got {text!r})")
+
+
+def add_conditions(session: pd.DataFrame, require_volume: bool = True,
+                   earliest: time = EARLIEST_ALERT) -> pd.DataFrame:
+    """The buy conditions, plus the bar where an alert would fire.
+
+    `require_volume` drops condition (d). Volume is the one measure the free
+    IEX feed gets badly wrong, so switching it off changes what data the
+    alert can run on, not just how often it fires.
+
+    `earliest` moves the gate in condition (e). Evaluating from 09:30 is
+    only meaningful because the MACD is warmed on pre-market bars -- a feed
+    with no pre-market reaches the open with an unsettled indicator, and
+    prepare() records whether it did.
+    """
     df = session.copy()
 
     above = df["macd"] > df["macd_signal"]
@@ -186,8 +206,11 @@ def add_conditions(session: pd.DataFrame) -> pd.DataFrame:
     df["cond_c_diverging"] = (df["macd_gap"] > df["macd_gap"].shift(1)) & (
         df["macd_gap"].shift(1) > df["macd_gap"].shift(2)
     )
-    df["cond_d_volume"] = df["volume_ratio"] >= VOLUME_MULTIPLE
-    df["cond_e_time"] = [ts.time() >= EARLIEST_ALERT for ts in df.index]
+    df["cond_d_volume"] = (
+        df["volume_ratio"] >= VOLUME_MULTIPLE if require_volume
+        else pd.Series(True, index=df.index)
+    )
+    df["cond_e_time"] = [ts.time() >= earliest for ts in df.index]
 
     for name in CONDITIONS:
         df[name] = df[name].fillna(False).astype(bool)
@@ -528,6 +551,31 @@ def self_test() -> int:
     if pd.isna(warm["volume_ratio"].iloc[VOLUME_LOOKBACK_BARS - 1]):
         failures.append(f"bar {VOLUME_LOOKBACK_BARS} should be the first with a volume ratio")
 
+    # Dropping condition (d) must let through bars the volume test blocked,
+    # and must never block one it allowed.
+    # Same rally, flat volume: every bar sits at 1.0x, so condition (d)
+    # blocks the crossover the other three conditions found.
+    flat_vol = [1000] * n
+    quiet_on = add_conditions(prepare(_frame(closes, flat_vol, _index(n)), macd))
+    quiet_off = add_conditions(prepare(_frame(closes, flat_vol, _index(n)), macd),
+                               require_volume=False)
+    with_vol = set(quiet_on.index[quiet_on["all_conditions"]])
+    without_vol = set(quiet_off.index[quiet_off["all_conditions"]])
+    if with_vol:
+        failures.append("flat volume should fail condition (d) on every bar")
+    if not without_vol:
+        failures.append("dropping the volume test should surface the MACD crossover")
+    if not with_vol <= without_vol:
+        failures.append("dropping the volume test lost bars it should have kept")
+
+    # Moving the gate to the open must admit bars between 09:30 and 09:45.
+    early = add_conditions(prepare(_frame(closes, volumes, _index(n)), macd),
+                           require_volume=False, earliest=SESSION_OPEN)
+    if not early["cond_e_time"].all():
+        failures.append("with the gate at 09:30 every session bar should pass condition (e)")
+    opened = sum(1 for ts in early.index[early["all_conditions"]]
+                 if ts.time() < EARLIEST_ALERT)
+
     print(f"  MACD crossovers in the rally   : {crossings}")
     print(f"  Alerts fired in the rally      : {len(alerts)}")
     for ts in alerts:
@@ -539,6 +587,8 @@ def self_test() -> int:
     print(f"  Session output starts at       : {warm.index[0]:%H:%M} (expected 09:30)")
     print(f"  First usable volume ratio at   : "
           f"{warm.index[warm['volume_ratio'].notna()][0]:%H:%M}")
+    print(f"  Qualifying bars, volume on/off : {len(with_vol)} / {len(without_vol)}")
+    print(f"  Extra bars once gate is 09:30  : {opened}")
 
     if failures:
         print("\nFAILED:")
@@ -559,6 +609,10 @@ def main() -> int:
     parser.add_argument("--macd", help="One setting as fast,slow,signal. Default: both "
                                        f"{DEFAULT_MACD} and {BASELINE_MACD}")
     parser.add_argument("--csv", default=None, help="Where to write the per-minute CSV")
+    parser.add_argument("--no-volume", action="store_true",
+                        help="Drop condition (d), the volume test")
+    parser.add_argument("--from", dest="earliest", default="09:45",
+                        help="Earliest alert time, ET (default 09:45; 09:30 is the open)")
     parser.add_argument("--self-test", action="store_true", help="Check the math offline")
     args = parser.parse_args()
 
@@ -570,6 +624,11 @@ def main() -> int:
     days = trading_days(end, max(1, args.days))
     symbol = args.symbol.upper()
     settings = [Macd.parse(args.macd)] if args.macd else [DEFAULT_MACD, BASELINE_MACD]
+    require_volume = not args.no_volume
+    earliest = parse_clock(args.earliest)
+    active = [CONDITIONS[c] for c in CONDITIONS if c != "cond_d_volume" or require_volume]
+    print("Conditions: " + ", ".join(active).replace("(e) after 09:45",
+                                                     f"(e) after {earliest:%H:%M}"))
 
     # Fetch once per day per feed; every MACD setting reuses the same bars.
     print(f"Fetching {symbol} 1-minute bars for {len(days)} day(s), both feeds...")
@@ -608,7 +667,7 @@ def main() -> int:
             for f in ("iex", "sip"):
                 if not r.frames[f].empty:
                     attrs = r.frames[f].attrs
-                    r.frames[f] = add_conditions(r.frames[f])
+                    r.frames[f] = add_conditions(r.frames[f], require_volume, earliest)
                     r.frames[f].attrs.update(attrs)
         pooled = report(symbol, macd, results)
         if not pooled.empty:

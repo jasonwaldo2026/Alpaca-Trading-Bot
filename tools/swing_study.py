@@ -55,12 +55,14 @@ from typing import Dict, List, Sequence, Tuple
 import pandas as pd
 
 from feed_check import (
+    CONDITIONS,
     DEFAULT_MACD,
     ET,
     SESSION_OPEN,
     Macd,
     add_conditions,
     fetch_extended,
+    parse_clock,
     prepare,
     trading_days,
 )
@@ -273,12 +275,15 @@ def pct(values, q: float) -> float:
     return float(pd.Series(values).quantile(q)) if len(values) else float("nan")
 
 
-def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame]) -> pd.DataFrame:
+def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
+           setup: str = "") -> pd.DataFrame:
     rule = "=" * 76
     days = sorted(sessions)
     total_bars = sum(len(s) for s in sessions.values())
     print(f"\n{rule}\n  {symbol}  swing study  --  {len(days)} sessions, "
           f"{days[0]:%Y-%m-%d} to {days[-1]:%Y-%m-%d}, MACD {macd}\n{rule}")
+    if setup:
+        print(f"  {setup}")
     print(f"\n  {total_bars:,} one-minute bars "
           f"({total_bars / len(days):.0f} per session out of 390)")
 
@@ -561,6 +566,10 @@ def main() -> int:
     parser.add_argument("--date", help="End on this day, YYYY-MM-DD (default: yesterday)")
     parser.add_argument("--macd", help="fast,slow,signal (default 9,17,6)")
     parser.add_argument("--csv", default=None)
+    parser.add_argument("--no-volume", action="store_true",
+                        help="Drop condition (d), the volume test")
+    parser.add_argument("--from", dest="earliest", default="09:45",
+                        help="Earliest signal time, ET (default 09:45; 09:30 is the open)")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -572,6 +581,11 @@ def main() -> int:
            else date.today() - timedelta(days=1))
     days = trading_days(end, max(1, args.days))
     symbol = args.symbol.upper()
+    require_volume = not args.no_volume
+    earliest = parse_clock(args.earliest)
+    active = [CONDITIONS[c] for c in CONDITIONS if c != "cond_d_volume" or require_volume]
+    print("Conditions: " + ", ".join(active).replace("(e) after 09:45",
+                                                     f"(e) after {earliest:%H:%M}"))
 
     print(f"Fetching {symbol} 1-minute bars for {len(days)} trading days from SIP...")
     sessions: Dict[date, pd.DataFrame] = {}
@@ -584,7 +598,7 @@ def main() -> int:
         if raw.empty:
             print(f"  {day:%Y-%m-%d}  no data (holiday?)")
             continue
-        session = add_conditions(prepare(raw, macd))
+        session = add_conditions(prepare(raw, macd), require_volume, earliest)
         if session.empty:
             print(f"  {day:%Y-%m-%d}  no regular-hours bars")
             continue
@@ -596,7 +610,9 @@ def main() -> int:
         print(f"\nNo usable data for {symbol}. Try --symbol AAPL to check the setup.")
         return 1
 
-    outcomes = report(symbol, macd, sessions)
+    setup = ("volume condition OFF" if not require_volume else "volume condition on")
+    setup += f" · signals from {earliest:%H:%M}"
+    outcomes = report(symbol, macd, sessions, setup)
 
     if not outcomes.empty:
         path = args.csv or f"{symbol}_signals_{days[0]:%Y%m%d}_{days[-1]:%Y%m%d}.csv"
