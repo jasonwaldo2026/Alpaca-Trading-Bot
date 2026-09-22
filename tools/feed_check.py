@@ -356,9 +356,9 @@ def report(symbol: str, macd: Macd, results: List[DayResult]) -> pd.DataFrame:
         print(f"   {r.day:%Y-%m-%d}{len(iex):>10}{len(sip):>10}{vol_pct:>11.1f}%"
               f"{r.premarket['iex']:>9}{r.premarket['sip']:>9}{warm:>11}")
 
-    print(f"\n   'pre' is pre-market bars, used only to warm the MACD.")
+    print("\n   'pre' is pre-market bars, used only to warm the MACD.")
     print(f"   MACD needs {macd.warmup_bars} bars to settle; fewer means the first")
-    print(f"   minutes after 09:30 are computed from an unsettled indicator.")
+    print("   minutes after 09:30 are computed from an unsettled indicator.")
 
     # ---- 2. numbers -----------------------------------------------------
     joined = []
