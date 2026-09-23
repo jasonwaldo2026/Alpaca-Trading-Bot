@@ -194,23 +194,25 @@ def band(fig, session: Session) -> None:
     pct = 100 * move / first["open"]
     colour = UP if move >= 0 else DOWN
 
-    fig.text(0.045, 0.952, f"{session.symbol}", size=21, weight="bold", color=INK)
-    fig.text(0.045, 0.928, f"{session.day:%A %d %B %Y}", size=10.5, color=INK_2)
+    # Two lines, not four. Every tenth of an inch the header takes is a
+    # tenth of an inch off five charts underneath it.
+    fig.text(0.045, 0.963, f"{session.symbol}", size=15, weight="bold", color=INK)
+    fig.text(0.108, 0.9625, f"{session.day:%A %d %B %Y}", size=9.5, color=INK_2)
 
     stats = [
         ("Open", f"${first['open']:,.2f}", INK),
         ("Close", f"${last['close']:,.2f}", INK),
-        ("Change", f"{move:+.2f}  ({pct:+.2f}%)", colour),
+        ("Change", f"{move:+.2f} ({pct:+.2f}%)", colour),
         ("High", f"${candles['high'].max():,.2f}", INK_2),
         ("Low", f"${candles['low'].min():,.2f}", INK_2),
         ("Volume", thousands(candles["volume"].sum()), INK_2),
     ]
     for i, (label, value, tone) in enumerate(stats):
         x = 0.045 + i * 0.152
-        fig.text(x, 0.884, label.upper(), size=7.5, color=MUTED)
-        fig.text(x, 0.856, value, size=13, color=tone, weight="normal")
+        fig.text(x, 0.9355, label.upper(), size=7, color=MUTED)
+        fig.text(x + 0.044, 0.934, value, size=10, color=tone)
 
-    fig.add_artist(plt.Line2D([0.045, 0.965], [0.838, 0.838],
+    fig.add_artist(plt.Line2D([0.045, 0.965], [0.920, 0.920],
                               color=AXIS, linewidth=0.8, transform=fig.transFigure))
 
 
@@ -220,15 +222,14 @@ def tick_positions(stamps, every: int):
 
 
 def panel_label(ax, text: str) -> None:
-    """Title inside the axes, not above it.
+    """Title above the panel, never on it.
 
-    Five panels on one page leaves no room between them for a heading.
-    Putting it on the plot costs a corner of white space and buys back
-    roughly half an inch of chart per panel.
+    An earlier version put these inside the axes to save vertical space.
+    It saved the space and spent it on legibility: the title landed on
+    whatever the line was doing at the left of the chart. A heading that
+    covers the data is not a saving.
     """
-    ax.text(0.007, 0.95, text, transform=ax.transAxes, va="top", ha="left",
-            size=8.5, color=INK_2, zorder=6,
-            bbox=dict(facecolor=SURFACE, edgecolor="none", pad=1.6, alpha=0.86))
+    ax.set_title(text, loc="left", size=8.5, color=INK_2, weight="normal", pad=3.5)
 
 
 def minute_positions(stamps, macd_index):
@@ -269,9 +270,9 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
 
     fig = plt.figure(figsize=(11.7, 8.3))
     band(fig, session)
-    grid = fig.add_gridspec(5, 1, height_ratios=[3.0, 1.35, 1.0, 1.1, 0.72],
-                            hspace=0.10, left=0.062, right=0.965,
-                            top=0.80, bottom=0.058)
+    grid = fig.add_gridspec(5, 1, height_ratios=[3.0, 1.35, 1.05, 1.15, 0.75],
+                            hspace=0.23, left=0.062, right=0.965,
+                            top=0.893, bottom=0.052)
     price = fig.add_subplot(grid[0])
     macd_ax = fig.add_subplot(grid[1], sharex=price)
     lean_ax = fig.add_subplot(grid[2], sharex=price)
@@ -333,7 +334,8 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
                      label="MACD", zorder=3)
         macd_ax.plot(mx, macd["macd_signal"].tolist(), color=SECOND,
                      linewidth=1.3, label="Signal", zorder=3)
-        macd_ax.legend(frameon=False, loc="upper right", fontsize=8, ncol=2)
+        macd_ax.legend(loc="upper right", ncol=2, fontsize=8, frameon=True,
+                       facecolor=SURFACE, edgecolor="none", framealpha=0.92)
 
         # The warm-up cannot always reach back far enough -- on a Monday,
         # 900 minutes lands in the weekend, leaving only a thin pre-market
