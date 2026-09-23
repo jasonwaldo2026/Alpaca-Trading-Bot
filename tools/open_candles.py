@@ -1,14 +1,34 @@
 """
-Open candles: the morning read out to your phone, five minutes at a time.
+Open candles: the morning read out to your phone, minute by minute.
 
-From 08:55 ET, one push as each 5-minute candle completes -- price, volume,
-open, close, and both wick tips -- then a single summary of every candle in
-order once the window closes. The point is to follow the open without
-sitting in front of the screen.
+From 08:55 ET:
 
-It states what the candles did. It does not say what they mean: no signal,
-no score, no suggestion. Reading the morning is the job you are keeping
-for yourself.
+  * every minute, a quiet update -- price, that minute's volume against
+    what that minute usually carries, how the 5-minute candle is shaping
+    up so far, and which way the volume is leaning;
+  * every five minutes, an alarm -- the completed candle in full, with
+    open, close and both wick tips;
+  * at the end of the window, one summary listing every candle in order.
+
+The minute updates go out at Pushover priority -1: they arrive without a
+sound and sit in the tray to be glanced at. The five-minute summaries go
+out at priority 1, which sounds through a focus mode. Sixty-five buzzing
+notifications in sixty-five minutes would train you to ignore all of
+them, alarms included.
+
+It states what the tape did. It does not say what it means: no signal, no
+score, no suggestion. Reading the morning is the job you are keeping.
+
+About "volume leaning"
+----------------------
+Bars do not carry signed order flow -- Alpaca sells trades and quotes for
+that, and this reads neither. What it computes instead is where each
+minute CLOSED inside its own range, weighted by that minute's volume: a
+minute that closes at its high with heavy volume says buyers took the
+range, one that closes at its low says sellers did. Over five minutes
+that is a reasonable read of who is winning, and it is not the same
+thing astrue buy/sell delta. Treated as a hint, it is useful; treated as
+fact, it will mislead you.
 
 READ-ONLY. Market-data client only. No trading client, no order object.
 
@@ -30,10 +50,10 @@ Setup
 
 A note on the pre-market half of this window. Alpaca's free IEX feed is
 one exchange and carries very little before 09:30 -- measured at 0 to 17
-one-minute bars a day against SIP's 300-plus. So 08:55 to 09:30 will be
-sparse or empty on the free feed, and the volume figures in it are a
-small sample of the real tape. Replay always uses SIP, which the free
-plan serves historically, so a past morning reads in full.
+one-minute bars a day against SIP's 300-plus. Minutes with no trades are
+skipped rather than pushed as "nothing happened" (pass --push-empty to
+send them anyway). Replay always uses SIP, which the free plan serves
+historically, so a past morning reads in full.
 """
 
 from __future__ import annotations
@@ -56,6 +76,16 @@ SYMBOL = "SPCX"
 BAR_MINUTES = 5
 WINDOW_START = time(8, 55)
 WINDOW_END = time(10, 0)
+
+#: Pushover priorities. -1 arrives silently; 1 sounds through a focus
+#: mode. The routine stream must not use the same channel as the alarm.
+PRIORITY_UPDATE = -1
+PRIORITY_SUMMARY = 1
+
+#: Minutes of one-minute bars behind the moment, used to read which way
+#: volume is leaning. Five matches the candle, so the reading and the
+#: candle describe the same stretch of tape.
+PRESSURE_MINUTES = 5
 
 #: Sessions used to build the "usual volume at this time of day" baseline.
 #: A rolling average across a handful of morning candles would compare
@@ -81,6 +111,23 @@ CREATE TABLE IF NOT EXISTS candles (
 """
 
 
+
+MINUTE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS minutes (
+    id        INTEGER PRIMARY KEY,
+    symbol    TEXT NOT NULL,
+    bar_time  TEXT NOT NULL,
+    open REAL, high REAL, low REAL, close REAL,
+    volume    INTEGER,
+    trades    INTEGER,
+    vol_ratio REAL,
+    lean      REAL,
+    sent_at   TEXT,
+    UNIQUE (symbol, bar_time)
+);
+"""
+
+
 # --------------------------------------------------------------------------
 # Market data
 # --------------------------------------------------------------------------
@@ -91,17 +138,23 @@ def _client():
     return StockHistoricalDataClient(*load_credentials())
 
 
-def fetch_candles(symbol: str, start: datetime, end: datetime,
+def fetch_minutes(symbol: str, start: datetime, end: datetime,
                   force_sip: bool = False) -> pd.DataFrame:
-    """5-minute bars between two moments, extended hours included."""
+    """One-minute bars, extended hours included.
+
+    Everything is built from minutes: the per-minute update reads them
+    directly and the 5-minute candle is aggregated from them, so both
+    cadences describe the same bars rather than two separate requests
+    that could disagree at the edges.
+    """
     from alpaca.data.enums import DataFeed
     from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    from alpaca.data.timeframe import TimeFrame
 
     feed = os.getenv("ALPACA_DATA_FEED", "").strip().lower()
     request = StockBarsRequest(
         symbol_or_symbols=symbol,
-        timeframe=TimeFrame(BAR_MINUTES, TimeFrameUnit.Minute),
+        timeframe=TimeFrame.Minute,
         start=start,
         end=end,
         feed=DataFeed.SIP if (force_sip or feed == "sip") else DataFeed.IEX,
@@ -114,41 +167,134 @@ def fetch_candles(symbol: str, start: datetime, end: datetime,
     return frame.tz_convert(ET).sort_index()
 
 
-def completed_only(frame: pd.DataFrame, now: datetime) -> pd.DataFrame:
-    """Drop the candle still being built.
+def aggregate(frame: pd.DataFrame, minutes: int = BAR_MINUTES) -> pd.DataFrame:
+    """Roll one-minute bars into candles aligned to the clock.
 
-    A 5-minute candle stamped 09:35 is not finished until 09:40. Reading it
-    early means reading a price that has not finished happening -- it can
-    still reverse before it closes.
+    `label="left"` and `closed="left"` put the 09:30-09:34 minutes into a
+    candle stamped 09:30, which is how every charting platform draws it.
     """
     if frame.empty:
         return frame
-    minute = now.minute - (now.minute % BAR_MINUTES)
-    boundary = now.replace(minute=minute, second=0, microsecond=0)
-    return frame[frame.index < boundary]
+    how = {"open": "first", "high": "max", "low": "min",
+           "close": "last", "volume": "sum"}
+    if "trade_count" in frame.columns:
+        how["trade_count"] = "sum"
+    rolled = frame.resample(f"{minutes}min", label="left", closed="left").agg(how)
+    return rolled.dropna(subset=["open"])
 
 
-def volume_baseline(symbol: str, day: date, slots: List[time]) -> Dict[time, float]:
-    """Median volume for each clock slot over recent sessions.
+def drop_forming(frame: pd.DataFrame, now: datetime, minutes: int) -> pd.DataFrame:
+    """Remove the bar still being built.
 
-    Returns an empty mapping if history cannot be had; the caller then
-    simply reports volume without a comparison rather than inventing one.
+    A candle stamped 09:35 is not finished until 09:40. Reading it early
+    reads a price that has not finished happening -- it can still reverse
+    before it closes.
     """
-    baseline: Dict[time, List[float]] = {slot: [] for slot in slots}
+    if frame.empty:
+        return frame
+    edge = now.replace(minute=now.minute - (now.minute % minutes),
+                       second=0, microsecond=0)
+    return frame[frame.index < edge]
+
+
+def volume_baselines(symbol: str, day: date) -> tuple:
+    """Median volume per clock slot, for minutes and for 5-minute candles.
+
+    Both come from one pass over the same history. The comparison is
+    against the SAME slot on previous sessions, never a rolling average of
+    the morning so far -- 09:35 and 09:30 are different animals at the
+    open, and averaging across them is what made an earlier relative-
+    volume rule fire in the deadest hours of the day.
+    """
+    per_minute: Dict[time, List[float]] = {}
+    per_candle: Dict[time, List[float]] = {}
     for past in trading_days(day - timedelta(days=1), BASELINE_SESSIONS):
         try:
-            frame = fetch_candles(
+            minutes = fetch_minutes(
                 symbol,
-                datetime.combine(past, WINDOW_START, tzinfo=ET) - timedelta(minutes=BAR_MINUTES),
+                datetime.combine(past, time(4, 0), tzinfo=ET),
                 datetime.combine(past, time(16, 0), tzinfo=ET),
                 force_sip=True,
             )
         except Exception:  # noqa: BLE001 -- a baseline is a nicety, not a requirement
             continue
-        for stamp, row in frame.iterrows():
-            if stamp.time() in baseline:
-                baseline[stamp.time()].append(float(row["volume"]))
-    return {slot: statistics.median(values) for slot, values in baseline.items() if values}
+        if minutes.empty:
+            continue
+        for stamp, row in minutes.iterrows():
+            per_minute.setdefault(stamp.time(), []).append(float(row["volume"]))
+        for stamp, row in aggregate(minutes).iterrows():
+            per_candle.setdefault(stamp.time(), []).append(float(row["volume"]))
+
+    return (
+        {slot: statistics.median(v) for slot, v in per_minute.items() if v},
+        {slot: statistics.median(v) for slot, v in per_candle.items() if v},
+    )
+
+
+# --------------------------------------------------------------------------
+# Which way the volume is leaning
+# --------------------------------------------------------------------------
+
+@dataclass
+class Lean:
+    """Where volume traded inside each minute's range, over a short window.
+
+    Not order flow. Bars carry no buy/sell tag, so this cannot be a true
+    delta -- what it measures is whether the heavy minutes closed near
+    their highs or near their lows. A hint about who is winning the
+    range, and nothing stronger.
+    """
+
+    score: float          # 0 = every heavy minute closed on its low, 1 = on its high
+    up_volume: float
+    down_volume: float
+    minutes: int
+
+    @property
+    def word(self) -> str:
+        if self.score >= 0.62:
+            return "buyers"
+        if self.score <= 0.38:
+            return "sellers"
+        return "balanced"
+
+    @property
+    def arrow(self) -> str:
+        return {"buyers": "↑", "sellers": "↓", "balanced": "→"}[self.word]
+
+    def __str__(self) -> str:
+        share = self.up_volume + self.down_volume
+        split = ""
+        if share:
+            split = f" · {100 * self.up_volume / share:.0f}% of volume on up minutes"
+        return (f"Volume leaning {self.word} {self.arrow} "
+                f"({self.score * 100:.0f}/100 over {self.minutes} min){split}")
+
+
+def read_lean(frame: pd.DataFrame, minutes: int = PRESSURE_MINUTES) -> Optional[Lean]:
+    """Volume-weighted close position across the last `minutes` bars."""
+    window = frame.tail(minutes)
+    if window.empty:
+        return None
+    total = float(window["volume"].sum())
+    if total <= 0:
+        return None
+
+    weighted = 0.0
+    up = down = 0.0
+    for _, row in window.iterrows():
+        high, low = float(row["high"]), float(row["low"])
+        volume = float(row["volume"])
+        # A minute with no range is a minute with no opinion.
+        position = 0.5 if high <= low else (float(row["close"]) - low) / (high - low)
+        weighted += position * volume
+        if float(row["close"]) > float(row["open"]):
+            up += volume
+        elif float(row["close"]) < float(row["open"]):
+            down += volume
+
+    return Lean(score=weighted / total, up_volume=up, down_volume=down,
+                minutes=len(window))
 
 
 # --------------------------------------------------------------------------
@@ -205,8 +351,53 @@ class Candle:
         return self.volume / self.usual_volume
 
 
-def describe(symbol: str, candle: Candle) -> str:
-    """One candle, spelled out. Sent as its five minutes close."""
+def to_candles(frame: pd.DataFrame, baseline: Dict[time, float]) -> List[Candle]:
+    return [
+        Candle(
+            at=stamp,
+            open=float(row["open"]), high=float(row["high"]),
+            low=float(row["low"]), close=float(row["close"]),
+            volume=float(row["volume"]),
+            trades=float(row["trade_count"]) if "trade_count" in row else None,
+            usual_volume=baseline.get(stamp.time()),
+        )
+        for stamp, row in frame.iterrows()
+    ]
+
+
+def describe_minute(symbol: str, minute: Candle, forming: Optional[Candle],
+                    lean: Optional[Lean]) -> str:
+    """The quiet once-a-minute update."""
+    arrow = "▲" if minute.up else "▼"
+    change = minute.close - minute.open
+    volume = f"Minute volume {thousands(minute.volume)}"
+    if minute.vol_ratio is not None:
+        volume += f" ({minute.vol_ratio:.1f}× usual)"
+    if minute.trades:
+        volume += f" in {int(minute.trades):,} trades"
+
+    lines = [
+        f"{symbol} {minute.at:%H:%M} {arrow} {money(minute.close)} "
+        f"({'+' if change >= 0 else ''}{cents(change)})",
+        volume,
+    ]
+    if forming is not None:
+        elapsed = int((minute.at - forming.at).total_seconds() // 60) + 1
+        lines.append(
+            f"Candle {forming.at:%H:%M} forming ({elapsed}/{BAR_MINUTES} min): "
+            f"O {forming.open:,.2f}  H {forming.high:,.2f}  "
+            f"L {forming.low:,.2f}  now {forming.close:,.2f}  "
+            f"{thousands(forming.volume)}"
+        )
+    if lean is not None:
+        lines.append(str(lean))
+    if minute.at.time() < time(9, 30):
+        lines.append("pre-market")
+    return "\n".join(lines)
+
+
+def describe(symbol: str, candle: Candle, lean: Optional[Lean] = None) -> str:
+    """The five-minute alarm: one completed candle, spelled out."""
     arrow = "▲" if candle.up else "▼"
     change = candle.close - candle.open
     lines = [
@@ -223,6 +414,8 @@ def describe(symbol: str, candle: Candle) -> str:
     if candle.trades:
         volume += f" in {int(candle.trades):,} trades"
     lines.append(volume)
+    if lean is not None:
+        lines.append(str(lean))
     if candle.at.time() < time(9, 30):
         lines.append("pre-market")
     return "\n".join(lines)
@@ -261,10 +454,11 @@ def summarise(symbol: str, candles: List[Candle]) -> str:
 
 def ensure_schema(db: sqlite3.Connection) -> None:
     db.executescript(SCHEMA)
+    db.executescript(MINUTE_SCHEMA)
 
 
 def remember(db: sqlite3.Connection, symbol: str, candle: Candle, sent: bool) -> bool:
-    """Write one candle. False if this one was already recorded."""
+    """Write one 5-minute candle. False if it was already recorded."""
     try:
         db.execute(
             """INSERT INTO candles
@@ -273,8 +467,7 @@ def remember(db: sqlite3.Connection, symbol: str, candle: Candle, sent: bool) ->
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (symbol, candle.at.isoformat(), BAR_MINUTES, candle.open, candle.high,
              candle.low, candle.close, int(candle.volume),
-             int(candle.trades) if candle.trades else None,
-             candle.vol_ratio,
+             int(candle.trades) if candle.trades else None, candle.vol_ratio,
              datetime.now(ET).isoformat() if sent else None),
         )
         db.commit()
@@ -283,112 +476,156 @@ def remember(db: sqlite3.Connection, symbol: str, candle: Candle, sent: bool) ->
         return False
 
 
-def to_candles(frame: pd.DataFrame, baseline: Dict[time, float]) -> List[Candle]:
-    return [
-        Candle(
-            at=stamp,
-            open=float(row["open"]), high=float(row["high"]),
-            low=float(row["low"]), close=float(row["close"]),
-            volume=float(row["volume"]),
-            trades=float(row["trade_count"]) if "trade_count" in row else None,
-            usual_volume=baseline.get(stamp.time()),
+def remember_minute(db: sqlite3.Connection, symbol: str, minute: Candle,
+                    lean: Optional[Lean], sent: bool) -> bool:
+    try:
+        db.execute(
+            """INSERT INTO minutes
+               (symbol, bar_time, open, high, low, close, volume, trades,
+                vol_ratio, lean, sent_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (symbol, minute.at.isoformat(), minute.open, minute.high, minute.low,
+             minute.close, int(minute.volume),
+             int(minute.trades) if minute.trades else None, minute.vol_ratio,
+             lean.score if lean else None,
+             datetime.now(ET).isoformat() if sent else None),
         )
-        for stamp, row in frame.iterrows()
-    ]
+        db.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
 
 
 # --------------------------------------------------------------------------
 # Running
 # --------------------------------------------------------------------------
 
-def deliver(message: str, title: str, dry_run: bool) -> str:
+def deliver(message: str, title: str, priority: int, dry_run: bool) -> str:
     if dry_run:
         return "dry run"
-    error = send_pushover(message, title=title)
-    return error or "sent"
+    return send_pushover(message, title=title, priority=priority) or "sent"
 
 
 def run_replay(symbol: str, day: date, start: time, end: time,
                dry_run: bool, db: sqlite3.Connection) -> int:
     """Read a past morning. Always the full tape -- history is free on SIP."""
-    frame = fetch_candles(
+    minutes = fetch_minutes(
         symbol,
         datetime.combine(day, start, tzinfo=ET),
         datetime.combine(day, end, tzinfo=ET),
         force_sip=True,
     )
-    if frame.empty:
-        print(f"No candles for {symbol} on {day}. Market closed that day?")
+    if minutes.empty:
+        print(f"No bars for {symbol} on {day}. Market closed that day?")
         return 1
 
-    slots = sorted({stamp.time() for stamp in frame.index})
-    baseline = volume_baseline(symbol, day, slots)
-    candles = to_candles(frame, baseline)
+    minute_base, candle_base = volume_baselines(symbol, day)
+    candles = to_candles(aggregate(minutes), candle_base)
 
     for candle in candles:
-        print(describe(symbol, candle))
+        upto = minutes[minutes.index < candle.at + timedelta(minutes=BAR_MINUTES)]
+        print(describe(symbol, candle, read_lean(upto)))
         print()
         remember(db, symbol, candle, sent=False)
 
     print("=" * 56)
-    print(summarise(symbol, candles))
+    text = summarise(symbol, candles)
+    print(text)
     if not dry_run:
-        print(f"\n[summary push: {deliver(summarise(symbol, candles), f'{symbol} replay', False)}]")
+        print("\n[summary push: "
+              f"{deliver(text, f'{symbol} replay', PRIORITY_SUMMARY, False)}]")
     return 0
 
 
 def run_live(symbol: str, start: time, end: time, dry_run: bool,
-             db: sqlite3.Connection) -> int:
-    """Follow this morning, pushing each candle as it closes."""
+             db: sqlite3.Connection, push_empty: bool = False) -> int:
+    """Follow this morning: a quiet update each minute, an alarm each candle."""
     today = datetime.now(ET).date()
     window_start = datetime.combine(today, start, tzinfo=ET)
     window_end = datetime.combine(today, end, tzinfo=ET)
 
-    slots, cursor = [], window_start
-    while cursor < window_end:
-        slots.append(cursor.time())
-        cursor += timedelta(minutes=BAR_MINUTES)
-
-    print(f"Baseline: median volume per slot over {BASELINE_SESSIONS} sessions...")
+    print(f"Baselines: median volume per slot over {BASELINE_SESSIONS} sessions...")
     try:
-        baseline = volume_baseline(symbol, today, slots)
-        print(f"  {len(baseline)} of {len(slots)} slots have history.\n")
+        minute_base, candle_base = volume_baselines(symbol, today)
+        print(f"  {len(minute_base)} minute slots, {len(candle_base)} candle slots.\n")
     except Exception as exc:  # noqa: BLE001
         print(f"  unavailable ({type(exc).__name__}) — volumes will be raw.\n")
-        baseline = {}
+        minute_base, candle_base = {}, {}
 
     feed = os.getenv("ALPACA_DATA_FEED", "").strip().lower() or "iex"
-    print(f"{symbol} · {BAR_MINUTES}-minute candles · {start:%H:%M}-{end:%H:%M} ET · {feed} feed")
+    print(f"{symbol} · {start:%H:%M}-{end:%H:%M} ET · {feed} feed")
+    print(f"  every minute  → quiet update (priority {PRIORITY_UPDATE})")
+    print(f"  every {BAR_MINUTES} min   → alarm (priority {PRIORITY_SUMMARY})")
     if feed != "sip" and start < time(9, 30):
-        print("Note: IEX carries very little before 09:30, so the pre-market")
-        print("candles may be sparse or missing. Replay uses the full tape.\n")
+        print("  note: IEX carries very little before 09:30; empty minutes are")
+        print("        skipped unless --push-empty.")
+    print()
 
-    seen, collected = set(), []
+    seen_minutes, seen_candles, collected = set(), set(), []
     try:
         while True:
             now = datetime.now(ET)
             if now >= window_end + timedelta(minutes=BAR_MINUTES):
                 break
-            if now >= window_start:
-                try:
-                    frame = completed_only(
-                        fetch_candles(symbol, window_start, min(now, window_end)), now)
-                except Exception as exc:  # noqa: BLE001 -- one bad minute is not the morning
-                    print(f"  {now:%H:%M}  error: {type(exc).__name__}: {exc}")
-                    frame = pd.DataFrame()
+            if now < window_start:
+                time_mod.sleep(min(30, max(1, (window_start - now).total_seconds())))
+                continue
 
-                for candle in to_candles(frame, baseline):
-                    if candle.at in seen:
-                        continue
-                    seen.add(candle.at)
-                    collected.append(candle)
-                    message = describe(symbol, candle)
-                    fresh = remember(db, symbol, candle, sent=not dry_run)
-                    status = deliver(message, f"{symbol} {candle.at:%H:%M}", dry_run) \
-                        if fresh else "already recorded"
-                    print(message)
-                    print(f"  [{status}]\n")
-            time_mod.sleep(max(5, 20 - datetime.now(ET).second % 20))
+            try:
+                minutes = fetch_minutes(symbol, window_start, min(now, window_end))
+            except Exception as exc:  # noqa: BLE001 -- one bad minute is not the morning
+                print(f"  {now:%H:%M}  error: {type(exc).__name__}: {exc}")
+                minutes = pd.DataFrame()
+
+            done_minutes = drop_forming(minutes, now, 1)
+
+            # --- the quiet per-minute update ---------------------------
+            for stamp, row in done_minutes.iterrows():
+                if stamp in seen_minutes:
+                    continue
+                seen_minutes.add(stamp)
+                minute = to_candles(done_minutes.loc[[stamp]], minute_base)[0]
+                if minute.volume <= 0 and not push_empty:
+                    print(f"  {stamp:%H:%M}  no trades — skipped")
+                    continue
+
+                upto = done_minutes[done_minutes.index <= stamp]
+                lean = read_lean(upto)
+
+                # The candle this minute belongs to, as far as it has got.
+                edge = stamp.replace(minute=stamp.minute - (stamp.minute % BAR_MINUTES),
+                                     second=0, microsecond=0)
+                part = upto[upto.index >= edge]
+                forming = to_candles(aggregate(part), {})[0] if not part.empty else None
+                if forming is not None and forming.at + timedelta(minutes=BAR_MINUTES) <= stamp:
+                    forming = None
+
+                message = describe_minute(symbol, minute, forming, lean)
+                fresh = remember_minute(db, symbol, minute, lean, sent=not dry_run)
+                status = deliver(message, f"{symbol} {stamp:%H:%M}",
+                                 PRIORITY_UPDATE, dry_run) if fresh else "already recorded"
+                print(message)
+                print(f"  [{status}]\n")
+
+            # --- the five-minute alarm ---------------------------------
+            for candle in to_candles(drop_forming(aggregate(minutes), now, BAR_MINUTES),
+                                     candle_base):
+                if candle.at in seen_candles:
+                    continue
+                seen_candles.add(candle.at)
+                collected.append(candle)
+                upto = done_minutes[done_minutes.index <
+                                    candle.at + timedelta(minutes=BAR_MINUTES)]
+                message = describe(symbol, candle, read_lean(upto))
+                fresh = remember(db, symbol, candle, sent=not dry_run)
+                status = deliver(message, f"{symbol} candle {candle.at:%H:%M}",
+                                 PRIORITY_SUMMARY, dry_run) if fresh else "already recorded"
+                print("-" * 56)
+                print(message)
+                print(f"  [{status}]")
+                print("-" * 56 + "\n")
+
+            time_mod.sleep(max(5, 62 - datetime.now(ET).second))
     except KeyboardInterrupt:
         print("\nStopped early.")
 
@@ -396,7 +633,8 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
         text = summarise(symbol, collected)
         print("=" * 56)
         print(text)
-        print(f"\n[summary push: {deliver(text, f'{symbol} morning', dry_run)}]")
+        print("\n[summary push: "
+              f"{deliver(text, f'{symbol} morning', PRIORITY_SUMMARY, dry_run)}]")
     else:
         print("No candles collected.")
     return 0
@@ -408,78 +646,124 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
 
 def self_test() -> int:
     """Check the arithmetic and the wording offline. No network, no keys."""
-    print("Self-test: checking candle maths and messages...\n")
+    print("Self-test: checking candle maths, lean and messages...\n")
     failures = []
 
     at = datetime.combine(date(2026, 9, 18), time(9, 35), tzinfo=ET)
-    # A candle that opened low, ran up, was pushed back, and closed mid-body.
     up = Candle(at=at, open=152.18, high=152.63, low=152.05, close=152.41,
                 volume=84_200, trades=612, usual_volume=46_000)
+    down = Candle(at=at + timedelta(minutes=BAR_MINUTES), open=152.41, high=152.44,
+                  low=151.90, close=152.02, volume=51_000)
 
     if abs(up.upper_wick - 0.22) > 1e-9:
         failures.append(f"upper wick should be 22c, got {up.upper_wick}")
     if abs(up.lower_wick - 0.13) > 1e-9:
         failures.append(f"lower wick should be 13c, got {up.lower_wick}")
-    if abs(up.body - 0.23) > 1e-9:
-        failures.append(f"body should be 23c, got {up.body}")
-    if not up.up:
-        failures.append("a candle closing above its open is an up candle")
     if abs(up.vol_ratio - 84_200 / 46_000) > 1e-9:
         failures.append("volume ratio should divide by the usual volume")
-
-    down = Candle(at=at + timedelta(minutes=BAR_MINUTES), open=152.41, high=152.44,
-                  low=151.90, close=152.02, volume=51_000)
-    if down.up:
-        failures.append("a candle closing below its open is a down candle")
-    if abs(down.upper_wick - 0.03) > 1e-9:
-        failures.append(f"down-candle upper wick should be 3c, got {down.upper_wick}")
-    if abs(down.lower_wick - 0.12) > 1e-9:
-        failures.append(f"down-candle lower wick should be 12c, got {down.lower_wick}")
+    if down.up or not up.up:
+        failures.append("up and down candles are being told apart wrongly")
     if down.vol_ratio is not None:
         failures.append("with no history there should be no ratio, not a made-up one")
-
-    # Wicks and body must account for the whole range, both directions.
     for candle in (up, down):
         span = candle.upper_wick + candle.body + candle.lower_wick
         if abs(span - (candle.high - candle.low)) > 1e-9:
-            failures.append(f"wicks plus body should equal the range for {candle.at:%H:%M}")
+            failures.append(f"wicks plus body should equal the range at {candle.at:%H:%M}")
         if candle.upper_wick < 0 or candle.lower_wick < 0:
             failures.append("a wick cannot be negative")
 
-    message = describe("SPCX", up)
+    # --- aggregation -------------------------------------------------------
+    index = pd.DatetimeIndex([at + timedelta(minutes=i) for i in range(10)])
+    minutes = pd.DataFrame({
+        "open":  [10, 11, 12, 13, 14, 20, 21, 22, 23, 24],
+        "high":  [11, 12, 13, 14, 15, 21, 22, 23, 24, 25],
+        "low":   [9, 10, 11, 12, 13, 19, 20, 21, 22, 23],
+        "close": [11, 12, 13, 14, 15, 21, 22, 23, 24, 25],
+        "volume": [100] * 10,
+        "trade_count": [5] * 10,
+    }, index=index)
+    rolled = aggregate(minutes)
+    if len(rolled) != 2:
+        failures.append(f"ten minutes should roll into two candles, got {len(rolled)}")
+    else:
+        first = rolled.iloc[0]
+        if not (first["open"] == 10 and first["high"] == 15 and first["low"] == 9
+                and first["close"] == 15 and first["volume"] == 500):
+            failures.append(f"the first candle aggregated wrongly: {dict(first)}")
+        if rolled.index[0].time() != time(9, 35):
+            failures.append(f"candles should align to the clock, got {rolled.index[0]}")
+
+    # --- the forming bar ---------------------------------------------------
+    kept = drop_forming(rolled, at + timedelta(minutes=7), BAR_MINUTES)
+    if len(kept) != 1:
+        failures.append(f"at 09:42 only the 09:35 candle is done, kept {len(kept)}")
+    if len(drop_forming(minutes, at + timedelta(minutes=4, seconds=30), 1)) != 4:
+        failures.append("the in-progress minute leaked through")
+
+    # --- the lean ----------------------------------------------------------
+    strong = pd.DataFrame({
+        "open": [10.0] * 3, "high": [11.0] * 3, "low": [10.0] * 3,
+        "close": [11.0] * 3, "volume": [100.0] * 3,
+    }, index=pd.DatetimeIndex([at + timedelta(minutes=i) for i in range(3)]))
+    buyers = read_lean(strong)
+    if buyers is None or buyers.score < 0.99 or buyers.word != "buyers":
+        failures.append(f"three minutes closing on their highs should read buyers: {buyers}")
+
+    weak = strong.copy()
+    weak["close"] = 10.0
+    weak["open"] = 11.0
+    sellers = read_lean(weak)
+    if sellers is None or sellers.score > 0.01 or sellers.word != "sellers":
+        failures.append(f"three minutes closing on their lows should read sellers: {sellers}")
+
+    flat = strong.copy()
+    flat["high"] = flat["low"] = flat["open"] = flat["close"] = 10.0
+    middling = read_lean(flat)
+    if middling is None or abs(middling.score - 0.5) > 1e-9 or middling.word != "balanced":
+        failures.append(f"a rangeless stretch has no opinion, got {middling}")
+
+    if read_lean(pd.DataFrame()) is not None:
+        failures.append("no bars should yield no reading, not a default one")
+
+    # --- messages ----------------------------------------------------------
+    minute = Candle(at=at, open=152.30, high=152.45, low=152.28, close=152.41,
+                    volume=18_200, trades=131, usual_volume=13_000)
+    forming = Candle(at=at.replace(minute=35), open=152.18, high=152.45,
+                     low=152.05, close=152.41, volume=42_100)
+    update = describe_minute("SPCX", minute, forming, buyers)
+    for needed in ("Minute volume", "forming", "Volume leaning"):
+        if needed not in update:
+            failures.append(f"the minute update should carry {needed!r}")
+
+    alarm = describe("SPCX", up, buyers)
     for needed in ("Open", "Close", "High", "Low", "Upper wick", "Lower wick", "Volume"):
-        if needed not in message:
-            failures.append(f"the message should carry {needed!r}")
-    if "pre-market" in message:
+        if needed not in alarm:
+            failures.append(f"the candle alarm should carry {needed!r}")
+    if "pre-market" in alarm:
         failures.append("09:35 is not pre-market")
-    early = Candle(at=at.replace(hour=8, minute=55), open=152.0, high=152.1,
-                   low=151.9, close=152.05, volume=1_200)
-    if "pre-market" not in describe("SPCX", early):
+    if "pre-market" not in describe("SPCX", Candle(
+            at=at.replace(hour=8, minute=55), open=152.0, high=152.1, low=151.9,
+            close=152.05, volume=1_200)):
         failures.append("08:55 should be marked pre-market")
 
-    # The forming candle must never survive.
-    index = pd.DatetimeIndex([at + timedelta(minutes=5 * i) for i in range(4)])
-    frame = pd.DataFrame({"open": [1.0] * 4, "high": [1.0] * 4, "low": [1.0] * 4,
-                          "close": [1.0] * 4, "volume": [1] * 4}, index=index)
-    now = at + timedelta(minutes=17)          # 09:52, so 09:50 is still forming
-    kept = completed_only(frame, now)
-    if len(kept) != 3 or kept.index[-1].time() != time(9, 45):
-        failures.append(f"the forming candle leaked: kept {[str(t.time()) for t in kept.index]}")
-
-    text = summarise("SPCX", [up, down])
-    if text.count("\n") < 4 or "2 candles" not in text:
-        failures.append("the summary should head with a count and list each candle")
+    if PRIORITY_UPDATE >= PRIORITY_SUMMARY:
+        failures.append("the routine stream must be quieter than the alarm")
 
     source = open(__file__, encoding="utf-8").read()
     for forbidden in ("TradingClient", "submit_order", "MarketOrderRequest"):
         if forbidden in source.replace(f'"{forbidden}"', ""):
             failures.append(f"this file must not mention {forbidden}")
 
-    print(describe("SPCX", up))
+    print(update)
     print()
-    print(summarise("SPCX", [up, down]))
-    print("\n  Forming candle dropped         : yes (kept through 09:45 at 09:52)")
-    print("  Wicks + body = range           : both candles")
+    print("-" * 56)
+    print(alarm)
+    print("-" * 56)
+    print(f"\n  Ten minutes → candles          : {len(rolled)}, aligned to the clock")
+    print("  Forming bar dropped            : minute and candle")
+    print(f"  Lean, highs / lows / no range  : {buyers.score:.2f} / "
+          f"{sellers.score:.2f} / {middling.score:.2f}")
+    print(f"  Priorities, update vs alarm    : {PRIORITY_UPDATE} vs {PRIORITY_SUMMARY}")
     print("  Trading client in this file    : none")
 
     if failures:
@@ -494,13 +778,15 @@ def self_test() -> int:
 # --------------------------------------------------------------------------
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Read the morning's candles to your phone.")
+    parser = argparse.ArgumentParser(description="Read the morning's tape to your phone.")
     parser.add_argument("--symbol", default=SYMBOL)
     parser.add_argument("--from", dest="start", default=f"{WINDOW_START:%H:%M}",
                         help=f"Window start, ET (default {WINDOW_START:%H:%M})")
     parser.add_argument("--until", dest="end", default=f"{WINDOW_END:%H:%M}",
                         help=f"Window end, ET (default {WINDOW_END:%H:%M})")
     parser.add_argument("--replay", metavar="YYYY-MM-DD", help="Read a past session instead")
+    parser.add_argument("--push-empty", action="store_true",
+                        help="Send an update for minutes with no trades too")
     parser.add_argument("--dry-run", action="store_true", help="Print, do not send")
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--self-test", action="store_true")
@@ -520,7 +806,7 @@ def main() -> int:
     if args.replay:
         day = datetime.strptime(args.replay, "%Y-%m-%d").date()
         return run_replay(symbol, day, start, end, args.dry_run, db)
-    return run_live(symbol, start, end, args.dry_run, db)
+    return run_live(symbol, start, end, args.dry_run, db, args.push_empty)
 
 
 if __name__ == "__main__":

@@ -237,8 +237,15 @@ def compose(symbol: str, bar_time: datetime, row: pd.Series) -> str:
     )
 
 
-def send_pushover(message: str, title: str = "SPCX setup") -> Optional[str]:
-    """Deliver to the phone. Returns an error string, or None on success."""
+def send_pushover(message: str, title: str = "SPCX setup",
+                  priority: int = 0) -> Optional[str]:
+    """Deliver to the phone. Returns an error string, or None on success.
+
+    Priority -1 arrives without a sound or vibration -- it sits in the
+    tray to be glanced at. 0 is a normal notification. 1 is an alarm that
+    sounds through a focus mode. A stream of routine updates belongs at
+    -1, or the phone becomes unusable and the alarms get ignored with it.
+    """
     token = os.getenv("PUSHOVER_APP_TOKEN", "").strip()
     user = os.getenv("PUSHOVER_USER_KEY", "").strip()
     if not token or not user:
@@ -246,6 +253,7 @@ def send_pushover(message: str, title: str = "SPCX setup") -> Optional[str]:
 
     payload = urllib.parse.urlencode({
         "token": token, "user": user, "title": title, "message": message,
+        "priority": str(priority),
     }).encode()
     try:
         with urllib.request.urlopen(PUSHOVER_URL, data=payload, timeout=10) as response:
