@@ -88,10 +88,14 @@ COOLDOWN_MINUTES = 40
 EARLIEST_SIGNAL = SESSION_OPEN
 
 #: The phone stays quiet until this. Evaluating a bar and alerting on it
-#: are two different decisions: the first 15 minutes are for watching the
+#: are two different decisions: the opening stretch is for watching the
 #: candles yourself, not for being told about them. Every qualifying bar
 #: before this is still written to the database, marked as held back.
-ALERT_FROM = time(9, 45)
+#:
+#: 09:40 rather than 09:45 on purpose -- five minutes of setups before the
+#: hour you would actually act on, to get your eye in rather than to be
+#: acted upon. Move it with --alert-from; what gets logged does not change.
+ALERT_FROM = time(9, 40)
 
 #: Bars fetched behind the current moment. MACD is an exponential average
 #: of price and carries across the session boundary, so it is warmed on
@@ -604,15 +608,17 @@ def self_test() -> int:
     # Evaluating and alerting must be two different gates, not one.
     if EARLIEST_SIGNAL >= ALERT_FROM:
         failures.append("signals should be evaluated earlier than alerts are sent")
-    if ALERT_FROM != time(9, 45):
-        failures.append(f"the alert gate should be 09:45, got {ALERT_FROM}")
+    if not (SESSION_OPEN <= ALERT_FROM < SESSION_CLOSE):
+        failures.append(f"the alert gate should sit inside the session, got {ALERT_FROM}")
     held = [ts for ts in qualifying if ts.time() < ALERT_FROM]
     sendable = [ts for ts in qualifying if ts.time() >= ALERT_FROM]
     if not held:
-        failures.append("the fixture should produce a qualifying bar before 09:45, "
+        failures.append(f"the fixture should produce a qualifying bar before "
+                        f"{ALERT_FROM:%H:%M}, "
                         "or the quiet period is not actually being tested")
     if not all(session.at[ts, "cond_e_time"] for ts in held):
-        failures.append("a bar before 09:45 should still satisfy the time condition, "
+        failures.append(f"a bar before {ALERT_FROM:%H:%M} should still satisfy the "
+                        f"time condition, "
                         "so that it is logged")
 
     # And the decision itself: held bars record, and stay silent.
@@ -627,8 +633,8 @@ def self_test() -> int:
         failures.append("every held bar should still be written to the database")
 
     print(f"  Qualifying bars in fixture     : {len(qualifying)}")
-    print(f"    before 09:45 (log only)      : {len(held)}")
-    print(f"    from 09:45 (may alert)       : {len(sendable)}")
+    print(f"    before {ALERT_FROM:%H:%M} (log only)      : {len(held)}")
+    print(f"    from {ALERT_FROM:%H:%M} (may alert)       : {len(sendable)}")
     print(f"  Example alert                  : {message}")
     print(f"  Cooldown                       : {COOLDOWN_MINUTES} min, read from the database")
     print("  Duplicate bar rejected         : yes")
