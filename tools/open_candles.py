@@ -253,7 +253,7 @@ def volume_baselines(symbol: str, day: date) -> tuple:
 
 @dataclass
 class Lean:
-    """Where volume traded inside each minute's range, over a short window.
+    """Where price closed within each minute's range, weighted by volume.
 
     Not order flow. Bars carry no buy/sell tag, so this cannot be a true
     delta -- what it measures is whether the heavy minutes closed near

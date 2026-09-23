@@ -343,7 +343,8 @@ def page_participation(pdf: PdfPages, session: Session) -> None:
     lean_ax.plot(x, scores, color=INK, linewidth=1.8)
     lean_ax.set_ylim(0, 100)
     lean_ax.set_ylabel("0 = lows · 100 = highs")
-    lean_ax.set_title("Where volume traded inside each range — a hint, not order flow",
+    lean_ax.set_title("Where price closed within its range — volume-weighted, "
+                      "a hint rather than order flow",
                       loc="left", size=10.5, weight="normal", pad=8)
     lean_ax.spines[["top", "right"]].set_visible(False)
 
