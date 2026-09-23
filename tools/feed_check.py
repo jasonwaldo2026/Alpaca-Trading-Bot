@@ -62,6 +62,7 @@ import argparse
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -254,16 +255,39 @@ def alert_text(symbol: str, row: pd.Series) -> str:
 # Fetching
 # --------------------------------------------------------------------------
 
+_env_loaded = False
+
+
+def load_env() -> None:
+    """Read .env once, before anything asks for a key.
+
+    Called at the top of every entry point rather than lazily from the
+    fetch path: a tool that only sends a notification never fetches, and
+    would otherwise look for keys in an environment nothing had filled.
+    A key that was never loaded looks exactly like a key that was never
+    set, which is the expensive kind of silence.
+
+    Beside this file first, then the working directory, because the
+    desktop launcher does not necessarily run from this folder. Neither
+    overrides a variable already set for real.
+    """
+    global _env_loaded
+    if _env_loaded:
+        return
+    _env_loaded = True
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv(Path(__file__).with_name(".env"))
+    load_dotenv()
+
+
 def load_credentials() -> Tuple[str, str]:
     """Read the key pair without ever printing it."""
     import os
 
-    try:
-        from dotenv import load_dotenv
-
-        load_dotenv()
-    except ImportError:
-        pass
+    load_env()
 
     key = os.getenv("ALPACA_API_KEY", "").strip()
     secret = (
@@ -602,6 +626,7 @@ def self_test() -> int:
 # --------------------------------------------------------------------------
 
 def main() -> int:
+    load_env()
     parser = argparse.ArgumentParser(description="Compare Alpaca's IEX and SIP feeds.")
     parser.add_argument("--symbol", default=SYMBOL, help=f"Ticker (default {SYMBOL})")
     parser.add_argument("--days", type=int, default=5, help="Trading days to check (default 5)")

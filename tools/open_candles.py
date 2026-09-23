@@ -69,7 +69,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from feed_check import ET, load_credentials, parse_clock, trading_days
+from feed_check import ET, load_credentials, load_env, parse_clock, trading_days
 from spcx_alert import (
     PRIORITY_SUMMARY,
     PRIORITY_UPDATE,
@@ -919,6 +919,7 @@ def self_test() -> int:
 # --------------------------------------------------------------------------
 
 def main() -> int:
+    load_env()
     parser = argparse.ArgumentParser(description="Read the morning's tape to your phone.")
     parser.add_argument("--symbol", default=SYMBOL)
     parser.add_argument("--from", dest="start", default=f"{WINDOW_START:%H:%M}",

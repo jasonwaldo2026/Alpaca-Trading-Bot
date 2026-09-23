@@ -41,7 +41,7 @@ import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Rectangle
 
-from feed_check import ET, parse_clock, trading_days
+from feed_check import ET, load_env, parse_clock, trading_days
 from open_candles import BAR_MINUTES, aggregate, fetch_minutes, read_lean, thousands
 from spcx_alert import open_db
 
@@ -470,6 +470,7 @@ def reveal(path: str) -> None:
 
 
 def main() -> int:
+    load_env()
     parser = argparse.ArgumentParser(description="One session as a PDF.")
     parser.add_argument("--symbol", default=SYMBOL)
     parser.add_argument("--date", help="YYYY-MM-DD (default: the last trading day)")

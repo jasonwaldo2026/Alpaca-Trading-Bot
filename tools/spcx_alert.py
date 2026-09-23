@@ -62,7 +62,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import Optional
+from typing import List, Optional, Tuple
 import pandas as pd
 
 from feed_check import (
@@ -72,6 +72,7 @@ from feed_check import (
     Macd,
     add_conditions,
     load_credentials,
+    load_env,
     prepare,
 )
 
@@ -106,6 +107,7 @@ WARMUP_MINUTES = 900
 
 DB_PATH = "spcx_alerts.db"
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
+PUSHOVER_VALIDATE_URL = "https://api.pushover.net/1/users/validate.json"
 
 #: Pushover priorities, shared with open_candles. -1 arrives with no sound
 #: or vibration; 1 sounds through a focus mode.
@@ -317,12 +319,48 @@ def send_pushover(message: str, title: str = "SPCX setup",
         return f"{type(exc).__name__}: {exc}"
 
 
+def registered_devices() -> Tuple[Optional[List[str]], Optional[str]]:
+    """Ask Pushover which devices this key actually reaches.
+
+    Returns (devices, error). A key can be perfectly valid and reach
+    nothing: the account exists, the send is accepted, and the message
+    lands nowhere a human will see it. That failure is invisible from
+    the sending side, so ask before claiming a test succeeded.
+    """
+    token = os.getenv("PUSHOVER_APP_TOKEN", "").strip()
+    user = os.getenv("PUSHOVER_USER_KEY", "").strip()
+    if not token or not user:
+        return None, "no Pushover credentials"
+
+    fields = {"token": token, "user": user}
+    request = urllib.request.Request(
+        PUSHOVER_VALIDATE_URL, data=urllib.parse.urlencode(fields).encode())
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode())
+        except (ValueError, OSError):
+            return None, f"HTTP {exc.code}"
+        errors = body.get("errors") or [f"HTTP {exc.code}"]
+        return None, "; ".join(str(e) for e in errors)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+    if body.get("status") != 1:
+        errors = body.get("errors") or [str(body)]
+        return None, "; ".join(str(e) for e in errors)
+    return list(body.get("devices") or []), None
+
+
 def test_push() -> int:
     """Send one of each kind, and say plainly what happened.
 
     Worth doing before you rely on it. A silent morning because a key was
     never pasted in looks exactly like a morning with nothing to report.
     """
+    load_env()
     print("Checking the path to your phone...\n")
 
     present = {name: bool(os.getenv(name, "").strip())
@@ -334,6 +372,28 @@ def test_push() -> int:
         print("  App token : pushover.net → Your Applications → your app")
         print("  User key  : pushover.net → the key on the main page after login")
         return 1
+
+    # Ask who is listening before sending anything. Pushover accepts a
+    # message for an account with no devices and reports success, so a
+    # send that "worked" proves nothing on its own.
+    devices, error = registered_devices()
+    if error:
+        print(f"\n  devices                UNKNOWN - {error}")
+        print("\nThe key was rejected, so nothing would arrive. Check that the")
+        print("app token and user key are the two different values they should")
+        print("be: the token belongs to the application, the key belongs to you.")
+        return 1
+    if not devices:
+        print("\n  devices                NONE")
+        print("\nThis key is valid but no device is attached to it, so a message")
+        print("is accepted and then reaches nobody. Two usual causes:")
+        print("  1. The iPhone app is signed in to a different Pushover account.")
+        print("  2. The 30-day trial lapsed and the app was never purchased.")
+        print("     The account keeps accepting; the handset stops receiving.")
+        print("\nOpen Pushover on the phone, check which account it is signed")
+        print("in to, then run this again.")
+        return 1
+    print(f"  devices                {', '.join(devices)}")
 
     checks = [
         (PRIORITY_UPDATE, "quiet update", f"{SYMBOL} 09:36 \u25bc $153.89 (-3\u00a2)\n"
@@ -650,6 +710,31 @@ def self_test() -> int:
         if forbidden in source.replace(f'"{forbidden}"', ""):
             failures.append(f"this file must not mention {forbidden}")
 
+    # Every entry point must load .env before it reads a key. A tool that
+    # only notifies never fetches, so it cannot rely on the fetch path
+    # having filled the environment on its way past.
+    import inspect
+
+    for fn in (main, test_push):
+        if "load_env()" not in inspect.getsource(fn):
+            failures.append(f"{fn.__name__}() must load .env before reading a key")
+
+    # And a test that only proves Pushover accepted the message proves
+    # nothing: the account can have no device attached to it.
+    if "registered_devices()" not in inspect.getsource(test_push):
+        failures.append("test_push() should confirm a device is listening before sending")
+
+    saved = {name: os.environ.pop(name, None)
+             for name in ("PUSHOVER_APP_TOKEN", "PUSHOVER_USER_KEY")}
+    try:
+        devices, error = registered_devices()   # returns before any network call
+        if devices is not None or not error:
+            failures.append("registered_devices() should report an error when no key is set")
+    finally:
+        for name, value in saved.items():
+            if value is not None:
+                os.environ[name] = value
+
     # Evaluating and alerting must be two different gates, not one.
     if EARLIEST_SIGNAL >= ALERT_FROM:
         failures.append("signals should be evaluated earlier than alerts are sent")
@@ -698,6 +783,7 @@ def self_test() -> int:
 # --------------------------------------------------------------------------
 
 def main() -> int:
+    load_env()
     parser = argparse.ArgumentParser(description="Warn when an SPCX buy setup may be opening.")
     parser.add_argument("--watch", action="store_true", help="Run through the session")
     parser.add_argument("--once", action="store_true", help="Evaluate the latest bar and exit")
