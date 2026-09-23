@@ -1,7 +1,7 @@
 """
 Open candles: the morning read out to your phone, minute by minute.
 
-From 08:55 ET:
+From 09:25 ET:
 
   * every minute, a quiet update -- price, that minute's volume against
     what that minute usually carries, how the 5-minute candle is shaping
@@ -32,7 +32,7 @@ fact, it will mislead you.
 
 READ-ONLY. Market-data client only. No trading client, no order object.
 
-    python open_candles.py                        # live, 08:55-10:00 ET
+    python open_candles.py                        # live, 09:25-10:00 ET
     python open_candles.py --until 11:00
     python open_candles.py --replay 2026-09-18    # any past session, SIP
     python open_candles.py --dry-run              # print, do not send
@@ -48,7 +48,7 @@ Setup
     PUSHOVER_APP_TOKEN=...
     PUSHOVER_USER_KEY=...
 
-A note on the pre-market half of this window. Alpaca's free IEX feed is
+A note on the pre-market five minutes of this window. Alpaca's free IEX feed is
 one exchange and carries very little before 09:30 -- measured at 0 to 17
 one-minute bars a day against SIP's 300-plus. Minutes with no trades are
 skipped rather than pushed as "nothing happened" (pass --push-empty to
@@ -79,7 +79,7 @@ from spcx_alert import (
 
 SYMBOL = "SPCX"
 BAR_MINUTES = 5
-WINDOW_START = time(8, 55)
+WINDOW_START = time(9, 25)
 WINDOW_END = time(10, 0)
 
 #: A candle or minute carrying this many times its usual volume for that
@@ -106,6 +106,10 @@ PRESSURE_MINUTES = 5
 BASELINE_SESSIONS = 10
 
 DB_PATH = "spcx_alerts.db"
+
+#: Minutes between rebuilds of the session PDF while the market is open,
+#: so the file on disk is never far behind the phone. 0 turns it off.
+PDF_EVERY_MINUTES = 15
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS candles (
@@ -536,10 +540,37 @@ def remember_minute(db: sqlite3.Connection, symbol: str, minute: Candle,
 # Running
 # --------------------------------------------------------------------------
 
-def deliver(message: str, title: str, priority: int, dry_run: bool) -> str:
+def deliver(message: str, title: str, priority: int, dry_run: bool,
+            attachment: Optional[str] = None) -> str:
     if dry_run:
-        return "dry run"
-    return send_pushover(message, title=title, priority=priority) or "sent"
+        return "dry run" + (" (chart drawn)" if attachment else "")
+    return send_pushover(message, title=title, priority=priority,
+                         attachment=attachment) or "sent"
+
+
+def rebuild_report(symbol: str, day: date, start: time, end: time,
+                   db_path: str, out_path: str,
+                   live: bool = True) -> Optional[str]:
+    """Rebuild the session PDF, and return page one as an image.
+
+    Imported here rather than at the top because daily_report imports this
+    module -- taking it at call time breaks the cycle without either file
+    having to know about the other's import order.
+    """
+    try:
+        import daily_report
+    except ImportError:
+        return None
+    try:
+        session = daily_report.gather(symbol, day, start, end, db_path,
+                                      force_sip=not live)
+        if session is None:
+            return None
+        daily_report.build(session, out_path)
+        return daily_report.session_png(session, "spcx_latest.png")
+    except Exception as exc:  # noqa: BLE001 -- a report must never stop the alerts
+        print(f"  (report not rebuilt: {type(exc).__name__}: {exc})")
+        return None
 
 
 def run_replay(symbol: str, day: date, start: time, end: time,
@@ -591,11 +622,14 @@ def run_replay(symbol: str, day: date, start: time, end: time,
 
 def run_live(symbol: str, start: time, end: time, dry_run: bool,
              db: sqlite3.Connection, push_empty: bool = False,
-             multiple: float = VOLUME_ALERT_MULTIPLE) -> int:
+             multiple: float = VOLUME_ALERT_MULTIPLE,
+             pdf_every: int = PDF_EVERY_MINUTES,
+             db_path: str = DB_PATH) -> int:
     """Follow this morning: a quiet update each minute, an alarm each candle."""
     today = datetime.now(ET).date()
     window_start = datetime.combine(today, start, tzinfo=ET)
     window_end = datetime.combine(today, end, tzinfo=ET)
+    pdf_path = f"{symbol}_{today:%Y%m%d}.pdf"
 
     print(f"Baselines: median volume per slot over {BASELINE_SESSIONS} sessions...")
     try:
@@ -615,6 +649,8 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
     print()
 
     seen_minutes, seen_candles, collected = set(), set(), []
+    chart: Optional[str] = None
+    last_pdf = datetime.now(ET) - timedelta(minutes=pdf_every or 0)
     try:
         while True:
             now = datetime.now(ET)
@@ -661,9 +697,15 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 fresh = remember_minute(db, symbol, minute, lean, sent=not dry_run)
                 title = (f"{symbol} {stamp:%H:%M} volume {minute.vol_ratio:.1f}x"
                          if spiked else f"{symbol} {stamp:%H:%M}")
+                if spiked and pdf_every:
+                    chart = rebuild_report(symbol, today, start, end,
+                                           db_path, pdf_path)
+                    last_pdf = datetime.now(ET)
                 status = deliver(message, title,
                                  PRIORITY_SUMMARY if spiked else PRIORITY_UPDATE,
-                                 dry_run) if fresh else "already recorded"
+                                 dry_run,
+                                 attachment=chart if spiked else None) \
+                    if fresh else "already recorded"
                 print(message)
                 print(f"  [{status}]\n")
 
@@ -678,15 +720,25 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                                     candle.at + timedelta(minutes=BAR_MINUTES)]
                 message = describe(symbol, candle, read_lean(upto), multiple)
                 fresh = remember(db, symbol, candle, sent=not dry_run)
+                candle_spike = is_spike(candle, multiple)
                 title = (f"{symbol} {candle.at:%H:%M} volume {candle.vol_ratio:.1f}x"
-                         if is_spike(candle, multiple)
-                         else f"{symbol} candle {candle.at:%H:%M}")
-                status = deliver(message, title, PRIORITY_SUMMARY,
-                                 dry_run) if fresh else "already recorded"
+                         if candle_spike else f"{symbol} candle {candle.at:%H:%M}")
+                if candle_spike and pdf_every:
+                    chart = rebuild_report(symbol, today, start, end,
+                                           db_path, pdf_path)
+                    last_pdf = datetime.now(ET)
+                status = deliver(message, title, PRIORITY_SUMMARY, dry_run,
+                                 attachment=chart if candle_spike else None) \
+                    if fresh else "already recorded"
                 print("-" * 56)
                 print(message)
                 print(f"  [{status}]")
                 print("-" * 56 + "\n")
+
+            if pdf_every and (datetime.now(ET) - last_pdf) >= timedelta(minutes=pdf_every):
+                if rebuild_report(symbol, today, start, end, db_path, pdf_path):
+                    print(f"  {datetime.now(ET):%H:%M}  {pdf_path} rebuilt\n")
+                last_pdf = datetime.now(ET)
 
             time_mod.sleep(max(5, 62 - datetime.now(ET).second))
     except KeyboardInterrupt:
@@ -880,6 +932,11 @@ def main() -> int:
                         metavar="N",
                         help=f"Sound the alarm at N times the usual volume for that "
                              f"slot (default {VOLUME_ALERT_MULTIPLE})")
+    parser.add_argument("--pdf-every", type=int, default=PDF_EVERY_MINUTES,
+                        metavar="N",
+                        help=f"Rebuild the session PDF every N minutes, and send "
+                             f"the chart with a volume alarm (default "
+                             f"{PDF_EVERY_MINUTES}; 0 turns it off)")
     parser.add_argument("--dry-run", action="store_true", help="Print, do not send")
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--self-test", action="store_true")
@@ -901,7 +958,7 @@ def main() -> int:
         return run_replay(symbol, day, start, end, args.dry_run, db,
                           args.volume_alert)
     return run_live(symbol, start, end, args.dry_run, db, args.push_empty,
-                    args.volume_alert)
+                    args.volume_alert, args.pdf_every, args.db)
 
 
 if __name__ == "__main__":

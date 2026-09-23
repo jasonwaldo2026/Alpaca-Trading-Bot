@@ -46,7 +46,7 @@ from open_candles import BAR_MINUTES, aggregate, fetch_minutes, read_lean, thous
 from spcx_alert import open_db
 
 SYMBOL = "SPCX"
-WINDOW_START = time(9, 30)
+WINDOW_START = time(9, 25)
 WINDOW_END = time(16, 0)
 BASELINE_SESSIONS = 10
 
@@ -147,11 +147,15 @@ def logged_signals(db_path: str, symbol: str, day: date) -> pd.DataFrame:
     return frame
 
 
-def gather(symbol: str, day: date, start: time, end: time, db_path: str) -> Optional[Session]:
+def gather(symbol: str, day: date, start: time, end: time, db_path: str,
+           force_sip: bool = True) -> Optional[Session]:
+    """Build a session. `force_sip` is right for a past day -- the free plan
+    serves the full tape historically -- and wrong for today, where SIP is
+    15 minutes behind and the live feed is what the alerts are reading."""
     minutes = fetch_minutes(symbol,
                             datetime.combine(day, start, tzinfo=ET),
                             datetime.combine(day, end, tzinfo=ET),
-                            force_sip=True)
+                            force_sip=force_sip)
     if minutes.empty:
         return None
     return Session(
@@ -439,6 +443,16 @@ def build(session: Session, path: str) -> str:
         info = pdf.infodict()
         info["Title"] = f"{session.symbol} {session.day:%Y-%m-%d}"
         info["Subject"] = "Session report — read-only market data, no trades"
+    return path
+
+
+def session_png(session: Session, path: str, dpi: int = 100) -> str:
+    """Page one as an image, small enough to travel with a notification."""
+    class _Sink:
+        def savefig(self, fig):
+            fig.savefig(path, dpi=dpi, bbox_inches="tight")
+
+    page_session(_Sink(), session)
     return path
 
 

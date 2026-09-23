@@ -246,8 +246,40 @@ def compose(symbol: str, bar_time: datetime, row: pd.Series) -> str:
     )
 
 
+#: Pushover accepts an image with a message. Its own ceiling is larger,
+#: but a chart that takes a while to arrive on a phone is a chart you
+#: read after the moment has passed, so this stays small deliberately.
+MAX_ATTACHMENT_BYTES = 2_000_000
+
+
+def _multipart(fields: dict, image_path: str) -> tuple:
+    """Build a multipart/form-data body by hand.
+
+    Pushover takes an attachment only as multipart, and the alternative
+    is adding `requests` as a dependency for one POST a day.
+    """
+    boundary = "----SPCXBoundary7MA4YWxkTrZu0gW"
+    parts = []
+    for name, value in fields.items():
+        parts.append(f"--{boundary}\r\n"
+                     f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                     f"{value}\r\n".encode())
+    with open(image_path, "rb") as handle:
+        blob = handle.read()
+    kind = "image/png" if image_path.lower().endswith(".png") else "image/jpeg"
+    parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="attachment"; '
+        f'filename="{os.path.basename(image_path)}"\r\n'
+        f"Content-Type: {kind}\r\n\r\n".encode())
+    parts.append(blob)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
 def send_pushover(message: str, title: str = "SPCX setup",
-                  priority: int = 0) -> Optional[str]:
+                  priority: int = 0,
+                  attachment: Optional[str] = None) -> Optional[str]:
     """Deliver to the phone. Returns an error string, or None on success.
 
     Priority -1 arrives without a sound or vibration -- it sits in the
@@ -260,12 +292,25 @@ def send_pushover(message: str, title: str = "SPCX setup",
     if not token or not user:
         return "no Pushover credentials — logged only"
 
-    payload = urllib.parse.urlencode({
-        "token": token, "user": user, "title": title, "message": message,
-        "priority": str(priority),
-    }).encode()
+    fields = {"token": token, "user": user, "title": title,
+              "message": message, "priority": str(priority)}
+
+    usable = (attachment and os.path.exists(attachment)
+              and os.path.getsize(attachment) <= MAX_ATTACHMENT_BYTES)
+    if attachment and not usable:
+        # Send the words anyway. A missing or oversized picture must never
+        # be the reason an alert does not arrive.
+        attachment = None
+
     try:
-        with urllib.request.urlopen(PUSHOVER_URL, data=payload, timeout=10) as response:
+        if usable:
+            payload, content_type = _multipart(fields, attachment)
+            request = urllib.request.Request(PUSHOVER_URL, data=payload)
+            request.add_header("Content-Type", content_type)
+        else:
+            request = urllib.request.Request(
+                PUSHOVER_URL, data=urllib.parse.urlencode(fields).encode())
+        with urllib.request.urlopen(request, timeout=20) as response:
             body = json.loads(response.read().decode())
         return None if body.get("status") == 1 else f"Pushover said: {body}"
     except (urllib.error.URLError, OSError, ValueError) as exc:
