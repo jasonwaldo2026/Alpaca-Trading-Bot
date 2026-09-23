@@ -227,7 +227,8 @@ def drop_forming(frame: pd.DataFrame, now: datetime, minutes: int) -> pd.DataFra
     return frame[frame.index < edge]
 
 
-def volume_baselines(symbol: str, day: date) -> tuple:
+def volume_baselines(symbol: str, day: date,
+                     force_sip: bool = False) -> tuple:
     """Median volume per clock slot, for minutes and for 5-minute candles.
 
     Both come from one pass over the same history. The comparison is
@@ -235,6 +236,12 @@ def volume_baselines(symbol: str, day: date) -> tuple:
     the morning so far -- 09:35 and 09:30 are different animals at the
     open, and averaging across them is what made an earlier relative-
     volume rule fire in the deadest hours of the day.
+
+    `force_sip` must match the feed the readings come from. SIP is the
+    whole tape and IEX is one venue carrying a fraction of it, so a
+    baseline built on one and compared against the other is not a ratio
+    at all: it reads near zero however busy the market is, and the spike
+    alarm can never fire. Like against like, or not at all.
     """
     per_minute: Dict[time, List[float]] = {}
     per_candle: Dict[time, List[float]] = {}
@@ -244,7 +251,7 @@ def volume_baselines(symbol: str, day: date) -> tuple:
                 symbol,
                 datetime.combine(past, time(4, 0), tzinfo=ET),
                 datetime.combine(past, time(16, 0), tzinfo=ET),
-                force_sip=True,
+                force_sip=force_sip,
             )
         except Exception:  # noqa: BLE001 -- a baseline is a nicety, not a requirement
             continue
@@ -279,18 +286,60 @@ class Lean:
     up_volume: float
     down_volume: float
     minutes: int
+    volume_ratio: Optional[float] = None   # this stretch against its usual
+
+    #: Score bands, low to high, and what each is called. The words are
+    #: active rather than adjectival -- "pressing" says what participants
+    #: are doing, where "strong" only says how much. They describe the
+    #: tape and never advise: this file states what happened, and the
+    #: judgement stays with whoever is reading it.
+    BANDS = (
+        (0.18, "sellers in control", "↓"),
+        (0.30, "sellers pressing", "↓"),
+        (0.42, "sellers showing up", "↓"),
+        (0.58, "balanced", "→"),
+        (0.70, "buyers showing up", "↑"),
+        (0.82, "buyers pressing", "↑"),
+        (1.01, "buyers in control", "↑"),
+    )
+
+    #: "Taking it" is the only word gated on participation as well as
+    #: direction, and it uses the same multiple as the spike alarm -- so
+    #: the loudest word and the noise the phone makes mean one thing.
+    #:
+    #: The gate exists because the score cannot tell size. A minute of
+    #: three hundred shares that closed on its high scores the same 100
+    #: as a minute of two million that did. Without it the loudest word
+    #: in the vocabulary would eventually land on a dead minute and read
+    #: like a reason to act.
+    TAKING_SCORE = 0.18
+    TAKING_VOLUME = VOLUME_ALERT_MULTIPLE
+
+    @property
+    def _band(self) -> tuple:
+        for edge, word, arrow in self.BANDS:
+            if self.score < edge:
+                return word, arrow
+        return self.BANDS[-1][1], self.BANDS[-1][2]
+
+    @property
+    def taking(self) -> bool:
+        """At an extreme, and on real participation."""
+        if self.volume_ratio is None or self.volume_ratio < self.TAKING_VOLUME:
+            return False
+        return self.score <= self.TAKING_SCORE or self.score >= 1 - self.TAKING_SCORE
 
     @property
     def word(self) -> str:
-        if self.score >= 0.62:
-            return "buyers"
-        if self.score <= 0.38:
-            return "sellers"
-        return "balanced"
+        if self.taking:
+            return "buyers taking it" if self.score >= 0.5 else "sellers taking it"
+        return self._band[0]
 
     @property
     def arrow(self) -> str:
-        return {"buyers": "↑", "sellers": "↓", "balanced": "→"}[self.word]
+        if self.taking:
+            return "↑↑" if self.score >= 0.5 else "↓↓"
+        return self._band[1]
 
     def __str__(self) -> str:
         share = self.up_volume + self.down_volume
@@ -301,8 +350,15 @@ class Lean:
                 f"({self.score * 100:.0f}/100 over {self.minutes} min){split}")
 
 
-def read_lean(frame: pd.DataFrame, minutes: int = PRESSURE_MINUTES) -> Optional[Lean]:
-    """Volume-weighted close position across the last `minutes` bars."""
+def read_lean(frame: pd.DataFrame, minutes: int = PRESSURE_MINUTES,
+              baseline: Optional[Dict[time, float]] = None) -> Optional[Lean]:
+    """Volume-weighted close position across the last `minutes` bars.
+
+    Given a per-slot baseline, the reading also carries how busy that
+    stretch was against its usual -- measured over the same window the
+    score covers, not over the last minute alone, so the two halves of
+    the word describe one piece of tape.
+    """
     window = frame.tail(minutes)
     if window.empty:
         return None
@@ -323,8 +379,14 @@ def read_lean(frame: pd.DataFrame, minutes: int = PRESSURE_MINUTES) -> Optional[
         elif float(row["close"]) < float(row["open"]):
             down += volume
 
+    ratio = None
+    if baseline:
+        usual = sum(baseline.get(stamp.time(), 0.0) for stamp in window.index)
+        if usual > 0:
+            ratio = total / usual
+
     return Lean(score=weighted / total, up_volume=up, down_volume=down,
-                minutes=len(window))
+                minutes=len(window), volume_ratio=ratio)
 
 
 # --------------------------------------------------------------------------
@@ -612,12 +674,14 @@ def run_replay(symbol: str, day: date, start: time, end: time,
         print(f"No bars for {symbol} on {day}. Market closed that day?")
         return 1
 
-    minute_base, candle_base = volume_baselines(symbol, day)
+    # Replay reads the whole tape, so its baseline must come from it too.
+    minute_base, candle_base = volume_baselines(symbol, day, force_sip=True)
     candles = to_candles(aggregate(minutes), candle_base)
 
     for candle in candles:
         upto = minutes[minutes.index < candle.at + timedelta(minutes=BAR_MINUTES)]
-        print(describe(symbol, candle, read_lean(upto), multiple))
+        print(describe(symbol, candle,
+                       read_lean(upto, baseline=minute_base), multiple))
         print()
         remember(db, symbol, candle, sent=False)
 
@@ -659,7 +723,11 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
 
     print(f"Baselines: median volume per slot over {BASELINE_SESSIONS} sessions...")
     try:
-        minute_base, candle_base = volume_baselines(symbol, today)
+        # The same feed the live readings come from, or the ratio is a
+        # comparison between one venue and all of them.
+        live_sip = os.getenv("ALPACA_DATA_FEED", "").strip().lower() == "sip"
+        minute_base, candle_base = volume_baselines(symbol, today,
+                                                    force_sip=live_sip)
         print(f"  {len(minute_base)} minute slots, {len(candle_base)} candle slots.\n")
     except Exception as exc:  # noqa: BLE001
         print(f"  unavailable ({type(exc).__name__}) — volumes will be raw.\n")
@@ -705,7 +773,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                     continue
 
                 upto = done_minutes[done_minutes.index <= stamp]
-                lean = read_lean(upto)
+                lean = read_lean(upto, baseline=minute_base)
 
                 # The candle this minute belongs to, as far as it has got.
                 edge = stamp.replace(minute=stamp.minute - (stamp.minute % BAR_MINUTES),
@@ -751,7 +819,9 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 collected.append(candle)
                 upto = done_minutes[done_minutes.index <
                                     candle.at + timedelta(minutes=BAR_MINUTES)]
-                message = describe(symbol, candle, read_lean(upto), multiple)
+                message = describe(symbol, candle,
+                                   read_lean(upto, baseline=minute_base),
+                                   multiple)
                 candle_spike = is_spike(candle, multiple)
                 push = reaches_phone(candle.at.time(), candle_spike,
                                      detail_until)
@@ -861,15 +931,42 @@ def self_test() -> int:
         "close": [11.0] * 3, "volume": [100.0] * 3,
     }, index=pd.DatetimeIndex([at + timedelta(minutes=i) for i in range(3)]))
     buyers = read_lean(strong)
-    if buyers is None or buyers.score < 0.99 or buyers.word != "buyers":
+    if buyers is None or buyers.score < 0.99 or not buyers.word.startswith("buyers"):
         failures.append(f"three minutes closing on their highs should read buyers: {buyers}")
 
     weak = strong.copy()
     weak["close"] = 10.0
     weak["open"] = 11.0
     sellers = read_lean(weak)
-    if sellers is None or sellers.score > 0.01 or sellers.word != "sellers":
+    if sellers is None or sellers.score > 0.01 or not sellers.word.startswith("sellers"):
         failures.append(f"three minutes closing on their lows should read sellers: {sellers}")
+
+    # The vocabulary itself: every band reachable, ordered, and the loudest
+    # word gated on participation rather than on conviction alone.
+    ladder = [(0.05, "sellers in control"), (0.24, "sellers pressing"),
+              (0.36, "sellers showing up"), (0.50, "balanced"),
+              (0.64, "buyers showing up"), (0.76, "buyers pressing"),
+              (0.95, "buyers in control")]
+    for score, expected in ladder:
+        got = Lean(score=score, up_volume=1.0, down_volume=0.0, minutes=5).word
+        if got != expected:
+            failures.append(f"a score of {score:.2f} should read '{expected}', got '{got}'")
+
+    quiet_extreme = Lean(score=0.99, up_volume=1.0, down_volume=0.0, minutes=5,
+                         volume_ratio=0.4)
+    if quiet_extreme.taking:
+        failures.append("a dead minute must never read 'taking it' however it closed")
+    busy_extreme = Lean(score=0.99, up_volume=1.0, down_volume=0.0, minutes=5,
+                        volume_ratio=VOLUME_ALERT_MULTIPLE)
+    if busy_extreme.word != "buyers taking it" or busy_extreme.arrow != "↑↑":
+        failures.append(f"an extreme on real volume should read 'buyers taking it', "
+                        f"got '{busy_extreme.word}'")
+    busy_low = Lean(score=0.01, up_volume=0.0, down_volume=1.0, minutes=5,
+                    volume_ratio=VOLUME_ALERT_MULTIPLE)
+    if busy_low.word != "sellers taking it":
+        failures.append(f"the mirror should read 'sellers taking it', got '{busy_low.word}'")
+    if Lean.TAKING_VOLUME != VOLUME_ALERT_MULTIPLE:
+        failures.append("the loudest word and the spike alarm should share one threshold")
 
     flat = strong.copy()
     flat["high"] = flat["low"] = flat["open"] = flat["close"] = 10.0

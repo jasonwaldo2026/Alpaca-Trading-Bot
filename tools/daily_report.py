@@ -112,8 +112,16 @@ def session_vwap(minutes: pd.DataFrame) -> pd.Series:
 
 
 def slot_baseline(symbol: str, day: date, start: time = time(9, 30),
-                  end: time = time(16, 0)) -> Dict[time, float]:
-    """Median 5-minute volume per clock slot over recent sessions."""
+                  end: time = time(16, 0),
+                  force_sip: bool = True) -> Dict[time, float]:
+    """Median 5-minute volume per clock slot over recent sessions.
+
+    `force_sip` has to match the feed the session's own bars came from.
+    SIP is the whole tape, IEX one venue carrying a fraction of it, and
+    a ratio between the two is not a ratio: it reads near zero however
+    busy the market is. A past day is SIP on both sides; a live session
+    is whatever the feed setting gives, on both sides.
+    """
     gathered: Dict[time, List[float]] = {}
     for past in trading_days(day - timedelta(days=1), BASELINE_SESSIONS):
         try:
@@ -121,7 +129,7 @@ def slot_baseline(symbol: str, day: date, start: time = time(9, 30),
                 symbol,
                 datetime.combine(past, start, tzinfo=ET),
                 datetime.combine(past, end, tzinfo=ET),
-                force_sip=True)
+                force_sip=force_sip)
         except Exception:  # noqa: BLE001 -- a baseline is a nicety
             continue
         if bars.empty:
@@ -176,7 +184,7 @@ def gather(symbol: str, day: date, start: time, end: time, db_path: str,
     return Session(
         symbol=symbol, day=day, minutes=minutes,
         candles=aggregate(minutes), vwap=session_vwap(minutes),
-        baseline=slot_baseline(symbol, day, start, end),
+        baseline=slot_baseline(symbol, day, start, end, force_sip=force_sip),
         signals=logged_signals(db_path, symbol, day),
         macd=macd,
     )
