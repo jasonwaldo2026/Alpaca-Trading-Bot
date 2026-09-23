@@ -83,9 +83,15 @@ MACD_SETTING = Macd(9, 17, 6)
 #: month. Raise it if the phone gets annoying, lower it to see more.
 COOLDOWN_MINUTES = 40
 
-#: Nothing before this. 09:30 means the opening bell -- the busiest half
-#: hour of the day, which an earlier 09:45 gate was silently excluding.
-EARLIEST_ALERT = SESSION_OPEN
+#: Conditions are evaluated and LOGGED from the opening bell, so the
+#: record of the morning is complete.
+EARLIEST_SIGNAL = SESSION_OPEN
+
+#: The phone stays quiet until this. Evaluating a bar and alerting on it
+#: are two different decisions: the first 15 minutes are for watching the
+#: candles yourself, not for being told about them. Every qualifying bar
+#: before this is still written to the database, marked as held back.
+ALERT_FROM = time(9, 45)
 
 #: Bars fetched behind the current moment. MACD is an exponential average
 #: of price and carries across the session boundary, so it is warmed on
@@ -265,15 +271,23 @@ class Result:
 def check_once(db: sqlite3.Connection, symbol: str = SYMBOL,
                macd: Macd = MACD_SETTING, now: Optional[datetime] = None,
                dry_run: bool = False,
-               cooldown: int = COOLDOWN_MINUTES) -> Result:
-    """Evaluate the most recent completed bar, and alert if it qualifies."""
+               cooldown: int = COOLDOWN_MINUTES,
+               alert_from: time = ALERT_FROM) -> Result:
+    """Evaluate the most recent completed bar; alert only if it qualifies
+    AND the morning quiet period is over.
+
+    A qualifying bar before `alert_from` is recorded exactly like any
+    other -- it simply does not buzz. That keeps the log honest about what
+    the conditions did all morning while leaving the open to your own
+    eyes.
+    """
     now = now or datetime.now(ET)
     raw = fetch_recent(symbol, now)
     if raw.empty:
         return Result(note="no bars returned")
 
     session = add_conditions(prepare(raw, macd), require_volume=False,
-                             earliest=EARLIEST_ALERT)
+                             earliest=EARLIEST_SIGNAL)
     if session.empty:
         return Result(note="no regular-hours bars yet")
 
@@ -284,16 +298,25 @@ def check_once(db: sqlite3.Connection, symbol: str = SYMBOL,
 
     message = compose(symbol, bar_time, row)
 
+    # Two reasons to stay quiet, checked in the order they matter. The
+    # morning gate wins: during it, the cooldown is beside the point.
+    too_early = bar_time.time() < alert_from
     last = last_alert_time(db, symbol)
     within_cooldown = last is not None and (bar_time - last) < timedelta(minutes=cooldown)
-    suppressed = (f"cooldown — last alert {last:%H:%M}" if within_cooldown else None)
 
-    fresh = record(db, symbol, bar_time, row, alerted=not within_cooldown,
+    if too_early:
+        suppressed = f"before {alert_from:%H:%M} — logged, not sent"
+    elif within_cooldown:
+        suppressed = f"cooldown — last alert {last:%H:%M}"
+    else:
+        suppressed = None
+
+    fresh = record(db, symbol, bar_time, row, alerted=suppressed is None,
                    suppressed=suppressed, message=message)
     if not fresh:
         return Result(bar_time=bar_time, fired=True, note="already recorded")
 
-    if within_cooldown:
+    if suppressed:
         return Result(bar_time=bar_time, fired=True, message=message,
                       note=suppressed)
 
@@ -395,9 +418,10 @@ def market_is_open(now: datetime) -> bool:
     return now.weekday() < 5 and SESSION_OPEN <= now.time() < SESSION_CLOSE
 
 
-def watch(db: sqlite3.Connection, dry_run: bool, cooldown: int) -> int:
+def watch(db: sqlite3.Connection, dry_run: bool, cooldown: int,
+          alert_from: time = ALERT_FROM) -> int:
     """Check once per minute, a few seconds after each bar completes."""
-    print(f"Watching {SYMBOL} · MACD {MACD_SETTING} · from {EARLIEST_ALERT:%H:%M} ET "
+    print(f"Watching {SYMBOL} · MACD {MACD_SETTING} · alerts from {alert_from:%H:%M} ET "
           f"· one alert per {cooldown} min")
     print("Ctrl-C to stop. Every signal is logged; only some are sent.\n")
     try:
@@ -405,7 +429,8 @@ def watch(db: sqlite3.Connection, dry_run: bool, cooldown: int) -> int:
             now = datetime.now(ET)
             if market_is_open(now):
                 try:
-                    result = check_once(db, dry_run=dry_run, cooldown=cooldown)
+                    result = check_once(db, dry_run=dry_run, cooldown=cooldown,
+                                        alert_from=alert_from)
                 except Exception as exc:  # noqa: BLE001 -- a bad minute must not end the day
                     print(f"  {now:%H:%M}  error: {type(exc).__name__}: {exc}")
                 else:
@@ -434,11 +459,23 @@ def self_test() -> int:
     print("Self-test: checking the alert logic...\n")
     failures = []
 
+    # Flat pre-market, a sharp dip over the first six minutes of the
+    # session and an immediate recovery -- so a crossover lands INSIDE the
+    # 09:30-09:45 quiet period -- then a second push later in the morning.
     start = datetime.combine(date(2026, 9, 18), time(8, 30), tzinfo=ET)
-    n = 60 + 120
+    closes = [100.0] * 60
+    price = 100.0
+    for _ in range(6):                       # 09:30-09:35, down hard
+        price -= 0.08
+        closes.append(price)
+    for _ in range(24):                      # 09:36-09:59, straight back up
+        price += 0.07
+        closes.append(price)
+    for step in range(90):                   # the rest of the morning
+        price += 0.06 if step % 45 < 18 else -0.03
+        closes.append(price)
+    n = len(closes)
     index = pd.DatetimeIndex([start + timedelta(minutes=i) for i in range(n)])
-    closes = [100.0] * 60 + [100 - i * 0.05 for i in range(60)] + \
-             [97 + (i - 60) * 0.12 for i in range(60, 120)]
     frame = pd.DataFrame(
         {"open": closes, "high": [c + 0.05 for c in closes],
          "low": [c - 0.05 for c in closes], "close": closes,
@@ -446,7 +483,7 @@ def self_test() -> int:
         index=index,
     )
     session = add_conditions(prepare(frame, MACD_SETTING), require_volume=False,
-                             earliest=EARLIEST_ALERT)
+                             earliest=EARLIEST_SIGNAL)
 
     qualifying = [ts for ts in session.index if bool(session.at[ts, "all_conditions"])]
     if not qualifying:
@@ -498,7 +535,34 @@ def self_test() -> int:
         if forbidden in source.replace(f'"{forbidden}"', ""):
             failures.append(f"this file must not mention {forbidden}")
 
+    # Evaluating and alerting must be two different gates, not one.
+    if EARLIEST_SIGNAL >= ALERT_FROM:
+        failures.append("signals should be evaluated earlier than alerts are sent")
+    if ALERT_FROM != time(9, 45):
+        failures.append(f"the alert gate should be 09:45, got {ALERT_FROM}")
+    held = [ts for ts in qualifying if ts.time() < ALERT_FROM]
+    sendable = [ts for ts in qualifying if ts.time() >= ALERT_FROM]
+    if not held:
+        failures.append("the fixture should produce a qualifying bar before 09:45, "
+                        "or the quiet period is not actually being tested")
+    if not all(session.at[ts, "cond_e_time"] for ts in held):
+        failures.append("a bar before 09:45 should still satisfy the time condition, "
+                        "so that it is logged")
+
+    # And the decision itself: held bars record, and stay silent.
+    quiet_db = open_db(":memory:")
+    for ts in held:
+        record(quiet_db, "SPCX", ts, session.loc[ts], alerted=False,
+               suppressed=f"before {ALERT_FROM:%H:%M} — logged, not sent",
+               message=compose("SPCX", ts, session.loc[ts]))
+    if last_alert_time(quiet_db, "SPCX") is not None:
+        failures.append("a morning full of held bars must leave no last-alert time")
+    if quiet_db.execute("SELECT COUNT(*) FROM signals").fetchone()[0] != len(held):
+        failures.append("every held bar should still be written to the database")
+
     print(f"  Qualifying bars in fixture     : {len(qualifying)}")
+    print(f"    before 09:45 (log only)      : {len(held)}")
+    print(f"    from 09:45 (may alert)       : {len(sendable)}")
     print(f"  Example alert                  : {message}")
     print(f"  Cooldown                       : {COOLDOWN_MINUTES} min, read from the database")
     print("  Duplicate bar rejected         : yes")
@@ -525,6 +589,9 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Print instead of sending")
     parser.add_argument("--cooldown", type=int, default=COOLDOWN_MINUTES,
                         help=f"Minutes between alerts (default {COOLDOWN_MINUTES})")
+    parser.add_argument("--alert-from", default=f"{ALERT_FROM:%H:%M}",
+                        help=f"Stay quiet before this, ET (default {ALERT_FROM:%H:%M}). "
+                             "Signals are still logged from 09:30.")
     parser.add_argument("--db", default=DB_PATH, help=f"Database file (default {DB_PATH})")
     parser.add_argument("--self-test", action="store_true", help="Check the logic offline")
     args = parser.parse_args()
@@ -532,6 +599,8 @@ def main() -> int:
     if args.self_test:
         return self_test()
 
+    from feed_check import parse_clock
+    alert_from = parse_clock(args.alert_from)
     db = open_db(args.db)
 
     if args.recent:
@@ -544,10 +613,11 @@ def main() -> int:
         return 0
 
     if args.watch:
-        return watch(db, args.dry_run, args.cooldown)
+        return watch(db, args.dry_run, args.cooldown, alert_from)
 
     if args.once:
-        result = check_once(db, dry_run=args.dry_run, cooldown=args.cooldown)
+        result = check_once(db, dry_run=args.dry_run, cooldown=args.cooldown,
+                            alert_from=alert_from)
         if not result.fired:
             print("No setup on the last completed bar"
                   + (f" ({result.bar_time:%H:%M})" if result.bar_time else "")
