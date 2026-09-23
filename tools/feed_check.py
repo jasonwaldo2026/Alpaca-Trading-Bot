@@ -128,6 +128,24 @@ BASELINE_MACD = Macd(12, 26, 9)    # the convention, as a yardstick
 # a difference in the output is a difference in the DATA and never the math.
 # --------------------------------------------------------------------------
 
+def add_macd(frame: pd.DataFrame, macd: Macd) -> pd.DataFrame:
+    """The MACD trio on whatever bars are handed in, and nothing else.
+
+    Separate from prepare() so a chart can draw the same numbers a signal
+    fired on over a window prepare() would have trimmed away -- the report
+    opens at 09:25, five minutes before the session gate. One copy of this
+    arithmetic exists and everything reads it, because a chart that
+    disagreed with its own alert would be worse than no chart.
+    """
+    df = frame.copy()
+    fast = df["close"].ewm(span=macd.fast, adjust=False).mean()
+    slow = df["close"].ewm(span=macd.slow, adjust=False).mean()
+    df["macd"] = fast - slow
+    df["macd_signal"] = df["macd"].ewm(span=macd.signal, adjust=False).mean()
+    df["macd_gap"] = df["macd"] - df["macd_signal"]
+    return df
+
+
 def prepare(raw: pd.DataFrame, macd: Macd) -> pd.DataFrame:
     """Indicators on a full extended-hours frame, trimmed to regular hours.
 
@@ -147,13 +165,7 @@ def prepare(raw: pd.DataFrame, macd: Macd) -> pd.DataFrame:
     every bar after 09:30 look like unusual volume -- turning "is this bar
     busy" into "is it the open yet".
     """
-    df = raw.copy()
-
-    fast = df["close"].ewm(span=macd.fast, adjust=False).mean()
-    slow = df["close"].ewm(span=macd.slow, adjust=False).mean()
-    df["macd"] = fast - slow
-    df["macd_signal"] = df["macd"].ewm(span=macd.signal, adjust=False).mean()
-    df["macd_gap"] = df["macd"] - df["macd_signal"]
+    df = add_macd(raw, macd)
 
     # How many bars the MACD actually got to warm up on.
     premarket_bars = int((df.index.time < SESSION_OPEN).sum())

@@ -41,7 +41,8 @@ import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Rectangle
 
-from feed_check import ET, load_env, parse_clock, trading_days
+from feed_check import ET, add_macd, load_env, parse_clock, trading_days
+from spcx_alert import MACD_SETTING, WARMUP_MINUTES
 from open_candles import BAR_MINUTES, aggregate, fetch_minutes, read_lean, thousands
 from spcx_alert import open_db
 
@@ -101,6 +102,7 @@ class Session:
     vwap: pd.Series
     baseline: Dict[time, float]
     signals: pd.DataFrame
+    macd: pd.DataFrame        # 1-minute, the bars the alerts read
 
 
 def session_vwap(minutes: pd.DataFrame) -> pd.Series:
@@ -152,17 +154,31 @@ def gather(symbol: str, day: date, start: time, end: time, db_path: str,
     """Build a session. `force_sip` is right for a past day -- the free plan
     serves the full tape historically -- and wrong for today, where SIP is
     15 minutes behind and the live feed is what the alerts are reading."""
-    minutes = fetch_minutes(symbol,
-                            datetime.combine(day, start, tzinfo=ET),
-                            datetime.combine(day, end, tzinfo=ET),
-                            force_sip=force_sip)
+    opens = datetime.combine(day, start, tzinfo=ET)
+    closes = datetime.combine(day, end, tzinfo=ET)
+
+    # Reach back as far as the alert engine does. MACD is an exponential
+    # average that carries across the session boundary, so a cold start at
+    # 09:25 would draw roughly twenty minutes of meaningless wiggle across
+    # exactly the part of the morning being studied -- and would not be the
+    # line the alerts were reading.
+    warm = fetch_minutes(symbol, opens - timedelta(minutes=WARMUP_MINUTES),
+                         closes, force_sip=force_sip)
+    minutes = warm[(warm.index >= opens) & (warm.index <= closes)]
     if minutes.empty:
         return None
+
+    macd = add_macd(warm, MACD_SETTING)
+    settled = macd.index[MACD_SETTING.warmup_bars:]
+    macd = macd.loc[macd.index.isin(settled) & (macd.index >= opens)
+                    & (macd.index <= closes)]
+
     return Session(
         symbol=symbol, day=day, minutes=minutes,
         candles=aggregate(minutes), vwap=session_vwap(minutes),
         baseline=slot_baseline(symbol, day, start, end),
         signals=logged_signals(db_path, symbol, day),
+        macd=macd,
     )
 
 
@@ -203,19 +219,66 @@ def tick_positions(stamps, every: int):
     return idx, [f"{stamps[i]:%H:%M}" for i in idx]
 
 
-def page_session(pdf: PdfPages, session: Session) -> None:
-    """Candles, VWAP and volume against one shared time axis."""
+def panel_label(ax, text: str) -> None:
+    """Title inside the axes, not above it.
+
+    Five panels on one page leaves no room between them for a heading.
+    Putting it on the plot costs a corner of white space and buys back
+    roughly half an inch of chart per panel.
+    """
+    ax.text(0.007, 0.95, text, transform=ax.transAxes, va="top", ha="left",
+            size=8.5, color=INK_2, zorder=6,
+            bbox=dict(facecolor=SURFACE, edgecolor="none", pad=1.6, alpha=0.86))
+
+
+def minute_positions(stamps, macd_index):
+    """Place 1-minute readings across the 5-minute candle axis.
+
+    The candles are drawn at integer positions, each covering the half-open
+    span [i-0.5, i+0.5). A minute inside that candle sits at its own share
+    of the width, so a crossover lands under the candle it happened in
+    rather than at the candle's edge.
+    """
+    slot_of = {stamp: i for i, stamp in enumerate(stamps)}
+    xs = []
+    for stamp in macd_index:
+        slot = stamp.replace(minute=stamp.minute - (stamp.minute % BAR_MINUTES),
+                             second=0, microsecond=0)
+        i = slot_of.get(slot)
+        if i is None:
+            xs.append(float("nan"))
+            continue
+        offset = (stamp - slot).seconds // 60
+        xs.append(i - 0.5 + (offset + 0.5) / BAR_MINUTES)
+    return xs
+
+
+def page_overview(pdf: PdfPages, session: Session) -> None:
+    """The whole session on one page, every panel on one clock.
+
+    Order is deliberate. Price on top because it is the thing being
+    explained. MACD under it because that is where a chart reader expects
+    it and where the signal markers point. Then the lean directly above
+    the volume it is weighted by -- a rise in volume and the change in
+    price action it precedes are read as one movement of the eye, which
+    they cannot be on separate pages.
+    """
     candles = session.candles
     stamps = list(candles.index)
-    x = range(len(stamps))
+    x = list(range(len(stamps)))
 
     fig = plt.figure(figsize=(11.7, 8.3))
     band(fig, session)
-    grid = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.08,
-                            left=0.06, right=0.965, top=0.785, bottom=0.09)
+    grid = fig.add_gridspec(5, 1, height_ratios=[3.0, 1.35, 1.0, 1.1, 0.72],
+                            hspace=0.10, left=0.062, right=0.965,
+                            top=0.80, bottom=0.058)
     price = fig.add_subplot(grid[0])
-    vol = fig.add_subplot(grid[1], sharex=price)
+    macd_ax = fig.add_subplot(grid[1], sharex=price)
+    lean_ax = fig.add_subplot(grid[2], sharex=price)
+    vol_ax = fig.add_subplot(grid[3], sharex=price)
+    size_ax = fig.add_subplot(grid[4], sharex=price)
 
+    # --- price ------------------------------------------------------------
     for i, (_, row) in enumerate(candles.iterrows()):
         rising = row["close"] >= row["open"]
         colour = UP if rising else DOWN
@@ -226,10 +289,10 @@ def page_session(pdf: PdfPages, session: Session) -> None:
                                   facecolor=colour, edgecolor=colour, linewidth=0.5))
 
     vwap_at = session.vwap.reindex(candles.index, method="ffill")
-    price.plot(list(x), vwap_at.values, color=VWAP_HUE, linewidth=1.6,
+    price.plot(x, vwap_at.values, color=VWAP_HUE, linewidth=1.6,
                linestyle=(0, (5, 2)), label="VWAP", zorder=3)
 
-    # Signals, if any have been logged for this day.
+    signal_x = []
     if not session.signals.empty:
         fired = session.signals[session.signals["alerted"] == 1]
         held = session.signals[session.signals["alerted"] == 0]
@@ -249,113 +312,113 @@ def page_session(pdf: PdfPages, session: Session) -> None:
                 price.scatter(xs, ys, marker=marker, s=58, color=ACCENT,
                               alpha=alpha, zorder=4, label=label,
                               edgecolors=SURFACE, linewidths=0.8)
+                signal_x.extend(xs)
 
     price.set_ylabel("Price")
-    price.set_title(f"{BAR_MINUTES}-minute candles", loc="left", size=11,
-                    weight="normal", pad=10)
-    price.legend(frameon=False, loc="upper left", fontsize=8.5)
-    price.tick_params(labelbottom=False)
+    panel_label(price, f"{BAR_MINUTES}-minute candles and VWAP")
+    price.legend(loc="upper right", ncol=3, fontsize=8, frameon=True,
+                 facecolor=SURFACE, edgecolor="none", framealpha=0.92)
     price.spines[["top", "right"]].set_visible(False)
 
-    colours = [UP if r["close"] >= r["open"] else DOWN for _, r in candles.iterrows()]
-    vol.bar(list(x), candles["volume"], color=colours, width=0.6, alpha=0.85)
-    if session.baseline:
-        usual = [session.baseline.get(s.time(), float("nan")) for s in stamps]
-        vol.plot(list(x), usual, color=INK_2, linewidth=1.2, linestyle=(0, (2, 2)),
-                 label=f"usual for the slot ({BASELINE_SESSIONS}-session median)")
-        vol.legend(frameon=False, loc="upper right", fontsize=8)
-    vol.set_ylabel("Volume")
-    vol.spines[["top", "right"]].set_visible(False)
-    vol.yaxis.set_major_formatter(lambda v, _: thousands(v) if v else "0")
+    # --- MACD, on the 1-minute bars the alerts read -----------------------
+    macd = session.macd
+    if not macd.empty:
+        mx = minute_positions(stamps, macd.index)
+        macd_ax.axhline(0, color=AXIS, linewidth=1)
+        gaps = macd["macd_gap"].tolist()
+        macd_ax.bar(mx, gaps, width=1.0 / BAR_MINUTES,
+                    color=[UP if g >= 0 else DOWN for g in gaps],
+                    alpha=0.30, linewidth=0)
+        macd_ax.plot(mx, macd["macd"].tolist(), color=ACCENT, linewidth=1.5,
+                     label="MACD", zorder=3)
+        macd_ax.plot(mx, macd["macd_signal"].tolist(), color=SECOND,
+                     linewidth=1.3, label="Signal", zorder=3)
+        macd_ax.legend(frameon=False, loc="upper right", fontsize=8, ncol=2)
 
-    idx, labels = tick_positions(stamps, 15)
-    price.set_xlim(-0.8, len(stamps) - 0.2)
-    vol.set_xlim(-0.8, len(stamps) - 0.2)
-    vol.set_xticks(idx)
-    vol.set_xticklabels(labels)
-    vol.set_xlabel("Eastern time")
-
-    pdf.savefig(fig)
-    plt.close(fig)
-
-
-def page_participation(pdf: PdfPages, session: Session) -> None:
-    """Three separate scales, three separate panels. Never a second y-axis."""
-    candles = session.candles
-    stamps = list(candles.index)
-    x = list(range(len(stamps)))
-
-    fig = plt.figure(figsize=(11.7, 8.3))
-    fig.text(0.045, 0.955, "Participation", size=18, weight="bold", color=INK)
-    fig.text(0.045, 0.925,
-             f"{session.symbol} · {session.day:%d %B %Y} · how busy, how large, which way",
-             size=10, color=INK_2)
-
-    grid = fig.add_gridspec(3, 1, hspace=0.42, left=0.06, right=0.965,
-                            top=0.87, bottom=0.075)
-
-    # --- volume against the usual for that slot ---------------------------
-    ratio_ax = fig.add_subplot(grid[0])
-    if session.baseline:
-        ratios = [row["volume"] / session.baseline[s.time()]
-                  if s.time() in session.baseline and session.baseline[s.time()] else float("nan")
-                  for s, (_, row) in zip(stamps, candles.iterrows())]
-        ratio_ax.bar(x, ratios, width=0.6,
-                     color=[ACCENT if (r == r and r >= 1) else MUTED for r in ratios])
-        ratio_ax.axhline(1.0, color=INK_2, linewidth=1, linestyle=(0, (2, 2)))
-        ratio_ax.text(len(x) - 0.4, 1.0, "  usual", va="center", size=8, color=INK_2)
-        ratio_ax.set_ylabel("× usual")
-        for i, r in enumerate(ratios):
-            if r == r and r >= 1.5:
-                ratio_ax.text(i, r, f"{r:.1f}×", ha="center", va="bottom",
-                              size=7.5, color=INK_2)
+        # The warm-up cannot always reach back far enough -- on a Monday,
+        # 900 minutes lands in the weekend, leaving only a thin pre-market
+        # to settle an average that needs 23 bars. Draw nothing there and
+        # say why, rather than leaving an unexplained gap or, worse,
+        # drawing the warm-up curve as though it meant something.
+        if macd.index[0] > stamps[0]:
+            edge = minute_positions(stamps, [macd.index[0]])[0]
+            macd_ax.axvspan(-0.8, edge, color=PLANE, zorder=0)
+            macd_ax.text((edge - 0.8) / 2, macd_ax.get_ylim()[0],
+                         f"settling until {macd.index[0]:%H:%M}",
+                         va="bottom", ha="center", size=7.5, color=MUTED)
     else:
-        ratio_ax.text(0.5, 0.5, "no history for a baseline", ha="center",
-                      va="center", transform=ratio_ax.transAxes, color=MUTED)
-    ratio_ax.set_title("Volume against the same slot on recent sessions",
-                       loc="left", size=10.5, weight="normal", pad=8)
-    ratio_ax.spines[["top", "right"]].set_visible(False)
+        macd_ax.text(0.5, 0.5, "not enough history to warm the MACD",
+                     ha="center", va="center", transform=macd_ax.transAxes,
+                     color=MUTED)
+    macd_ax.set_ylabel("MACD")
+    panel_label(macd_ax,
+                f"MACD {MACD_SETTING.fast}/{MACD_SETTING.slow}/{MACD_SETTING.signal} "
+                "on 1-minute bars \u2014 the line the alerts read")
+    macd_ax.spines[["top", "right"]].set_visible(False)
 
-    # --- average trade size -----------------------------------------------
-    size_ax = fig.add_subplot(grid[1])
-    if "trade_count" in candles.columns:
-        avg = (candles["volume"] / candles["trade_count"].replace(0, pd.NA)).tolist()
-        size_ax.plot(x, avg, color=SECOND, linewidth=1.8, marker="o", markersize=3.5)
-        size_ax.set_ylabel("shares / trade")
-        size_ax.set_title("Average trade size — blocks, or many small orders",
-                          loc="left", size=10.5, weight="normal", pad=8)
-    else:
-        size_ax.text(0.5, 0.5, "the feed returned no trade counts", ha="center",
-                     va="center", transform=size_ax.transAxes, color=MUTED)
-    size_ax.spines[["top", "right"]].set_visible(False)
-
-    # --- the lean ----------------------------------------------------------
-    lean_ax = fig.add_subplot(grid[2])
+    # --- where price closed in its range, directly above the volume -------
     scores = []
     for stamp in stamps:
         upto = session.minutes[session.minutes.index <
                                stamp + timedelta(minutes=BAR_MINUTES)]
         reading = read_lean(upto)
         scores.append(reading.score * 100 if reading else float("nan"))
-    lean_ax.axhspan(50, 100, color=UP, alpha=0.05)
-    lean_ax.axhspan(0, 50, color=DOWN, alpha=0.05)
     lean_ax.axhline(50, color=AXIS, linewidth=1)
-    lean_ax.plot(x, scores, color=INK, linewidth=1.8)
+    lean_ax.plot(x, scores, color=UP, linewidth=1.8, zorder=3)
     lean_ax.set_ylim(0, 100)
-    lean_ax.set_ylabel("0 = lows · 100 = highs")
-    lean_ax.set_title("Where price closed within its range — volume-weighted, "
-                      "a hint rather than order flow",
-                      loc="left", size=10.5, weight="normal", pad=8)
+    lean_ax.set_yticks([0, 50, 100])
+    lean_ax.set_ylabel("in range")
+    panel_label(lean_ax, "Where price closed within its range \u2014 volume-weighted "
+                         "(100 = at the highs)")
     lean_ax.spines[["top", "right"]].set_visible(False)
 
-    # One x range across all three, so a moment sits at the same place in
-    # each. Panels that scale independently invite reading a coincidence.
+    # --- volume against the usual for that slot ---------------------------
+    if session.baseline:
+        ratios = [row["volume"] / session.baseline[s.time()]
+                  if s.time() in session.baseline and session.baseline[s.time()] else float("nan")
+                  for s, (_, row) in zip(stamps, candles.iterrows())]
+        vol_ax.bar(x, ratios, width=0.6,
+                   color=[ACCENT if (r == r and r >= 1) else MUTED for r in ratios])
+        vol_ax.axhline(1.0, color=INK_2, linewidth=1, linestyle=(0, (2, 2)))
+        for i, r in enumerate(ratios):
+            if r == r and r >= 1.5:
+                vol_ax.text(i, r, f"{r:.1f}\u00d7", ha="center", va="bottom",
+                            size=7.5, color=INK_2)
+        vol_ax.set_ylabel("\u00d7 usual")
+        peak = max([r for r in ratios if r == r], default=1.0)
+        vol_ax.set_ylim(0, peak * 1.55)   # room for the labels, clear of the panel title
+    else:
+        vol_ax.text(0.5, 0.5, "no history for a baseline", ha="center",
+                    va="center", transform=vol_ax.transAxes, color=MUTED)
+    panel_label(vol_ax, f"Volume against the same slot on recent sessions "
+                        f"({BASELINE_SESSIONS}-session median = 1.0)")
+    vol_ax.spines[["top", "right"]].set_visible(False)
+
+    # --- average trade size -----------------------------------------------
+    if "trade_count" in candles.columns:
+        avg = (candles["volume"] / candles["trade_count"].replace(0, pd.NA)).tolist()
+        size_ax.plot(x, avg, color=SECOND, linewidth=1.5)
+        size_ax.set_ylabel("sh/trade")
+        size_ax.yaxis.set_major_locator(plt.MaxNLocator(3))
+    else:
+        size_ax.text(0.5, 0.5, "the feed returned no trade counts", ha="center",
+                     va="center", transform=size_ax.transAxes, color=MUTED)
+    panel_label(size_ax, "Average trade size \u2014 blocks, or many small orders")
+    size_ax.spines[["top", "right"]].set_visible(False)
+
+    # A signal is a vertical line through every panel, so the crossover, the
+    # volume behind it and what price did next are read as one moment.
+    for ax in (price, macd_ax, lean_ax, vol_ax, size_ax):
+        for sx in signal_x:
+            ax.axvline(sx, color=ACCENT, linewidth=0.7, alpha=0.18, zorder=0)
+
     idx, labels = tick_positions(stamps, 15)
-    for ax in (ratio_ax, size_ax, lean_ax):
-        ax.set_xlim(-0.8, len(stamps) - 0.2)
-        ax.set_xticks(idx)
-        ax.set_xticklabels(labels, size=8)
-    lean_ax.set_xlabel("Eastern time")
+    for ax in (price, macd_ax, lean_ax, vol_ax):
+        ax.tick_params(labelbottom=False)
+    size_ax.set_xlim(-0.8, len(stamps) - 0.2)
+    size_ax.set_xticks(idx)
+    size_ax.set_xticklabels(labels, size=8)
+    size_ax.set_xlabel("Eastern time")
 
     pdf.savefig(fig)
     plt.close(fig)
@@ -438,8 +501,7 @@ def page_signals(pdf: PdfPages, session: Session) -> None:
 
 def build(session: Session, path: str) -> str:
     with PdfPages(path) as pdf:
-        page_session(pdf, session)
-        page_participation(pdf, session)
+        page_overview(pdf, session)
         page_signals(pdf, session)
         info = pdf.infodict()
         info["Title"] = f"{session.symbol} {session.day:%Y-%m-%d}"
@@ -453,7 +515,7 @@ def session_png(session: Session, path: str, dpi: int = 100) -> str:
         def savefig(self, fig):
             fig.savefig(path, dpi=dpi, bbox_inches="tight")
 
-    page_session(_Sink(), session)
+    page_overview(_Sink(), session)
     return path
 
 
