@@ -82,6 +82,18 @@ BAR_MINUTES = 5
 WINDOW_START = time(8, 55)
 WINDOW_END = time(10, 0)
 
+#: A candle or minute carrying this many times its usual volume for that
+#: clock slot breaks through the quiet channel and sounds the alarm. The
+#: rest of the stream stays silent, so a spike is the thing that gets
+#: attention rather than one more line in a tray.
+#:
+#: 1.5 is a starting point, not a finding. On 18 September the busiest
+#: 5-minute candle of the morning ran 1.4x, so this would have stayed
+#: silent all session -- lower it to see more, raise it to see less, and
+#: let a week of real mornings decide. Minute volume swings harder than
+#: candle volume, so the same multiple fires more often on minutes.
+VOLUME_ALERT_MULTIPLE = 1.5
+
 #: Minutes of one-minute bars behind the moment, used to read which way
 #: volume is leaning. Five matches the candle, so the reading and the
 #: candle describe the same stretch of tape.
@@ -365,9 +377,26 @@ def to_candles(frame: pd.DataFrame, baseline: Dict[time, float]) -> List[Candle]
     ]
 
 
+def is_spike(candle: Candle, multiple: float = VOLUME_ALERT_MULTIPLE) -> bool:
+    """Did this bar carry unusual volume for its time of day?
+
+    Unusual means against the SAME clock slot on recent sessions, never a
+    rolling average of today -- 09:35 and 14:35 are different animals, and
+    comparing them is how "busy" quietly comes to mean "is it morning".
+    With no history there is no claim to make, so it is not a spike.
+    """
+    return candle.vol_ratio is not None and candle.vol_ratio >= multiple
+
+
+def spike_line(candle: Candle) -> str:
+    return (f"** VOLUME {candle.vol_ratio:.1f}x usual for "
+            f"{candle.at:%H:%M} **")
+
+
 def describe_minute(symbol: str, minute: Candle, forming: Optional[Candle],
-                    lean: Optional[Lean]) -> str:
-    """The quiet once-a-minute update."""
+                    lean: Optional[Lean],
+                    multiple: float = VOLUME_ALERT_MULTIPLE) -> str:
+    """The once-a-minute update. Quiet, unless the volume is not."""
     arrow = "▲" if minute.up else "▼"
     change = minute.close - minute.open
     volume = f"Minute volume {thousands(minute.volume)}"
@@ -376,7 +405,10 @@ def describe_minute(symbol: str, minute: Candle, forming: Optional[Candle],
     if minute.trades:
         volume += f" in {int(minute.trades):,} trades"
 
-    lines = [
+    lines = []
+    if is_spike(minute, multiple):
+        lines.append(spike_line(minute))
+    lines += [
         f"{symbol} {minute.at:%H:%M} {arrow} {money(minute.close)} "
         f"({'+' if change >= 0 else ''}{cents(change)})",
         volume,
@@ -396,11 +428,15 @@ def describe_minute(symbol: str, minute: Candle, forming: Optional[Candle],
     return "\n".join(lines)
 
 
-def describe(symbol: str, candle: Candle, lean: Optional[Lean] = None) -> str:
+def describe(symbol: str, candle: Candle, lean: Optional[Lean] = None,
+             multiple: float = VOLUME_ALERT_MULTIPLE) -> str:
     """The five-minute alarm: one completed candle, spelled out."""
     arrow = "▲" if candle.up else "▼"
     change = candle.close - candle.open
-    lines = [
+    lines = []
+    if is_spike(candle, multiple):
+        lines.append(spike_line(candle))
+    lines += [
         f"{symbol} {candle.at:%H:%M} {arrow} {money(candle.close)} "
         f"({'+' if change >= 0 else ''}{cents(change)})",
         f"Open {money(candle.open)}   Close {money(candle.close)}",
@@ -507,7 +543,8 @@ def deliver(message: str, title: str, priority: int, dry_run: bool) -> str:
 
 
 def run_replay(symbol: str, day: date, start: time, end: time,
-               dry_run: bool, db: sqlite3.Connection) -> int:
+               dry_run: bool, db: sqlite3.Connection,
+               multiple: float = VOLUME_ALERT_MULTIPLE) -> int:
     """Read a past morning. Always the full tape -- history is free on SIP."""
     minutes = fetch_minutes(
         symbol,
@@ -524,10 +561,25 @@ def run_replay(symbol: str, day: date, start: time, end: time,
 
     for candle in candles:
         upto = minutes[minutes.index < candle.at + timedelta(minutes=BAR_MINUTES)]
-        print(describe(symbol, candle, read_lean(upto)))
+        print(describe(symbol, candle, read_lean(upto), multiple))
         print()
         remember(db, symbol, candle, sent=False)
 
+    # How often would the spike alarm have sounded on this day? That is the
+    # question a threshold can only be chosen by answering.
+    spikes = [c for c in candles if is_spike(c, multiple)]
+    print("=" * 56)
+    if candles and candles[0].vol_ratio is None:
+        print("  No baseline available, so no volume comparison was made.")
+    else:
+        print(f"  Volume alarm at {multiple:.1f}x: {len(spikes)} of {len(candles)} candles")
+        for c in spikes:
+            print(f"    {c.at:%H:%M}  {c.vol_ratio:.1f}x  {thousands(c.volume)}")
+        busiest = max((c for c in candles if c.vol_ratio is not None),
+                      key=lambda c: c.vol_ratio, default=None)
+        if busiest is not None and not spikes:
+            print(f"    busiest was {busiest.at:%H:%M} at {busiest.vol_ratio:.1f}x "
+                  f"-- lower the threshold to catch it")
     print("=" * 56)
     text = summarise(symbol, candles)
     print(text)
@@ -538,7 +590,8 @@ def run_replay(symbol: str, day: date, start: time, end: time,
 
 
 def run_live(symbol: str, start: time, end: time, dry_run: bool,
-             db: sqlite3.Connection, push_empty: bool = False) -> int:
+             db: sqlite3.Connection, push_empty: bool = False,
+             multiple: float = VOLUME_ALERT_MULTIPLE) -> int:
     """Follow this morning: a quiet update each minute, an alarm each candle."""
     today = datetime.now(ET).date()
     window_start = datetime.combine(today, start, tzinfo=ET)
@@ -600,10 +653,17 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 if forming is not None and forming.at + timedelta(minutes=BAR_MINUTES) <= stamp:
                     forming = None
 
-                message = describe_minute(symbol, minute, forming, lean)
+                # A spike leaves the silent channel. That is the whole
+                # point of having two: the stream stays glanceable, and the
+                # unusual minute is the one that makes a noise.
+                spiked = is_spike(minute, multiple)
+                message = describe_minute(symbol, minute, forming, lean, multiple)
                 fresh = remember_minute(db, symbol, minute, lean, sent=not dry_run)
-                status = deliver(message, f"{symbol} {stamp:%H:%M}",
-                                 PRIORITY_UPDATE, dry_run) if fresh else "already recorded"
+                title = (f"{symbol} {stamp:%H:%M} volume {minute.vol_ratio:.1f}x"
+                         if spiked else f"{symbol} {stamp:%H:%M}")
+                status = deliver(message, title,
+                                 PRIORITY_SUMMARY if spiked else PRIORITY_UPDATE,
+                                 dry_run) if fresh else "already recorded"
                 print(message)
                 print(f"  [{status}]\n")
 
@@ -616,10 +676,13 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 collected.append(candle)
                 upto = done_minutes[done_minutes.index <
                                     candle.at + timedelta(minutes=BAR_MINUTES)]
-                message = describe(symbol, candle, read_lean(upto))
+                message = describe(symbol, candle, read_lean(upto), multiple)
                 fresh = remember(db, symbol, candle, sent=not dry_run)
-                status = deliver(message, f"{symbol} candle {candle.at:%H:%M}",
-                                 PRIORITY_SUMMARY, dry_run) if fresh else "already recorded"
+                title = (f"{symbol} {candle.at:%H:%M} volume {candle.vol_ratio:.1f}x"
+                         if is_spike(candle, multiple)
+                         else f"{symbol} candle {candle.at:%H:%M}")
+                status = deliver(message, title, PRIORITY_SUMMARY,
+                                 dry_run) if fresh else "already recorded"
                 print("-" * 56)
                 print(message)
                 print(f"  [{status}]")
@@ -749,6 +812,32 @@ def self_test() -> int:
     if PRIORITY_UPDATE >= PRIORITY_SUMMARY:
         failures.append("the routine stream must be quieter than the alarm")
 
+    # --- the volume alarm --------------------------------------------------
+    busy = Candle(at=at, open=1.0, high=1.1, low=0.9, close=1.05,
+                  volume=100_000, usual_volume=40_000)          # 2.5x
+    calm = Candle(at=at, open=1.0, high=1.1, low=0.9, close=1.05,
+                  volume=44_000, usual_volume=40_000)           # 1.1x
+    blind = Candle(at=at, open=1.0, high=1.1, low=0.9, close=1.05,
+                   volume=999_999)                              # no history
+    if not is_spike(busy):
+        failures.append("2.5x usual should be a spike")
+    if is_spike(calm):
+        failures.append("1.1x usual should not be a spike")
+    if is_spike(blind):
+        failures.append("with no baseline there is no claim to make, so no spike")
+    if is_spike(busy, multiple=3.0):
+        failures.append("the threshold should be respected")
+    if not is_spike(calm, multiple=1.05):
+        failures.append("lowering the threshold should catch more")
+
+    spike_message = describe("SPCX", busy)
+    if "VOLUME 2.5x usual" not in spike_message:
+        failures.append(f"a spike should be called out first: {spike_message!r}")
+    if not spike_message.startswith("**"):
+        failures.append("the spike line should lead, not be buried")
+    if "VOLUME" in describe("SPCX", calm).split("\n")[0]:
+        failures.append("an ordinary candle should not be marked")
+
     source = open(__file__, encoding="utf-8").read()
     for forbidden in ("TradingClient", "submit_order", "MarketOrderRequest"):
         if forbidden in source.replace(f'"{forbidden}"', ""):
@@ -787,6 +876,10 @@ def main() -> int:
     parser.add_argument("--replay", metavar="YYYY-MM-DD", help="Read a past session instead")
     parser.add_argument("--push-empty", action="store_true",
                         help="Send an update for minutes with no trades too")
+    parser.add_argument("--volume-alert", type=float, default=VOLUME_ALERT_MULTIPLE,
+                        metavar="N",
+                        help=f"Sound the alarm at N times the usual volume for that "
+                             f"slot (default {VOLUME_ALERT_MULTIPLE})")
     parser.add_argument("--dry-run", action="store_true", help="Print, do not send")
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--self-test", action="store_true")
@@ -805,8 +898,10 @@ def main() -> int:
 
     if args.replay:
         day = datetime.strptime(args.replay, "%Y-%m-%d").date()
-        return run_replay(symbol, day, start, end, args.dry_run, db)
-    return run_live(symbol, start, end, args.dry_run, db, args.push_empty)
+        return run_replay(symbol, day, start, end, args.dry_run, db,
+                          args.volume_alert)
+    return run_live(symbol, start, end, args.dry_run, db, args.push_empty,
+                    args.volume_alert)
 
 
 if __name__ == "__main__":
