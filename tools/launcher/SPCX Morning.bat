@@ -46,6 +46,7 @@ echo     5   Replay a past day      full tape, costs nothing
 echo.
 echo     6   Today's signals        what has fired so far
 echo     7   End of day             fill in what price did next
+echo     8   PDF report             one session as charts, opens when done
 echo.
 echo     0   Quit
 echo.
@@ -59,6 +60,7 @@ if "%choice%"=="4" goto testpush
 if "%choice%"=="5" goto replay
 if "%choice%"=="6" goto recent
 if "%choice%"=="7" goto endofday
+if "%choice%"=="8" goto report
 if "%choice%"=="0" exit /b 0
 goto menu
 
@@ -99,6 +101,19 @@ set /p "day=  Date: "
 if "%day%"=="" goto menu
 echo.
 python open_candles.py --replay %day% --dry-run
+echo.
+pause
+goto menu
+
+:report
+cls
+echo.
+echo   Which day? Use the form 2026-09-18, or press Enter for the last one.
+echo.
+set "rday="
+set /p "rday=  Date: "
+echo.
+if "%rday%"=="" (python daily_report.py) else (python daily_report.py --date %rday%)
 echo.
 pause
 goto menu
