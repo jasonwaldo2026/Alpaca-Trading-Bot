@@ -1,7 +1,12 @@
 """
-Open candles: the morning read out to your phone, minute by minute.
+Open candles: the session read out to your phone, minute by minute.
 
-From 09:25 ET:
+The day runs in two phases. From 09:25 to 10:00 the phone gets
+everything. After 10:00 the readings keep being taken, recorded and
+drawn into the PDF, but only a volume spike is worth interrupting a
+working day for. `--detail-until` moves the line.
+
+In the detail phase:
 
   * every minute, a quiet update -- price, that minute's volume against
     what that minute usually carries, how the 5-minute candle is shaping
@@ -32,8 +37,9 @@ fact, it will mislead you.
 
 READ-ONLY. Market-data client only. No trading client, no order object.
 
-    python open_candles.py                        # live, 09:25-10:00 ET
-    python open_candles.py --until 11:00
+    python open_candles.py                        # live, 09:25-16:00 ET
+    python open_candles.py --detail-until 10:30   # move the quiet line
+    python open_candles.py --until 11:00          # stop early
     python open_candles.py --replay 2026-09-18    # any past session, SIP
     python open_candles.py --dry-run              # print, do not send
     python open_candles.py --self-test            # check the logic offline
@@ -80,7 +86,15 @@ from spcx_alert import (
 SYMBOL = "SPCX"
 BAR_MINUTES = 5
 WINDOW_START = time(9, 25)
-WINDOW_END = time(10, 0)
+WINDOW_END = time(16, 0)
+
+# Up to here the phone gets everything: a quiet line each minute and an
+# alarm each candle. After it, only the unusual -- a volume spike -- is
+# worth an interruption at a desk job. The readings keep being computed,
+# recorded and drawn into the PDF either way; what changes is whether
+# they buzz. Seventy-nine routine alarms a day is how an alert channel
+# gets ignored, and an alert you ignore is worse than one never built.
+DETAIL_UNTIL = time(10, 0)
 
 #: A candle or minute carrying this many times its usual volume for that
 #: clock slot breaks through the quiet channel and sounds the alarm. The
@@ -540,6 +554,17 @@ def remember_minute(db: sqlite3.Connection, symbol: str, minute: Candle,
 # Running
 # --------------------------------------------------------------------------
 
+def reaches_phone(at: time, spiked: bool, detail_until: time) -> bool:
+    """Does this reading earn an interruption?
+
+    Inside the detail window, everything does. Outside it, only a volume
+    spike -- the rest is still computed, recorded and drawn, it just does
+    not buzz. Written once because the minute loop and the candle loop
+    must never disagree about it: two copies of a rule is two rules.
+    """
+    return spiked or at < detail_until
+
+
 def deliver(message: str, title: str, priority: int, dry_run: bool,
             attachment: Optional[str] = None) -> str:
     if dry_run:
@@ -624,8 +649,9 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
              db: sqlite3.Connection, push_empty: bool = False,
              multiple: float = VOLUME_ALERT_MULTIPLE,
              pdf_every: int = PDF_EVERY_MINUTES,
-             db_path: str = DB_PATH) -> int:
-    """Follow this morning: a quiet update each minute, an alarm each candle."""
+             db_path: str = DB_PATH,
+             detail_until: time = DETAIL_UNTIL) -> int:
+    """Follow the session: full detail early, then only the unusual."""
     today = datetime.now(ET).date()
     window_start = datetime.combine(today, start, tzinfo=ET)
     window_end = datetime.combine(today, end, tzinfo=ET)
@@ -693,19 +719,26 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 # point of having two: the stream stays glanceable, and the
                 # unusual minute is the one that makes a noise.
                 spiked = is_spike(minute, multiple)
+                # Past the detail window only the unusual leaves the machine.
+                push = reaches_phone(stamp.time(), spiked, detail_until)
                 message = describe_minute(symbol, minute, forming, lean, multiple)
-                fresh = remember_minute(db, symbol, minute, lean, sent=not dry_run)
+                fresh = remember_minute(db, symbol, minute, lean,
+                                        sent=push and not dry_run)
                 title = (f"{symbol} {stamp:%H:%M} volume {minute.vol_ratio:.1f}x"
                          if spiked else f"{symbol} {stamp:%H:%M}")
+                chart = None
                 if spiked and pdf_every:
                     chart = rebuild_report(symbol, today, start, end,
                                            db_path, pdf_path)
                     last_pdf = datetime.now(ET)
-                status = deliver(message, title,
-                                 PRIORITY_SUMMARY if spiked else PRIORITY_UPDATE,
-                                 dry_run,
-                                 attachment=chart if spiked else None) \
-                    if fresh else "already recorded"
+                if not fresh:
+                    status = "already recorded"
+                elif not push:
+                    status = "logged, quiet after " + f"{detail_until:%H:%M}"
+                else:
+                    status = deliver(message, title,
+                                     PRIORITY_SUMMARY if spiked else PRIORITY_UPDATE,
+                                     dry_run, attachment=chart)
                 print(message)
                 print(f"  [{status}]\n")
 
@@ -719,17 +752,24 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 upto = done_minutes[done_minutes.index <
                                     candle.at + timedelta(minutes=BAR_MINUTES)]
                 message = describe(symbol, candle, read_lean(upto), multiple)
-                fresh = remember(db, symbol, candle, sent=not dry_run)
                 candle_spike = is_spike(candle, multiple)
+                push = reaches_phone(candle.at.time(), candle_spike,
+                                     detail_until)
+                fresh = remember(db, symbol, candle, sent=push and not dry_run)
                 title = (f"{symbol} {candle.at:%H:%M} volume {candle.vol_ratio:.1f}x"
                          if candle_spike else f"{symbol} candle {candle.at:%H:%M}")
+                chart = None
                 if candle_spike and pdf_every:
                     chart = rebuild_report(symbol, today, start, end,
                                            db_path, pdf_path)
                     last_pdf = datetime.now(ET)
-                status = deliver(message, title, PRIORITY_SUMMARY, dry_run,
-                                 attachment=chart if candle_spike else None) \
-                    if fresh else "already recorded"
+                if not fresh:
+                    status = "already recorded"
+                elif not push:
+                    status = "logged, quiet after " + f"{detail_until:%H:%M}"
+                else:
+                    status = deliver(message, title, PRIORITY_SUMMARY, dry_run,
+                                     attachment=chart)
                 print("-" * 56)
                 print(message)
                 print(f"  [{status}]")
@@ -895,6 +935,26 @@ def self_test() -> int:
         if forbidden in source.replace(f'"{forbidden}"', ""):
             failures.append(f"this file must not mention {forbidden}")
 
+    # The quiet phase is the whole reason this runs all day. A regression
+    # here means 79 alarms in a working day, which is how an alert channel
+    # stops being read.
+    quiet = time(10, 0)
+    cases = [
+        (time(9, 40), False, True,  "a routine minute inside the detail window"),
+        (time(9, 40), True,  True,  "a spike inside the detail window"),
+        (time(11, 0), False, False, "a routine minute after it"),
+        (time(11, 0), True,  True,  "a spike after it"),
+        (time(10, 0), False, False, "the switchover minute itself"),
+    ]
+    for at, spiked, expected, what in cases:
+        if reaches_phone(at, spiked, quiet) is not expected:
+            failures.append(f"{what} should "
+                            f"{'reach' if expected else 'not reach'} the phone")
+
+    # And the window it defaults to must actually be a trading day.
+    if not (WINDOW_START < DETAIL_UNTIL <= WINDOW_END):
+        failures.append("the detail window should sit inside the session window")
+
     print(update)
     print()
     print("-" * 56)
@@ -905,6 +965,7 @@ def self_test() -> int:
     print(f"  Lean, highs / lows / no range  : {buyers.score:.2f} / "
           f"{sellers.score:.2f} / {middling.score:.2f}")
     print(f"  Priorities, update vs alarm    : {PRIORITY_UPDATE} vs {PRIORITY_SUMMARY}")
+    print(f"  Phone quiet after              : {DETAIL_UNTIL:%H:%M} (spikes still sound)")
     print("  Trading client in this file    : none")
 
     if failures:
@@ -938,6 +999,11 @@ def main() -> int:
                         help=f"Rebuild the session PDF every N minutes, and send "
                              f"the chart with a volume alarm (default "
                              f"{PDF_EVERY_MINUTES}; 0 turns it off)")
+    parser.add_argument("--detail-until", dest="detail", metavar="HH:MM",
+                        default=f"{DETAIL_UNTIL:%H:%M}",
+                        help=f"Minute updates and candle summaries reach the "
+                             f"phone until this time; after it only volume "
+                             f"spikes do (default {DETAIL_UNTIL:%H:%M})")
     parser.add_argument("--dry-run", action="store_true", help="Print, do not send")
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--self-test", action="store_true")
@@ -949,6 +1015,10 @@ def main() -> int:
     start, end = parse_clock(args.start), parse_clock(args.end)
     if start >= end:
         raise SystemExit(f"--from {start:%H:%M} must be before --until {end:%H:%M}")
+    detail = parse_clock(args.detail)
+    if not (start <= detail <= end):
+        raise SystemExit(f"--detail-until {detail:%H:%M} must sit inside "
+                         f"{start:%H:%M}-{end:%H:%M}")
 
     db = open_db(args.db)
     ensure_schema(db)
@@ -959,7 +1029,7 @@ def main() -> int:
         return run_replay(symbol, day, start, end, args.dry_run, db,
                           args.volume_alert)
     return run_live(symbol, start, end, args.dry_run, db, args.push_empty,
-                    args.volume_alert, args.pdf_every, args.db)
+                    args.volume_alert, args.pdf_every, args.db, detail)
 
 
 if __name__ == "__main__":
