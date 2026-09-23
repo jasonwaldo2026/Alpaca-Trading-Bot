@@ -103,6 +103,11 @@ WARMUP_MINUTES = 900
 DB_PATH = "spcx_alerts.db"
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 
+#: Pushover priorities, shared with open_candles. -1 arrives with no sound
+#: or vibration; 1 sounds through a focus mode.
+PRIORITY_UPDATE = -1
+PRIORITY_SUMMARY = 1
+
 #: Minutes after a signal at which to record what price did.
 HORIZONS_MIN = (15, 30, 60)
 
@@ -261,6 +266,59 @@ def send_pushover(message: str, title: str = "SPCX setup",
         return None if body.get("status") == 1 else f"Pushover said: {body}"
     except (urllib.error.URLError, OSError, ValueError) as exc:
         return f"{type(exc).__name__}: {exc}"
+
+
+def test_push() -> int:
+    """Send one of each kind, and say plainly what happened.
+
+    Worth doing before you rely on it. A silent morning because a key was
+    never pasted in looks exactly like a morning with nothing to report.
+    """
+    print("Checking the path to your phone...\n")
+
+    present = {name: bool(os.getenv(name, "").strip())
+               for name in ("PUSHOVER_APP_TOKEN", "PUSHOVER_USER_KEY")}
+    for name, ok in present.items():
+        print(f"  {name:<22} {'set' if ok else 'MISSING'}")
+    if not all(present.values()):
+        print("\nNothing can be sent until both are in your .env.")
+        print("  App token : pushover.net → Your Applications → your app")
+        print("  User key  : pushover.net → the key on the main page after login")
+        return 1
+
+    checks = [
+        (PRIORITY_UPDATE, "quiet update", f"{SYMBOL} 09:36 \u25bc $153.89 (-3\u00a2)\n"
+                                          "Minute volume 13.2k (1.0x usual)\n"
+                                          "This is a test of the silent channel."),
+        (PRIORITY_SUMMARY, "alarm", f"{SYMBOL} 09:35 \u25b2 $152.41 (+23\u00a2)\n"
+                                    "Open $152.18   Close $152.41\n"
+                                    "This is a test of the alarm channel."),
+    ]
+
+    failed = False
+    for priority, label, message in checks:
+        error = send_pushover(message, title=f"{SYMBOL} test — {label}",
+                              priority=priority)
+        if error:
+            print(f"\n  priority {priority:>2} ({label}): FAILED — {error}")
+            failed = True
+        else:
+            print(f"\n  priority {priority:>2} ({label}): sent")
+        time_mod.sleep(2)     # so they arrive in order, not as one blob
+
+    if failed:
+        print("\nAt least one send failed. The message above says why.")
+        return 1
+
+    print("\nBoth sent. On the phone you should now have TWO notifications:")
+    print("  1. 'quiet update' — arrived with NO sound and NO vibration")
+    print("  2. 'alarm'        — made a noise")
+    print("\nIf the quiet one buzzed, or the alarm was silent, tell me and I")
+    print("will change the priorities. If the alarm did not sound while your")
+    print("phone was in a Focus mode, allow Pushover under Settings → Focus →")
+    print("Allowed Notifications, or under Notifications → Pushover → Time")
+    print("Sensitive. iOS can suppress a priority-1 push on its own.")
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -601,11 +659,16 @@ def main() -> int:
                         help=f"Stay quiet before this, ET (default {ALERT_FROM:%H:%M}). "
                              "Signals are still logged from 09:30.")
     parser.add_argument("--db", default=DB_PATH, help=f"Database file (default {DB_PATH})")
+    parser.add_argument("--test-push", action="store_true",
+                        help="Send one of each notification kind to your phone")
     parser.add_argument("--self-test", action="store_true", help="Check the logic offline")
     args = parser.parse_args()
 
     if args.self_test:
         return self_test()
+
+    if args.test_push:
+        return test_push()
 
     from feed_check import parse_clock
     alert_from = parse_clock(args.alert_from)

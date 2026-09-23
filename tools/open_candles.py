@@ -70,17 +70,17 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from feed_check import ET, load_credentials, parse_clock, trading_days
-from spcx_alert import open_db, send_pushover
+from spcx_alert import (
+    PRIORITY_SUMMARY,
+    PRIORITY_UPDATE,
+    open_db,
+    send_pushover,
+)
 
 SYMBOL = "SPCX"
 BAR_MINUTES = 5
 WINDOW_START = time(8, 55)
 WINDOW_END = time(10, 0)
-
-#: Pushover priorities. -1 arrives silently; 1 sounds through a focus
-#: mode. The routine stream must not use the same channel as the alarm.
-PRIORITY_UPDATE = -1
-PRIORITY_SUMMARY = 1
 
 #: Minutes of one-minute bars behind the moment, used to read which way
 #: volume is leaning. Five matches the candle, so the reading and the
