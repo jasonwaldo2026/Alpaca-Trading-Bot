@@ -47,6 +47,10 @@ except ImportError:            # noqa: F401 -- the calendar is a convenience
     # whole morning down at 09:25. Losing the unlock line is a cost worth
     # paying; losing the tape is not.
     lockups = None
+try:
+    import launches
+except ImportError:            # noqa: F401 -- same contract as lockups
+    launches = None
 from daily_report import (  # noqa: E402
     ACCENT, AXIS, DOWN, INK, INK_2, MUTED, SECOND, SURFACE, UP, reveal,
 )
@@ -167,6 +171,26 @@ def mark_unlocks(ax, comparison: Comparison, label: bool = False) -> List[int]:
     return positions
 
 
+def mark_launches(ax, comparison: Comparison) -> List[int]:
+    """A tick under the axis at each notable launch inside the window.
+
+    Deliberately a weaker mark than an unlock gets. An unlock is supply
+    arriving on a schedule and earns a rule through the whole panel; a
+    launch is a date with nothing measured behind it, and drawing the two
+    the same way would assert an equivalence this project has no evidence
+    for. A tick says "this happened here" and stops there.
+    """
+    positions = []
+    for flight in (launches.for_symbol(comparison.symbol) if launches else []):
+        if flight.day is None or flight.day not in comparison.days:
+            continue
+        i = comparison.days.index(flight.day)
+        positions.append(i)
+        ax.plot([i], [0], marker="^", markersize=5, color=MUTED,
+                transform=ax.get_xaxis_transform(), clip_on=False, zorder=6)
+    return positions
+
+
 def page(pdf: PdfPages, comparison: Comparison) -> None:
     days = comparison.days
     x = list(range(len(days)))
@@ -237,14 +261,17 @@ def page(pdf: PdfPages, comparison: Comparison) -> None:
     stock_moves, market_moves = comparison.daily_moves()
     diff = [s - m for s, m in zip(stock_moves, market_moves)]
     unlock_positions = set(mark_unlocks(bars, comparison))
+    launch_positions = mark_launches(bars, comparison)
     bars.axhline(0, color=AXIS, linewidth=1)
     bars.bar(x, diff, width=0.74, zorder=2,
              color=[SECOND if i in unlock_positions
                     else (UP if d >= 0 else DOWN) for i, d in enumerate(diff)])
     bars.set_ylabel("% vs market")
-    bars.set_title("Each session on its own: the stock's move minus the "
-                   "market's. Unlock days in orange",
-                   loc="left", size=9.5, color=INK_2, pad=4)
+    caption = ("Each session on its own: the stock's move minus the "
+               "market's. Unlock days in orange")
+    if launch_positions:
+        caption += ", notable launches ticked below"
+    bars.set_title(caption, loc="left", size=9.5, color=INK_2, pad=4)
     bars.spines[["top", "right"]].set_visible(False)
 
     idx, labels = ticks(days)

@@ -84,6 +84,10 @@ except ImportError:            # noqa: F401 -- the calendar is a convenience
     # whole morning down at 09:25. Losing the unlock line is a cost worth
     # paying; losing the tape is not.
     lockups = None
+try:
+    import launches
+except ImportError:            # noqa: F401 -- same contract as lockups
+    launches = None
 from feed_check import ET, load_credentials, load_env, parse_clock, trading_days
 from spcx_alert import (
     PRIORITY_SUMMARY,
@@ -746,9 +750,16 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
     # the next six hours of minute bars will say, and it is the one thing
     # here that is knowable in advance.
     notice = lockups.headline(symbol, today) if lockups else None
-    if notice:
+    flight = launches.headline(symbol, today) if launches else None
+    if notice or flight:
         print("=" * 56)
-        print(f"  {notice}")
+        if notice:
+            print(f"  {notice}")
+        # Second, and visibly so. An unlock is supply arriving on a
+        # schedule; a launch is a date in the news with nothing measured
+        # behind it. Printing them in either order would be a claim.
+        if flight:
+            print(f"  {flight}")
         print("=" * 56 + "\n")
 
     feed = os.getenv("ALPACA_DATA_FEED", "").strip().lower() or "iex"

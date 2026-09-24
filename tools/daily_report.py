@@ -50,6 +50,10 @@ except ImportError:            # noqa: F401 -- the calendar is a convenience
     # whole morning down at 09:25. Losing the unlock line is a cost worth
     # paying; losing the tape is not.
     lockups = None
+try:
+    import launches
+except ImportError:            # noqa: F401 -- same contract as lockups
+    launches = None
 from feed_check import ET, add_macd, load_env, parse_clock, trading_days
 from spcx_alert import MACD_SETTING, WARMUP_MINUTES
 from open_candles import BAR_MINUTES, aggregate, fetch_minutes, read_lean, thousands
@@ -282,6 +286,9 @@ def band(fig, session: Session) -> None:
     unlock = lockups.headline(session.symbol, session.day) if lockups else None
     if unlock:
         notes.append(unlock)
+    flight = launches.headline(session.symbol, session.day) if launches else None
+    if flight:
+        notes.append(flight)
     if notes:
         fig.text(0.045, 0.9035, "  ·  ".join(notes), size=8, color=INK_2)
 
