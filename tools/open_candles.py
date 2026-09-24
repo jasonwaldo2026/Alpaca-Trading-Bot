@@ -309,11 +309,14 @@ ALARM_VOLUME = VOLUME_ALERT_MULTIPLE
 #: happened twice.
 SOUND_COOLDOWN_MINUTES = 15
 
-#: Direction rides the sound, because the phone is in a pocket. A bike
-#: bell and a siren are unmistakable from each other before you have
-#: looked at anything. Both are overridable on the command line, and a
-#: custom sound uploaded to the Pushover account works here by name.
-SOUND_BUY, SOUND_SELL = "bike", "siren"
+#: Direction rides the sound, because the phone is in a pocket: which way
+#: to look should be settled before you have looked at anything. These
+#: are custom sounds uploaded to the Pushover account that owns the app
+#: token, named exactly as that account lists them -- a name that does
+#: not match falls back to the user's default sound, silently, which is
+#: the failure you would not notice until a Monday. Both are overridable
+#: per run with --buy-sound / --sell-sound.
+SOUND_BUY, SOUND_SELL = "Buy_Stock", "Sell_Positiins"
 
 #: The slider's track. Eleven cells so there is an exact middle, and two
 #: hues plus a neutral centre rather than a red-orange-yellow-green ramp:
