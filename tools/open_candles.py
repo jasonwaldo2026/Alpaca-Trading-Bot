@@ -316,7 +316,7 @@ SOUND_COOLDOWN_MINUTES = 15
 #: not match falls back to the user's default sound, silently, which is
 #: the failure you would not notice until a Monday. Both are overridable
 #: per run with --buy-sound / --sell-sound.
-SOUND_BUY, SOUND_SELL = "Buy_Stock", "Sell_Positiins"
+SOUND_BUY, SOUND_SELL = "Buy_Stock", "Sell_Positions"
 
 #: The slider's track. Eleven cells so there is an exact middle, and two
 #: hues plus a neutral centre rather than a red-orange-yellow-green ramp:
