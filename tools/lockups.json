@@ -1,0 +1,53 @@
+{
+  "_README": [
+    "Share-unlock calendar. Every date here is UNCONFIRMED unless its entry says",
+    "otherwise: they were transcribed from secondary sources (news aggregators, a",
+    "tweet, a video), not from the prospectus. Confirm each against SEC EDGAR --",
+    "search the issuer, open the S-1 or 424B4, and read the 'lock-up' section --",
+    "then set \"confirmed\": true. The tools label unconfirmed dates as such every",
+    "time they show them, because trading the wrong date is worse than not",
+    "knowing the right one."
+  ],
+  "SPCX": {
+    "name": "SpaceX",
+    "ipo": "2026-06-12",
+    "events": [
+      {
+        "date": "2026-09-24",
+        "shares": 328400000,
+        "label": "first tranche",
+        "confirmed": false
+      },
+      {
+        "date": "2026-10-09",
+        "shares": null,
+        "label": "7% calendar tranche",
+        "confirmed": false
+      },
+      {
+        "date": "2026-10-24",
+        "shares": 328400000,
+        "label": "7% tranche, day 135",
+        "confirmed": false
+      },
+      {
+        "date": null,
+        "shares": 1300000000,
+        "label": "post-Q3 earnings, up to 28% -- DATE UNKNOWN, tied to the earnings release",
+        "confirmed": false
+      },
+      {
+        "date": "2026-12-08",
+        "shares": 797600000,
+        "label": "180-day pool",
+        "confirmed": false
+      },
+      {
+        "date": "2027-06-12",
+        "shares": null,
+        "label": "founder stake",
+        "confirmed": false
+      }
+    ]
+  }
+}

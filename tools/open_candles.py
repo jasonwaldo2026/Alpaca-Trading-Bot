@@ -75,6 +75,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
+import lockups
 from feed_check import ET, load_credentials, load_env, parse_clock, trading_days
 from spcx_alert import (
     PRIORITY_SUMMARY,
@@ -733,10 +734,22 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
         print(f"  unavailable ({type(exc).__name__}) — volumes will be raw.\n")
         minute_base, candle_base = {}, {}
 
+    # The calendar before the tape. A known share unlock outweighs anything
+    # the next six hours of minute bars will say, and it is the one thing
+    # here that is knowable in advance.
+    notice = lockups.headline(symbol, today)
+    if notice:
+        print("=" * 56)
+        print(f"  {notice}")
+        print("=" * 56 + "\n")
+
     feed = os.getenv("ALPACA_DATA_FEED", "").strip().lower() or "iex"
     print(f"{symbol} · {start:%H:%M}-{end:%H:%M} ET · {feed} feed")
-    print(f"  every minute  → quiet update (priority {PRIORITY_UPDATE})")
-    print(f"  every {BAR_MINUTES} min   → alarm (priority {PRIORITY_SUMMARY})")
+    print(f"  {start:%H:%M}-{detail_until:%H:%M}  every minute → quiet update "
+          f"(priority {PRIORITY_UPDATE}),")
+    print(f"{'':16}every {BAR_MINUTES} min → alarm (priority {PRIORITY_SUMMARY})")
+    print(f"  {detail_until:%H:%M}-{end:%H:%M}  volume spikes only; the rest is "
+          f"recorded, not sent")
     if feed != "sip" and start < time(9, 30):
         print("  note: IEX carries very little before 09:30; empty minutes are")
         print("        skipped unless --push-empty.")
