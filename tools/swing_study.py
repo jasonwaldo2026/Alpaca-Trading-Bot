@@ -123,6 +123,18 @@ HYPOTHESIS_FROM = date(2026, 6, 12)
 HYPOTHESIS_WINDOW = (time(9, 40), time(11, 0))
 HYPOTHESIS_BRACKET = (0.75, 2.00)
 
+# SPCX listed on 12 June 2026, so its whole history IS the sample the VWAP
+# idea came from and no earlier days exist to test on -- not "hard to get",
+# none. The forward test starts today and takes months.
+#
+# Meanwhile the argument for the idea was never SPCX-specific: VWAP is a
+# line institutions are measured against, so it is a place where behaviour
+# changes. If that is true it should show somewhere else. These are liquid
+# names with years of history, and the POOLED row is the answer -- testing
+# six symbols is six chances at a false positive, and the best of six
+# always looks better than it is.
+CROSS_SYMBOLS = ("AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "AMD")
+
 # The gate sections score ONE bracket, fixed in advance, rather than
 # searching the grid again inside each window. Searching 36 cells per
 # window would hand back the best of 180 tries and call it a finding --
@@ -795,6 +807,115 @@ def self_test() -> int:
 
 # --------------------------------------------------------------------------
 
+def cross_symbol(symbols: Sequence[str], days: Sequence[date], macd: Macd,
+                 earliest: time) -> int:
+    """The pre-registered VWAP rule, on symbols it was not invented on.
+
+    Not a test of SPCX -- nothing can be, until time passes. A test of the
+    reason the idea was proposed: that VWAP is a line behaviour changes at.
+    A mechanism that only exists in the seventy days that suggested it is
+    not a mechanism.
+    """
+    lo, hi = HYPOTHESIS_WINDOW
+    stop, target = HYPOTHESIS_BRACKET
+    print(f"\n{'=' * 76}")
+    print("  THE VWAP RULE, ON SYMBOLS IT WAS NOT FOUND ON")
+    print(f"{'=' * 76}")
+    print(f"  A signal between {lo:%H:%M} and {hi:%H:%M} with price above VWAP, "
+          f"{stop:.2f}% stop,")
+    print(f"  {target:.2f}% target. Fixed in advance, identical for every symbol, "
+          f"scored")
+    print("  against random entry under the same conditions.\n")
+    print(f"  {len(days)} trading days per symbol, MACD {macd}, volume "
+          f"condition off.\n")
+
+    def picks(session, signals_only: bool):
+        if "vwap" not in session:
+            return []
+        out = []
+        for i in range(len(session)):
+            stamp = session.index[i]
+            if not (lo <= stamp.time() < hi):
+                continue
+            close, vwap = session["close"].iloc[i], session["vwap"].iloc[i]
+            if not (vwap == vwap and close > vwap):
+                continue
+            if signals_only:
+                if bool(session["alert"].iloc[i]):
+                    out.append(i)
+            elif i % BASELINE_STRIDE == 0:
+                out.append(i)
+        return out
+
+    print(f"  {'Symbol':<10}{'Days':>7}{'n':>8}{'Signal':>10}{'Random':>10}{'Edge':>10}")
+    pooled_signal, pooled_random = [], []
+    for symbol in symbols:
+        sessions: Dict[date, pd.DataFrame] = {}
+        for day in days:
+            try:
+                raw = fetch_extended(symbol, day, "sip")
+            except Exception:  # noqa: BLE001 -- one symbol short is not fatal
+                continue
+            if raw.empty:
+                continue
+            session = add_conditions(prepare(raw, macd), False, earliest)
+            if not session.empty:
+                sessions[day] = session
+
+        sig_trades, rnd_trades = [], []
+        for session in sessions.values():
+            sig_trades += simulate(session, picks(session, True), stop, target)
+            rnd_trades += simulate(session, picks(session, False), stop, target)
+        pooled_signal += sig_trades
+        pooled_random += rnd_trades
+
+        sig, rnd = score(sig_trades), score(rnd_trades)
+        if sig["n"] < 20 or rnd["n"] < 20:
+            body = f"{sig['n']:>8}{'--':>10}{'--':>10}{'too few':>10}"
+        else:
+            body = (f"{sig['n']:>8}{sig['avg_return']:>10.3f}"
+                    f"{rnd['avg_return']:>10.3f}"
+                    f"{sig['avg_return'] - rnd['avg_return']:>10.3f}")
+        print(f"  {symbol:<10}{len(sessions):>7}{body}")
+
+    sig, rnd = score(pooled_signal), score(pooled_random)
+    print(f"  {'-' * 53}")
+    if sig["n"] < 20 or rnd["n"] < 20:
+        print(f"  {'POOLED':<10}{'':>7}{sig['n']:>8}{'--':>10}{'--':>10}"
+              f"{'too few':>10}")
+        print("\n  Not enough trades anywhere to say anything.")
+        return 1
+
+    edge = sig["avg_return"] - rnd["avg_return"]
+    print(f"  {'POOLED':<10}{'':>7}{sig['n']:>8}{sig['avg_return']:>10.3f}"
+          f"{rnd['avg_return']:>10.3f}{edge:>10.3f}")
+
+    print(f"\n  The POOLED row is the answer. Individual symbols are "
+          f"{len(symbols)} chances")
+    print("  at a false positive, and one of them looking good is what noise "
+          "does.")
+    if edge <= 0:
+        print(f"\n  -> {edge:+.3f}%. The rule did not beat random entry under "
+              f"its own")
+        print("     conditions on symbols it was not invented on. The VWAP")
+        print("     filter is not a mechanism; it was a pattern in the seventy")
+        print("     days that suggested it.")
+    elif edge < MIN_EDGE_PCT:
+        print(f"\n  -> {edge:+.3f}%, under {MIN_EDGE_PCT}% and therefore inside "
+              f"the spread.")
+        print("     Real in sign, worth nothing after costs. Not tradeable, and")
+        print("     not a reason to change anything.")
+    else:
+        print(f"\n  -> {edge:+.3f}%, above the {MIN_EDGE_PCT}% noise floor, on "
+              f"symbols the")
+        print("     idea was not built on. That is the first result in this")
+        print("     project to survive a test it could have failed. Worth")
+        print("     pursuing -- and still not proof about SPCX, which needs")
+        print("     its own forward test.")
+    print(f"{'=' * 76}\n")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Measure SPCX's swings and brackets.")
     parser.add_argument("--symbol", default="SPCX")
@@ -806,6 +927,13 @@ def main() -> int:
                         help="Drop condition (d), the volume test")
     parser.add_argument("--from", dest="earliest", default="09:45",
                         help="Earliest signal time, ET (default 09:45; 09:30 is the open)")
+    parser.add_argument("--cross-symbol", nargs="?", const=",".join(CROSS_SYMBOLS),
+                        metavar="AAPL,MSFT",
+                        help="Run the pre-registered VWAP rule on other symbols "
+                             "instead of the full study. SPCX listed in June 2026 "
+                             "so it has no out-of-sample past; this tests the "
+                             "reason the idea was proposed, not the stock. "
+                             f"Default set: {','.join(CROSS_SYMBOLS)}")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -823,24 +951,76 @@ def main() -> int:
     print("Conditions: " + ", ".join(active).replace("(e) after 09:45",
                                                      f"(e) after {earliest:%H:%M}"))
 
+    if args.cross_symbol:
+        names = [n.strip().upper() for n in args.cross_symbol.split(",") if n.strip()]
+        return cross_symbol(names, days, macd, earliest)
+
     print(f"Fetching {symbol} 1-minute bars for {len(days)} trading days from SIP...")
     sessions: Dict[date, pd.DataFrame] = {}
+    empty: List[date] = []
+    errors: List[Tuple[date, str]] = []
+    shown = 0                       # identical errors already printed
     for n, day in enumerate(days, 1):
         try:
             raw = fetch_extended(symbol, day, "sip")
         except Exception as exc:  # noqa: BLE001 -- the message is the point
-            print(f"  {day:%Y-%m-%d}  failed: {type(exc).__name__}: {exc}")
+            kind = f"{type(exc).__name__}: {exc}"
+            errors.append((day, kind))
+            # One cause repeated is one fact. Printing it once per day turns
+            # the message that matters into a wall nobody reads to the end
+            # of -- and a network that is down is down for all of them.
+            same = sum(1 for _, k in errors if k == kind)
+            if same <= 2:
+                print(f"  {day:%Y-%m-%d}  failed: {kind}")
+                shown += 1
+            elif same == 3:
+                print(f"  {day:%Y-%m-%d}  failed: (same again -- further "
+                      f"identical failures counted, not printed)")
             continue
         if raw.empty:
-            print(f"  {day:%Y-%m-%d}  no data (holiday?)")
+            empty.append(day)
             continue
         session = add_conditions(prepare(raw, macd), require_volume, earliest)
         if session.empty:
-            print(f"  {day:%Y-%m-%d}  no regular-hours bars")
+            empty.append(day)
             continue
         sessions[day] = session
         if n % 5 == 0 or n == len(days):
             print(f"  {n}/{len(days)} days fetched...")
+
+    if errors:
+        kinds = {k for _, k in errors}
+        print(f"\n  {len(errors)} of {len(days)} days failed to fetch.")
+        if len(kinds) == 1:
+            print(f"  Every one of them with the same error, so this is one "
+                  f"problem and not {len(errors)}:")
+            print(f"    {errors[0][1][:150]}")
+            if "resolve" in errors[0][1].lower() or "NameResolution" in errors[0][1]:
+                print("  That is your machine's name resolution, not Alpaca and "
+                      "not this")
+                print("  code. Check the network, a VPN, or Tailscale, then run "
+                      "it again.")
+
+    if empty:
+        # A long unbroken run of empty days is not a run of holidays. It is a
+        # symbol that was not trading -- which is a more useful thing to be
+        # told, and for a recent listing it is the whole explanation.
+        runs, run = [], [empty[0]]
+        for previous, day in zip(empty, empty[1:]):
+            if (days.index(day) - days.index(previous)) == 1:
+                run.append(day)
+            else:
+                runs.append(run)
+                run = [day]
+        runs.append(run)
+        longest = max(runs, key=len)
+        print(f"\n  {len(empty)} of {len(days)} days returned no bars.")
+        if len(longest) >= 5:
+            print(f"  {longest[0]} to {longest[-1]} is {len(longest)} consecutive "
+                  f"sessions,")
+            print(f"  which is not a run of holidays -- {symbol} was almost "
+                  f"certainly not")
+            print("  trading then. For a recent listing that is the whole story.")
 
     if not sessions:
         print(f"\nNo usable data for {symbol}. Try --symbol AAPL to check the setup.")
