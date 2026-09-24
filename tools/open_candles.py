@@ -69,9 +69,9 @@ import os
 import sqlite3
 import statistics
 import time as time_mod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -284,6 +284,36 @@ def volume_baselines(symbol: str, day: date,
 # --------------------------------------------------------------------------
 # Which way the volume is leaning
 # --------------------------------------------------------------------------
+
+#: What earns a noise. The band edges -- "sellers pressing" and "buyers
+#: pressing" -- rather than the extremes, and the reason is a measurement
+#: rather than a preference. Scored against 23 Sep 2026, a session that
+#: fell 3.53%, the extremes (<=18 / >=82) fired on NONE of that day's five
+#: volume alarms: the phone would have stayed silent through the whole
+#: decline. The edges fire once, at 13:50, sellers pressing at 26 on 2.7x
+#: volume and $1.60 before the low. One interruption in a session is what
+#: a working day can carry.
+#:
+#: Calibrated on a single day, which is exactly the kind of fit that
+#: flatters itself in hindsight. If it turns out noisy or silent in
+#: practice, these two numbers are where to look.
+PRESSING_LOW, PRESSING_HIGH = 0.30, 0.70
+
+#: An alarm needs participation as well as direction. Same multiple as
+#: the spike alarm, so the loudest word and the noise mean one thing.
+ALARM_VOLUME = VOLUME_ALERT_MULTIPLE
+
+#: One event, one ring. Without this, a state that stays true rings every
+#: minute it stays true. Time-based rather than reset-on-lapse: a reading
+#: that dips below the edge for a single bar and comes back has not
+#: happened twice.
+SOUND_COOLDOWN_MINUTES = 15
+
+#: Direction rides the sound, because the phone is in a pocket. A bike
+#: bell and a siren are unmistakable from each other before you have
+#: looked at anything. Both are overridable on the command line, and a
+#: custom sound uploaded to the Pushover account works here by name.
+SOUND_BUY, SOUND_SELL = "bike", "siren"
 
 #: The slider's track. Eleven cells so there is an exact middle, and two
 #: hues plus a neutral centre rather than a red-orange-yellow-green ramp:
@@ -616,6 +646,72 @@ def previous_close(symbol: str, before: date) -> Optional[float]:
         return None
 
 
+@dataclass
+class Alarms:
+    """Decides which readings are worth a noise, and how often.
+
+    Two triggers, mirrored. A lean at or past a pressing band with real
+    volume behind it, and a VWAP cross with the same volume behind it --
+    above VWAP the average buyer today is in profit, below it they are
+    underwater, so crossing is the moment the day's balance changes
+    hands. Either one fires; the direction picks the sound.
+
+    None of this claims an edge. Nothing measured here beats a coin
+    flip, and a sound that meant "buy" would be asserting otherwise.
+    What it says is: something is happening now, with participation
+    behind it, in a direction you care about. Go and look.
+    """
+
+    cooldown: int = SOUND_COOLDOWN_MINUTES
+    volume: float = ALARM_VOLUME
+    fired: Dict[str, datetime] = field(default_factory=dict)
+    above_vwap: Optional[bool] = None
+
+    def _cross(self, day: Optional[Day]) -> Optional[str]:
+        """Which way price just crossed VWAP, if it did. Updates state."""
+        if day is None or day.vwap is None or pd.isna(day.vwap):
+            return None
+        now_above = day.last >= day.vwap
+        was = self.above_vwap
+        self.above_vwap = now_above
+        if was is None or was == now_above:
+            return None
+        return "buy" if now_above else "sell"
+
+    def reason(self, candle: Candle, lean: Optional[Lean],
+               day: Optional[Day]) -> Optional[Tuple[str, str]]:
+        """(direction, why) for a reading that earns a noise, or None.
+
+        The VWAP side is updated on every reading, fired or not -- a
+        cross has to be measured against the last bar, not the last
+        alarm, or a quiet stretch would swallow the crossing.
+        """
+        crossed = self._cross(day)
+        loud = candle.vol_ratio is not None and candle.vol_ratio >= self.volume
+        if not loud:
+            return None
+        if lean is not None:
+            if lean.score >= PRESSING_HIGH:
+                return "buy", f"{lean.word} on {candle.vol_ratio:.1f}x volume"
+            if lean.score <= PRESSING_LOW:
+                return "sell", f"{lean.word} on {candle.vol_ratio:.1f}x volume"
+        if crossed:
+            side = "above" if crossed == "buy" else "below"
+            return crossed, f"crossed {side} VWAP on {candle.vol_ratio:.1f}x volume"
+        return None
+
+    def should_sound(self, direction: str, at: datetime) -> bool:
+        last = self.fired.get(direction)
+        if last is not None and (at - last) < timedelta(minutes=self.cooldown):
+            return False
+        self.fired[direction] = at
+        return True
+
+    def sound_for(self, direction: str, buy: str = SOUND_BUY,
+                  sell: str = SOUND_SELL) -> str:
+        return buy if direction == "buy" else sell
+
+
 def is_spike(candle: Candle, multiple: float = VOLUME_ALERT_MULTIPLE) -> bool:
     """Did this bar carry unusual volume for its time of day?
 
@@ -763,11 +859,13 @@ def reaches_phone(at: time, spiked: bool, detail_until: time) -> bool:
 
 
 def deliver(message: str, title: str, priority: int, dry_run: bool,
-            attachment: Optional[str] = None) -> str:
+            attachment: Optional[str] = None,
+            sound: Optional[str] = None) -> str:
     if dry_run:
-        return "dry run" + (" (chart drawn)" if attachment else "")
+        noise = f" ({sound})" if sound else ""
+        return "dry run" + noise + (" (chart drawn)" if attachment else "")
     return send_pushover(message, title=title, priority=priority,
-                         attachment=attachment) or "sent"
+                         attachment=attachment, sound=sound) or "sent"
 
 
 def rebuild_report(symbol: str, day: date, start: time, end: time,
@@ -852,7 +950,9 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
              multiple: float = VOLUME_ALERT_MULTIPLE,
              pdf_every: int = PDF_EVERY_MINUTES,
              db_path: str = DB_PATH,
-             detail_until: time = DETAIL_UNTIL) -> int:
+             detail_until: time = DETAIL_UNTIL,
+             buy_sound: str = SOUND_BUY,
+             sell_sound: str = SOUND_SELL) -> int:
     """Follow the session: full detail early, then only the unusual."""
     today = datetime.now(ET).date()
     window_start = datetime.combine(today, start, tzinfo=ET)
@@ -889,11 +989,17 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
 
     feed = os.getenv("ALPACA_DATA_FEED", "").strip().lower() or "iex"
     print(f"{symbol} · {start:%H:%M}-{end:%H:%M} ET · {feed} feed")
-    print(f"  {start:%H:%M}-{detail_until:%H:%M}  every minute → quiet update "
-          f"(priority {PRIORITY_UPDATE}),")
-    print(f"{'':16}every {BAR_MINUTES} min → alarm (priority {PRIORITY_SUMMARY})")
-    print(f"  {detail_until:%H:%M}-{end:%H:%M}  volume spikes only; the rest is "
-          f"recorded, not sent")
+    print(f"  {start:%H:%M}-{detail_until:%H:%M}  every reading → silent "
+          f"update (priority {PRIORITY_UPDATE})")
+    print(f"  {detail_until:%H:%M}-{end:%H:%M}  volume spikes only, still "
+          f"silent; the rest is recorded")
+    print(f"  all session      a lean past {PRESSING_LOW * 100:.0f}/"
+          f"{PRESSING_HIGH * 100:.0f} or a VWAP cross, on "
+          f"{ALARM_VOLUME:.1f}x volume,")
+    print(f"{'':19}sounds at priority {PRIORITY_SUMMARY} — {buy_sound} to buy, "
+          f"{sell_sound} to sell,")
+    print(f"{'':19}at most one a direction every "
+          f"{SOUND_COOLDOWN_MINUTES} minutes")
     if feed != "sip" and start < time(9, 30):
         print("  note: IEX carries very little before 09:30; empty minutes are")
         print("        skipped unless --push-empty.")
@@ -903,6 +1009,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
     # Once a session, not once an alert. It only moves overnight, and a
     # per-message fetch would put a network call between a spike and the
     # phone. None is survivable: the day's move is the line that goes.
+    alarms = Alarms()
     prev_close = previous_close(symbol, today)
     if prev_close:
         print(f"  yesterday's close {money(prev_close)} — today's move is "
@@ -942,18 +1049,25 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 upto = done_minutes[done_minutes.index <= stamp]
                 lean = read_lean(upto, baseline=minute_base)
 
-                # A spike leaves the silent channel. That is the whole
-                # point of having two: the stream stays glanceable, and the
-                # unusual minute is the one that makes a noise.
                 spiked = is_spike(minute, multiple)
+                day = read_day(upto, prev_close)
+                # A spike is now visible, not audible. Only a direction
+                # with participation behind it earns a noise, because a
+                # phone that shouts at every busy minute is a phone whose
+                # shouting stops meaning anything.
+                call = alarms.reason(minute, lean, day)
+                ringing = call is not None and alarms.should_sound(call[0], stamp)
                 # Past the detail window only the unusual leaves the machine.
-                push = reaches_phone(stamp.time(), spiked, detail_until)
-                message = describe(symbol, minute, read_day(upto, prev_close),
-                                   lean, multiple)
+                push = reaches_phone(stamp.time(), spiked, detail_until) or ringing
+                message = describe(symbol, minute, day, lean, multiple)
                 fresh = remember_minute(db, symbol, minute, lean,
                                         sent=push and not dry_run)
-                title = (f"{symbol} {stamp:%H:%M} volume {minute.vol_ratio:.1f}x"
-                         if spiked else f"{symbol} {stamp:%H:%M}")
+                if ringing:
+                    title = f"{symbol} {stamp:%H:%M} — {call[1]}"
+                elif spiked:
+                    title = f"{symbol} {stamp:%H:%M} volume {minute.vol_ratio:.1f}x"
+                else:
+                    title = f"{symbol} {stamp:%H:%M}"
                 chart = None
                 if spiked and pdf_every:
                     chart = rebuild_report(symbol, today, start, end,
@@ -964,9 +1078,12 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 elif not push:
                     status = "logged, quiet after " + f"{detail_until:%H:%M}"
                 else:
-                    status = deliver(message, title,
-                                     PRIORITY_SUMMARY if spiked else PRIORITY_UPDATE,
-                                     dry_run, attachment=chart)
+                    status = deliver(
+                        message, title,
+                        PRIORITY_SUMMARY if ringing else PRIORITY_UPDATE,
+                        dry_run, attachment=chart,
+                        sound=alarms.sound_for(call[0], buy_sound, sell_sound)
+                        if ringing else None)
                 print(message)
                 print(f"  [{status}]\n")
 
@@ -998,7 +1115,11 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 elif not push:
                     status = "logged, quiet after " + f"{detail_until:%H:%M}"
                 else:
-                    status = deliver(message, title, PRIORITY_SUMMARY, dry_run,
+                    # Always quiet. Every audible decision is made once, on
+                    # the minute stream, which sees the same tape first --
+                    # two paths judging the same thing is how the two
+                    # message composers in this file drifted apart.
+                    status = deliver(message, title, PRIORITY_UPDATE, dry_run,
                                      attachment=chart)
                 print("-" * 56)
                 print(message)
@@ -1208,6 +1329,82 @@ def self_test() -> int:
     if PRIORITY_UPDATE >= PRIORITY_SUMMARY:
         failures.append("the routine stream must be quieter than the alarm")
 
+    # --- what earns a noise ------------------------------------------------
+    def reading(score, ratio, vwap_gap=1.0, at_minute=35):
+        """A candle, its lean and its day, at one clock minute."""
+        when = datetime.combine(date(2026, 9, 18), time(10, at_minute), tzinfo=ET)
+        bar = Candle(at=when, open=150.0, high=151.0, low=149.5, close=150.5,
+                     volume=ratio * 40_000, usual_volume=40_000)
+        return (bar, Lean(score, 5, 5, 5, volume_ratio=ratio),
+                Day(last=150.5, high=151.0, low=149.0,
+                    prev_close=149.0, vwap=150.5 - vwap_gap), when)
+
+    quiet = Alarms()
+    bar, lean, dctx, when = reading(0.90, 1.0)          # direction, no volume
+    if quiet.reason(bar, lean, dctx) is not None:
+        failures.append("a pressing lean on ordinary volume must stay silent")
+    bar, lean, dctx, when = reading(0.50, 3.0)          # volume, no direction
+    if quiet.reason(bar, lean, dctx) is not None:
+        failures.append("a volume spike with no direction must stay silent")
+
+    ring = Alarms()
+    bar, lean, dctx, when = reading(0.72, 2.0)
+    call = ring.reason(bar, lean, dctx)
+    if not call or call[0] != "buy":
+        failures.append(f"72 on 2x volume should ring the buy side: {call}")
+    bar, lean, dctx, when = reading(0.28, 2.0, at_minute=36)
+    call = ring.reason(bar, lean, dctx)
+    if not call or call[0] != "sell":
+        failures.append(f"28 on 2x volume should ring the sell side: {call}")
+
+    if ring.sound_for("buy") == ring.sound_for("sell"):
+        failures.append("the two directions must not share a sound")
+    if ring.sound_for("buy") != SOUND_BUY or ring.sound_for("sell") != SOUND_SELL:
+        failures.append("the sounds should not be swapped")
+    if ring.sound_for("buy", "butler", "klaxon") != "butler":
+        failures.append("an overridden sound should be used")
+
+    # One event, one ring.
+    cool = Alarms()
+    base = datetime.combine(date(2026, 9, 18), time(10, 0), tzinfo=ET)
+    if not cool.should_sound("buy", base):
+        failures.append("the first ring should always sound")
+    if cool.should_sound("buy", base + timedelta(minutes=5)):
+        failures.append("a second ring inside the cooldown should be suppressed")
+    if not cool.should_sound("sell", base + timedelta(minutes=5)):
+        failures.append("the other direction has its own cooldown")
+    if not cool.should_sound("buy", base + timedelta(minutes=SOUND_COOLDOWN_MINUTES)):
+        failures.append("the cooldown should expire")
+
+    # A VWAP cross needs a previous side to cross from, and the side must
+    # be tracked on every reading -- not only on the ones that ring.
+    cross = Alarms()
+    bar, lean, dctx, when = reading(0.50, 2.0, vwap_gap=-1.0)   # below
+    cross.reason(bar, lean, dctx)
+    bar, lean, dctx, when = reading(0.50, 2.0, vwap_gap=1.0)    # now above
+    call = cross.reason(bar, lean, dctx)
+    if not call or call[0] != "buy" or "VWAP" not in call[1]:
+        failures.append(f"crossing above VWAP on volume rings buy: {call}")
+    quiet_cross = Alarms()
+    bar, lean, dctx, when = reading(0.50, 1.0, vwap_gap=-1.0)
+    quiet_cross.reason(bar, lean, dctx)
+    bar, lean, dctx, when = reading(0.50, 1.0, vwap_gap=1.0)
+    if quiet_cross.reason(bar, lean, dctx) is not None:
+        failures.append("a VWAP cross with no volume behind it is not news")
+
+    # 23 Sep 2026, the session this threshold was chosen against: five
+    # volume alarms, and only the 13:50 one carried a direction. If this
+    # ever reads differently the thresholds moved without anyone saying so.
+    observed = ((0.48, 2.7), (0.26, 2.7), (0.45, 1.8), (0.60, 1.5), (0.60, 1.5))
+    rings = []
+    for i, (score, ratio) in enumerate(observed):
+        bar, lean, dctx, when = reading(score, ratio, at_minute=i)
+        got = Alarms().reason(bar, lean, dctx)
+        if got:
+            rings.append((score, got[0]))
+    if rings != [(0.26, "sell")]:
+        failures.append(f"23 Sep should ring once, sell at 26: {rings}")
+
     # --- the volume alarm --------------------------------------------------
     busy = Candle(at=at, open=1.0, high=1.1, low=0.9, close=1.05,
                   volume=100_000, usual_volume=40_000)          # 2.5x
@@ -1273,7 +1470,14 @@ def self_test() -> int:
     print(f"  Lean, highs / lows / no range  : {buyers.score:.2f} / "
           f"{sellers.score:.2f} / {middling.score:.2f}")
     print(f"  Priorities, update vs alarm    : {PRIORITY_UPDATE} vs {PRIORITY_SUMMARY}")
-    print(f"  Phone quiet after              : {DETAIL_UNTIL:%H:%M} (spikes still sound)")
+    print(f"  Phone quiet after              : {DETAIL_UNTIL:%H:%M} "
+          f"(spikes still arrive, silently)")
+    print(f"  Rings at                       : lean past "
+          f"{PRESSING_LOW * 100:.0f}/{PRESSING_HIGH * 100:.0f} or a VWAP "
+          f"cross, on {ALARM_VOLUME:.1f}x volume")
+    print(f"  Sounds, buy / sell             : {SOUND_BUY} / {SOUND_SELL}, "
+          f"one per direction per {SOUND_COOLDOWN_MINUTES} min")
+    print("  23 Sep replayed                : 1 ring of 5 volume spikes")
     print("  Trading client in this file    : none")
 
     if failures:
@@ -1307,6 +1511,13 @@ def main() -> int:
                         help=f"Rebuild the session PDF every N minutes, and send "
                              f"the chart with a volume alarm (default "
                              f"{PDF_EVERY_MINUTES}; 0 turns it off)")
+    parser.add_argument("--buy-sound", default=SOUND_BUY, metavar="NAME",
+                        help=f"Pushover sound for a buy-side alarm "
+                             f"(default {SOUND_BUY}; a custom sound uploaded "
+                             f"to your Pushover account works by name)")
+    parser.add_argument("--sell-sound", default=SOUND_SELL, metavar="NAME",
+                        help=f"Pushover sound for a sell-side alarm "
+                             f"(default {SOUND_SELL})")
     parser.add_argument("--detail-until", dest="detail", metavar="HH:MM",
                         default=f"{DETAIL_UNTIL:%H:%M}",
                         help=f"Minute updates and candle summaries reach the "
@@ -1337,7 +1548,8 @@ def main() -> int:
         return run_replay(symbol, day, start, end, args.dry_run, db,
                           args.volume_alert)
     return run_live(symbol, start, end, args.dry_run, db, args.push_empty,
-                    args.volume_alert, args.pdf_every, args.db, detail)
+                    args.volume_alert, args.pdf_every, args.db, detail,
+                    args.buy_sound, args.sell_sound)
 
 
 if __name__ == "__main__":

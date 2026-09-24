@@ -293,13 +293,18 @@ def _multipart(fields: dict, image_path: str) -> tuple:
 
 def send_pushover(message: str, title: str = "SPCX setup",
                   priority: int = 0,
-                  attachment: Optional[str] = None) -> Optional[str]:
+                  attachment: Optional[str] = None,
+                  sound: Optional[str] = None) -> Optional[str]:
     """Deliver to the phone. Returns an error string, or None on success.
 
     Priority -1 arrives without a sound or vibration -- it sits in the
     tray to be glanced at. 0 is a normal notification. 1 is an alarm that
     sounds through a focus mode. A stream of routine updates belongs at
     -1, or the phone becomes unusable and the alarms get ignored with it.
+
+    `sound` names one of Pushover's built-in sounds, or a custom sound
+    uploaded to the account that owns the app token. It only matters at
+    priority 0 and above; at -1 nothing plays whatever is asked for.
     """
     token = os.getenv("PUSHOVER_APP_TOKEN", "").strip()
     user = os.getenv("PUSHOVER_USER_KEY", "").strip()
@@ -308,6 +313,11 @@ def send_pushover(message: str, title: str = "SPCX setup",
 
     fields = {"token": token, "user": user, "title": title,
               "message": message, "priority": str(priority)}
+    if sound:
+        # Left unset, Pushover uses whatever the user picked as their
+        # default for this application. Naming one overrides it, which is
+        # the point: the sound is carrying the direction.
+        fields["sound"] = sound
 
     usable = (attachment and os.path.exists(attachment)
               and os.path.getsize(attachment) <= MAX_ATTACHMENT_BYTES)
