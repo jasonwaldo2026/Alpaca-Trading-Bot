@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Sequence, Tuple
 
 import pandas as pd
@@ -88,6 +88,26 @@ MIN_EDGE_PCT = 0.05
 # every minute of 30 days is ~11,700 trades per grid cell, which is slow
 # and no more informative than a fifth of them.
 BASELINE_STRIDE = 5
+
+# Candidate trading windows, for the time-of-day section. SPCX moves
+# roughly three times as much per bar at the open as it does at 14:00,
+# while the signal fires at a flat rate all day -- so most alerts arrive
+# when there is least to act on. These ask whether that is worth gating.
+GATE_WINDOWS = (
+    ("09:40-11:00", ((time(9, 40), time(11, 0)),)),
+    ("09:40-10:30", ((time(9, 40), time(10, 30)),)),
+    ("15:00-16:00", ((time(15, 0), time(16, 0)),)),
+    ("09:40-11:00 + 15:00-16:00", ((time(9, 40), time(11, 0)),
+                                   (time(15, 0), time(16, 0)))),
+    ("all day (now)", ((time(0, 0), time(23, 59)),)),
+)
+
+# The gate sections score ONE bracket, fixed in advance, rather than
+# searching the grid again inside each window. Searching 36 cells per
+# window would hand back the best of 180 tries and call it a finding --
+# and with this many windows something always looks good. This is the
+# bracket Jason planned to trade, scored the same way every time.
+GATE_BRACKET = (1.0, 2.0)
 
 
 # --------------------------------------------------------------------------
@@ -450,6 +470,94 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
               f"{s['avg_return']:+.3f}% average per trade")
         print(f"    {s['target_pct']:.0f}% hit the target, {s['stop_pct']:.0f}% were "
               f"stopped, {100 - s['target_pct'] - s['stop_pct']:.0f}% closed at 16:00\n")
+
+    # ---- 5. is a signal worth more at some times than others? ----------
+    if not outcomes.empty:
+        print("\n5. SIGNAL QUALITY BY TIME OF DAY\n")
+        print("   Section 2 counts signals. This one asks whether they were any")
+        print("   good -- the same measurements as section 3, cut by half hour.\n")
+        print(f"   {'Half hour':<12}{'Signals':>9}{'Med MFE':>10}{'Med MAE':>10}"
+              f"{'MFE/MAE':>10}{'Higher 60m':>13}")
+        stamped = outcomes.copy()
+        stamped["slot"] = [f"{t:%H}:{'00' if t.minute < 30 else '30'}"
+                           for t in stamped["time"]]
+        for slot in sorted(stamped["slot"].unique()):
+            part = stamped[stamped["slot"] == slot]
+            mfe = part["mfe_60"].median()
+            mae = part["mae_60"].median()
+            ratio = abs(mfe / mae) if mae else float("nan")
+            higher = 100.0 * (part["ret_60"] > 0).mean()
+            print(f"   {slot:<12}{len(part):>9}{mfe:>9.2f}%{mae:>9.2f}%"
+                  f"{ratio:>10.2f}{higher:>12.0f}%")
+        print("\n   MFE/MAE above 1.00 means the typical signal went further your")
+        print("   way than against it. At 1.00 the two are the same size, which")
+        print("   is what a random walk looks like and what no bracket can fix.")
+
+    # ---- 6. what a time-of-day gate would actually buy -------------------
+    print("\n6. A TIME-OF-DAY GATE\n")
+    stop_gate, target_gate = GATE_BRACKET
+    print(f"   One bracket, {stop_gate:.2f}% stop / {target_gate:.2f}% target, fixed")
+    print("   in advance and scored identically in every window -- not a fresh")
+    print("   search per window, which would find a winner by trying enough.\n")
+    print("   The control matters most here. Restricting to the busiest hours")
+    print("   raises returns on its own, because there is more movement to")
+    print("   catch; so random entry is restricted to the SAME hours. The last")
+    print("   column is the only one that says whether the SIGNAL improved.\n")
+
+    def inside(stamp, spans) -> bool:
+        return any(lo <= stamp.time() < hi for lo, hi in spans)
+
+    total_swings = 0
+    total_range = 0.0
+    swing_slots: List[datetime] = []
+    range_rows: List[Tuple[datetime, float]] = []
+    for session in sessions.values():
+        pivots = find_swings(session["high"].to_numpy(),
+                             session["low"].to_numpy(), 0.5)
+        for i, _, _ in pivots:
+            swing_slots.append(session.index[i])
+        for i in range(len(session)):
+            span = 100.0 * (session["high"].iloc[i] - session["low"].iloc[i]) \
+                / session["close"].iloc[i]
+            range_rows.append((session.index[i], span))
+            total_range += span
+    total_swings = len(swing_slots)
+
+    print(f"   {'Window':<28}{'Signals':>9}{'Swings':>9}{'Movement':>11}"
+          f"{'Signal':>9}{'Random':>9}{'Edge':>9}")
+    for label, spans in GATE_WINDOWS:
+        signal_trades, random_trades = [], []
+        for session in sessions.values():
+            picks = [i for i in range(len(session))
+                     if bool(session["alert"].iloc[i])
+                     and inside(session.index[i], spans)]
+            signal_trades += simulate(session, picks, stop_gate, target_gate)
+            rolls = [i for i in range(0, len(session) - 1, BASELINE_STRIDE)
+                     if inside(session.index[i], spans)]
+            random_trades += simulate(session, rolls, stop_gate, target_gate)
+
+        sig, rnd = score(signal_trades), score(random_trades)
+        kept_swings = sum(1 for stamp in swing_slots if inside(stamp, spans))
+        kept_range = sum(span for stamp, span in range_rows if inside(stamp, spans))
+        swing_share = (f"{100.0 * kept_swings / total_swings:>7.0f}%"
+                       if total_swings else f"{'--':>8}")
+        range_share = (f"{100.0 * kept_range / total_range:>9.0f}%"
+                       if total_range else f"{'--':>10}")
+        # A handful of trades is not a measurement. Say so rather than
+        # printing three decimals that invite reading a pattern into six
+        # coin flips -- the whole point of this section is to resist that.
+        if sig["n"] < 20 or rnd["n"] < 20:
+            numbers = f"{'--':>9}{'--':>9}{'too few':>9}"
+        else:
+            numbers = (f"{sig['avg_return']:>9.3f}{rnd['avg_return']:>9.3f}"
+                       f"{sig['avg_return'] - rnd['avg_return']:>9.3f}")
+        print(f"   {label:<28}{sig['n']:>9}{swing_share}{range_share}{numbers}")
+
+    print("\n   Signals / Swings / Movement are shares of the whole session kept")
+    print("   by the gate. Signal and Random are average % per trade inside the")
+    print("   window; Edge is the difference. An edge that is still near zero")
+    print("   in every row means the gate cut the noise without finding an")
+    print("   edge underneath -- fewer interruptions, not a better entry.")
 
     return outcomes
 
