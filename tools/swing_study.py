@@ -102,6 +102,26 @@ GATE_WINDOWS = (
     ("all day (now)", ((time(0, 0), time(23, 59)),)),
 )
 
+# --------------------------------------------------------------------------
+# The pre-registered VWAP hypothesis
+# --------------------------------------------------------------------------
+# Written down on 24 September 2026, BEFORE being tested on anything but
+# the sample that produced it. In the 12 Jun - 22 Sep window, morning
+# signals firing above VWAP showed a best-case/worst-case ratio of 1.67
+# and finished higher an hour later 58% of the time, against 0.79 and 48%
+# for those below. That is one of four cells examined, on 108
+# observations, about 1.7 standard errors from a coin flip -- the same
+# shape as a 54% figure that had already fooled this project once.
+#
+# So the rule is fixed here and not adjusted afterwards. A day on or
+# after HYPOTHESIS_FROM is in-sample: the idea was found there and it is
+# expected to look good, which proves nothing. A day before it has never
+# been examined, and is the only place the question can actually be
+# answered. Run with --days large enough to reach back past the cutoff.
+HYPOTHESIS_FROM = date(2026, 6, 12)
+HYPOTHESIS_WINDOW = (time(9, 40), time(11, 0))
+HYPOTHESIS_BRACKET = (0.75, 2.00)
+
 # The gate sections score ONE bracket, fixed in advance, rather than
 # searching the grid again inside each window. Searching 36 cells per
 # window would hand back the best of 180 tries and call it a finding --
@@ -558,6 +578,70 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
     print("   window; Edge is the difference. An edge that is still near zero")
     print("   in every row means the gate cut the noise without finding an")
     print("   edge underneath -- fewer interruptions, not a better entry.")
+
+    # ---- 7. the pre-registered VWAP test --------------------------------
+    print("\n7. THE VWAP HYPOTHESIS, TESTED THE ONLY WAY THAT COUNTS\n")
+    lo_h, hi_h = HYPOTHESIS_WINDOW
+    stop_h, target_h = HYPOTHESIS_BRACKET
+    print(f"   Rule, fixed before this ran: a signal between {lo_h:%H:%M} and")
+    print(f"   {hi_h:%H:%M} with price above VWAP. {stop_h:.2f}% stop, "
+          f"{target_h:.2f}% target.")
+    print(f"   Days from {HYPOTHESIS_FROM:%d %b %Y} are where the idea came "
+          f"from, so they")
+    print("   are expected to look good and prove nothing. Days before it have")
+    print("   never been examined. Only that row is evidence.\n")
+
+    def vwap_picks(session, signals_only: bool):
+        if "vwap" not in session:
+            return []
+        picks = []
+        for i in range(len(session)):
+            stamp = session.index[i]
+            if not (lo_h <= stamp.time() < hi_h):
+                continue
+            close, vwap = session["close"].iloc[i], session["vwap"].iloc[i]
+            if not (vwap == vwap and close > vwap):     # NaN-safe
+                continue
+            if signals_only:
+                if bool(session["alert"].iloc[i]):
+                    picks.append(i)
+            elif i % BASELINE_STRIDE == 0:
+                picks.append(i)
+        return picks
+
+    groups = {
+        "before the sample (never looked at)": [d for d in days if d < HYPOTHESIS_FROM],
+        f"from {HYPOTHESIS_FROM:%d %b} (where it came from)":
+            [d for d in days if d >= HYPOTHESIS_FROM],
+    }
+    print(f"   {'Days':<38}{'n':>6}{'Signal':>9}{'Random':>9}{'Edge':>9}")
+    for label, group in groups.items():
+        sig_trades, rnd_trades = [], []
+        for day in group:
+            session = sessions[day]
+            sig_trades += simulate(session, vwap_picks(session, True),
+                                   stop_h, target_h)
+            rnd_trades += simulate(session, vwap_picks(session, False),
+                                   stop_h, target_h)
+        sig, rnd = score(sig_trades), score(rnd_trades)
+        if sig["n"] < 20 or rnd["n"] < 20:
+            body = f"{sig['n']:>6}{'--':>9}{'--':>9}{'too few':>9}"
+        else:
+            body = (f"{sig['n']:>6}{sig['avg_return']:>9.3f}"
+                    f"{rnd['avg_return']:>9.3f}"
+                    f"{sig['avg_return'] - rnd['avg_return']:>9.3f}")
+        print(f"   {label:<38}{body}")
+
+    out_of_sample = [d for d in days if d < HYPOTHESIS_FROM]
+    if not out_of_sample:
+        print(f"\n   No days before {HYPOTHESIS_FROM:%d %b %Y} were fetched, so the")
+        print("   test has not actually been run. Increase --days until the first")
+        print("   session listed above is earlier than the cutoff; anything else")
+        print("   is the idea grading its own homework.")
+    else:
+        print(f"\n   {len(out_of_sample)} unexamined sessions. An edge under "
+              f"{MIN_EDGE_PCT}% is inside")
+        print("   the spread and counts as zero however it is signed.")
 
     return outcomes
 
