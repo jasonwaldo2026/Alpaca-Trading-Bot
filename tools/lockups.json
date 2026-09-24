@@ -13,6 +13,18 @@
     "ipo": "2026-06-12",
     "events": [
       {
+        "date": "2026-08-06",
+        "shares": 911500000,
+        "label": "first unlock, largest tranche so far",
+        "confirmed": false
+      },
+      {
+        "date": "2026-09-09",
+        "shares": 319000000,
+        "label": "second unlock",
+        "confirmed": false
+      },
+      {
         "date": "2026-09-24",
         "shares": 328400000,
         "label": "first tranche",

@@ -54,6 +54,7 @@ from typing import Dict, List, Sequence, Tuple
 
 import pandas as pd
 
+import lockups
 from feed_check import (
     CONDITIONS,
     DEFAULT_MACD,
@@ -642,6 +643,49 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
         print(f"\n   {len(out_of_sample)} unexamined sessions. An edge under "
               f"{MIN_EDGE_PCT}% is inside")
         print("   the spread and counts as zero however it is signed.")
+
+    # ---- 8. what actually happened on unlock days -----------------------
+    dated = [u for u in lockups.for_symbol(symbol) if u.day and u.day in sessions]
+    if dated:
+        print("\n8. UNLOCK DAYS\n")
+        print(f"   {len(dated)} dated unlock(s) fall inside this window. This is what")
+        print("   happened on them. It is not what happens on them: a handful of")
+        print("   events is an anecdote, and the honest use of this table is to")
+        print("   see whether the days were remarkable at all, not to forecast")
+        print("   the next one.\n")
+
+        def day_stats(session):
+            first, last = session.iloc[0], session.iloc[-1]
+            move = 100.0 * (last["close"] - first["open"]) / first["open"]
+            span = 100.0 * (session["high"].max() - session["low"].min()) / first["open"]
+            return move, span, float(session["volume"].sum())
+
+        stats = {day: day_stats(session) for day, session in sessions.items()}
+        volumes = sorted(v for _, _, v in stats.values())
+        typical = volumes[len(volumes) // 2] if volumes else 0.0
+
+        print(f"   {'Date':<12}{'Shares':>10}{'Day move':>11}{'Range':>9}"
+              f"{'Volume':>11}{'x typical':>11}")
+        for unlock in dated:
+            move, span, volume = stats[unlock.day]
+            ratio = volume / typical if typical else float("nan")
+            print(f"   {unlock.day:%d %b %Y}{unlock.size().replace(' shares', ''):>10}"
+                  f"{move:>10.2f}%{span:>8.2f}%"
+                  f"{volume / 1_000_000:>10.1f}M{ratio:>11.2f}")
+
+        others = [(m, r, v) for day, (m, r, v) in stats.items()
+                  if day not in {u.day for u in dated}]
+        if others:
+            moves = sorted(m for m, _, _ in others)
+            spans = sorted(r for _, r, _ in others)
+            mid = len(moves) // 2
+            print(f"\n   Every other session here, for comparison ({len(others)} days):")
+            print(f"   {'median':<12}{'':>10}{moves[mid]:>10.2f}%{spans[mid]:>8.2f}%")
+            down = sum(1 for m in moves if m < 0)
+            print(f"   {down} of {len(moves)} were down days "
+                  f"({100.0 * down / len(moves):.0f}%), so a fall on any given")
+            print("   day is not itself evidence of anything.")
+        print("\n   Dates are UNCONFIRMED unless lockups.json says otherwise.")
 
     return outcomes
 
