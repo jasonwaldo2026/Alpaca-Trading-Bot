@@ -93,6 +93,7 @@ from spcx_alert import (
     PRIORITY_SUMMARY,
     PRIORITY_UPDATE,
     open_db,
+    registered_devices,
     send_pushover,
 )
 
@@ -871,6 +872,171 @@ def deliver(message: str, title: str, priority: int, dry_run: bool,
                          attachment=attachment, sound=sound) or "sent"
 
 
+PUSHOVER_SOUNDS_URL = "https://api.pushover.net/1/sounds.json"
+
+
+def available_sounds() -> Tuple[Optional[List[str]], Optional[str]]:
+    """Ask Pushover which sound names this app token can actually use.
+
+    Worth asking, because a wrong name is not an error. Pushover accepts
+    the message, plays the user's default sound instead, and reports
+    success -- so a typo in a sound name is invisible until the morning
+    it matters and the wrong noise comes out of a pocket.
+
+    The token goes into the query string and is never printed.
+    """
+    import json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    token = os.getenv("PUSHOVER_APP_TOKEN", "").strip()
+    if not token:
+        return None, "no app token"
+    url = f"{PUSHOVER_SOUNDS_URL}?{urllib.parse.urlencode({'token': token})}"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as reply:
+            body = json.load(reply)
+    except urllib.error.HTTPError as exc:
+        return None, f"HTTP {exc.code} — the app token was rejected"
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}"
+    sounds = body.get("sounds")
+    if not isinstance(sounds, dict):
+        return None, "no sounds in the reply"
+    return sorted(sounds), None
+
+
+def list_sounds() -> int:
+    """Print every sound this app can name, custom ones included."""
+    load_env()
+    names, error = available_sounds()
+    if error:
+        print(f"Could not ask Pushover: {error}")
+        return 1
+    custom = [n for n in names if n not in BUILT_IN_SOUNDS]
+    print(f"\n{len(names)} sounds available to this application.\n")
+    if custom:
+        print("  Your uploads:")
+        for name in custom:
+            print(f"    {name}")
+        print()
+    print("  Built in:")
+    for name in [n for n in names if n in BUILT_IN_SOUNDS]:
+        print(f"    {name}")
+    print(f"\n  Currently configured: {SOUND_BUY} to buy, {SOUND_SELL} to sell.")
+    for role, name in (("buy", SOUND_BUY), ("sell", SOUND_SELL)):
+        if name not in names:
+            print(f"  ** {name!r} ({role}) is NOT in this list. A message asking")
+            print("     for it is delivered with your default sound instead,")
+            print("     and Pushover reports that as a success.")
+    print()
+    return 0
+
+
+#: Pushover's own sounds, so an upload can be told apart from a built-in
+#: in the listing. Only used for that: a name missing from here is not an
+#: error, it is a sound Pushover added since.
+BUILT_IN_SOUNDS = frozenset((
+    "pushover", "bike", "bugle", "cashregister", "classical", "cosmic",
+    "falling", "gamelan", "incoming", "intermission", "magic", "mechanical",
+    "pianobar", "siren", "spacealarm", "tugboat", "alien", "climb",
+    "persistent", "echo", "updown", "vibrate", "none",
+))
+
+
+def test_push(buy_sound: str = SOUND_BUY, sell_sound: str = SOUND_SELL,
+              pause: int = 6) -> int:
+    """Send one of each kind to the phone, and say what happened.
+
+    Three messages: the silent stream, a buy ring, a sell ring. Built by
+    the same composer the live watcher uses, so what arrives is what a
+    real alert looks like rather than an approximation of one.
+
+    Every title is prefixed TEST. An alert indistinguishable from a live
+    one is a trap -- you would find it on a Monday and act on it.
+    """
+    load_env()
+    print("Checking the path to your phone...\n")
+
+    present = {name: bool(os.getenv(name, "").strip())
+               for name in ("PUSHOVER_APP_TOKEN", "PUSHOVER_USER_KEY")}
+    for name, ok in present.items():
+        print(f"  {name:<22} {'set' if ok else 'MISSING'}")
+    if not all(present.values()):
+        print("\nNothing can be sent until both are in your .env.")
+        return 1
+
+    # Pushover accepts a message for an account with no devices and calls
+    # it a success, so a send that "worked" proves nothing on its own.
+    devices, error = registered_devices()
+    if error:
+        print(f"\n  devices                UNKNOWN — {error}")
+        print("\nThe key was rejected, so nothing would arrive.")
+        return 1
+    if not devices:
+        print("\n  devices                NONE")
+        print("\nThis key is valid but no device is attached, so a message is")
+        print("accepted and then reaches nobody. Open Pushover on the phone and")
+        print("check which account it is signed in to.")
+        return 1
+    print(f"  devices                {', '.join(devices)}")
+
+    names, sound_error = available_sounds()
+    if sound_error:
+        print(f"  sounds                 UNKNOWN — {sound_error}")
+    else:
+        for role, name in (("buy", buy_sound), ("sell", sell_sound)):
+            if name in names:
+                print(f"  {role + ' sound':<22} {name}")
+            else:
+                print(f"  {role + ' sound':<22} {name}  ** NOT FOUND **")
+                print(f"{'':25}Pushover will use your default sound and")
+                print(f"{'':25}report success. Check the spelling at")
+                print(f"{'':25}pushover.net → Sounds.")
+
+    at = datetime.now(ET).replace(second=0, microsecond=0)
+    day = Day(last=149.90, high=154.26, low=149.85, prev_close=153.70,
+              vwap=151.80)
+    calm = Day(last=152.47, high=154.26, low=152.05, prev_close=153.70,
+               vwap=153.10)
+
+    rounds = (
+        ("the silent stream", PRIORITY_UPDATE, None,
+         Candle(at=at, open=152.25, high=152.59, low=152.12, close=152.47,
+                volume=808_200, trades=11_325, usual_volume=1_400_000),
+         Lean(0.48, 390_000, 418_000, 5, volume_ratio=0.6), calm),
+        ("a buy ring", PRIORITY_SUMMARY, buy_sound,
+         Candle(at=at, open=153.63, high=154.18, low=153.60, close=154.12,
+                volume=1_620_000, trades=14_200, usual_volume=900_000),
+         Lean(0.76, 1_280_000, 340_000, 5, volume_ratio=1.8),
+         Day(last=154.12, high=154.18, low=153.04, prev_close=153.70,
+             vwap=153.55)),
+        ("a sell ring", PRIORITY_SUMMARY, sell_sound,
+         Candle(at=at, open=150.27, high=150.31, low=149.85, close=149.90,
+                volume=1_300_000, trades=18_764, usual_volume=481_000),
+         Lean(0.26, 169_000, 1_131_000, 5, volume_ratio=2.7), day),
+    )
+
+    print(f"\nSending {len(rounds)}, {pause}s apart so the sounds do not "
+          f"overlap...\n")
+    for i, (label, priority, sound, bar, lean, context) in enumerate(rounds):
+        if i:
+            time_mod.sleep(pause)
+        message = describe(SYMBOL, bar, context, lean)
+        title = f"TEST — {label}"
+        outcome = send_pushover(message, title=title, priority=priority,
+                                sound=sound) or "sent"
+        noise = sound or "silent"
+        print(f"  {label:<20} priority {priority:<3} {noise:<16} {outcome}")
+
+    print("\nThree should have arrived. The first without a sound, then the")
+    print("buy, then the sell. If a sound played that you did not choose, the")
+    print("name does not match the account — that is the failure this cannot")
+    print("detect from here.\n")
+    return 0
+
+
 def rebuild_report(symbol: str, day: date, start: time, end: time,
                    db_path: str, out_path: str,
                    live: bool = True) -> Optional[str]:
@@ -1279,6 +1445,40 @@ def self_test() -> int:
         if Lean(score, 5, 5, 5).slider.count(TRACK_KNOB) != 1:
             failures.append(f"exactly one knob, at {score}")
 
+    # --- the test push -----------------------------------------------------
+    # These are promises about a function that talks to a phone, so they
+    # are checked by reading it rather than by running it.
+    import inspect
+    push_source = inspect.getsource(test_push)
+    if "registered_devices()" not in push_source:
+        failures.append("test_push() should confirm a device is listening "
+                        "before sending")
+    if "available_sounds()" not in push_source:
+        failures.append("test_push() should check the sound names exist — a "
+                        "wrong one is delivered silently with the default")
+    if 'f"TEST — {label}"' not in push_source:
+        failures.append("every test title must be marked TEST, or one will be "
+                        "mistaken for a live signal")
+    if "PRIORITY_UPDATE" not in push_source or "PRIORITY_SUMMARY" not in push_source:
+        failures.append("the test should exercise both the quiet and loud "
+                        "channels")
+    if "time_mod.sleep(pause)" not in push_source:
+        failures.append("the rings should be spaced, or the two sounds overlap")
+
+    # The token is a credential. It travels in a query string and must
+    # never reach a print or a log.
+    for fn in (available_sounds, list_sounds, test_push):
+        body = inspect.getsource(fn)
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("print(", "print(f")) and "token" in stripped.lower():
+                failures.append(f"{fn.__name__} prints something with 'token' "
+                                f"in it: {stripped}")
+
+    if "bike" not in BUILT_IN_SOUNDS or SOUND_BUY in BUILT_IN_SOUNDS:
+        failures.append("the built-in list should know bike and not claim the "
+                        "uploaded buy sound as its own")
+
     # --- the day's context -------------------------------------------------
     day = Day(last=153.60, high=154.00, low=150.00, prev_close=150.50,
               vwap=152.90)
@@ -1481,6 +1681,8 @@ def self_test() -> int:
     print(f"  Sounds, buy / sell             : {SOUND_BUY} / {SOUND_SELL}, "
           f"one per direction per {SOUND_COOLDOWN_MINUTES} min")
     print("  23 Sep replayed                : 1 ring of 5 volume spikes")
+    print("  Test push                      : devices and sound names "
+          "checked first")
     print("  Trading client in this file    : none")
 
     if failures:
@@ -1528,11 +1730,20 @@ def main() -> int:
                              f"spikes do (default {DETAIL_UNTIL:%H:%M})")
     parser.add_argument("--dry-run", action="store_true", help="Print, do not send")
     parser.add_argument("--db", default=DB_PATH)
+    parser.add_argument("--test-push", action="store_true",
+                        help="Send one of each kind to the phone: a silent "
+                             "reading, a buy ring, a sell ring")
+    parser.add_argument("--list-sounds", action="store_true",
+                        help="Ask Pushover which sound names this app can use")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
     if args.self_test:
         return self_test()
+    if args.list_sounds:
+        return list_sounds()
+    if args.test_push:
+        return test_push(args.buy_sound, args.sell_sound)
 
     start, end = parse_clock(args.start), parse_clock(args.end)
     if start >= end:
