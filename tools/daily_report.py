@@ -31,7 +31,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -41,6 +41,7 @@ import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Rectangle
 
+import lockups
 from feed_check import ET, add_macd, load_env, parse_clock, trading_days
 from spcx_alert import MACD_SETTING, WARMUP_MINUTES
 from open_candles import BAR_MINUTES, aggregate, fetch_minutes, read_lean, thousands
@@ -50,6 +51,13 @@ SYMBOL = "SPCX"
 WINDOW_START = time(9, 25)
 WINDOW_END = time(16, 0)
 BASELINE_SESSIONS = 10
+
+#: The market, for comparison. A stock down 4% on a day everything fell 4%
+#: has done nothing; the same number against a flat market is the whole
+#: story. Measuring one symbol in isolation quietly attributes the market's
+#: mood to the stock. SPY is the broad US market; --benchmark takes any
+#: symbol, and an empty one turns the comparison off.
+BENCHMARK = "SPY"
 
 # ---------------------------------------------------------------------------
 # Palette. The categorical pair is validated for colour-vision deficiency in
@@ -103,6 +111,7 @@ class Session:
     baseline: Dict[time, float]
     signals: pd.DataFrame
     macd: pd.DataFrame        # 1-minute, the bars the alerts read
+    benchmark: Optional[Tuple[str, float]] = None   # (symbol, % over the window)
 
 
 def session_vwap(minutes: pd.DataFrame) -> pd.Series:
@@ -157,8 +166,33 @@ def logged_signals(db_path: str, symbol: str, day: date) -> pd.DataFrame:
     return frame
 
 
+def market_move(symbol: str, day: date, start: time, end: time,
+                force_sip: bool) -> Optional[Tuple[str, float]]:
+    """The benchmark's move across the same window, or None.
+
+    Same window as the session, or the comparison is between two
+    different questions. A failure here loses a line of context and
+    must never cost the report: the stock's own day is the point.
+    """
+    if not symbol:
+        return None
+    try:
+        bars = fetch_minutes(symbol,
+                             datetime.combine(day, start, tzinfo=ET),
+                             datetime.combine(day, end, tzinfo=ET),
+                             force_sip=force_sip)
+    except Exception:  # noqa: BLE001 -- context is a nicety, the session is not
+        return None
+    if bars.empty:
+        return None
+    first, last = bars.iloc[0], bars.iloc[-1]
+    if not first["open"]:
+        return None
+    return symbol.upper(), 100.0 * (last["close"] - first["open"]) / first["open"]
+
+
 def gather(symbol: str, day: date, start: time, end: time, db_path: str,
-           force_sip: bool = True) -> Optional[Session]:
+           force_sip: bool = True, benchmark: str = BENCHMARK) -> Optional[Session]:
     """Build a session. `force_sip` is right for a past day -- the free plan
     serves the full tape historically -- and wrong for today, where SIP is
     15 minutes behind and the live feed is what the alerts are reading."""
@@ -187,6 +221,7 @@ def gather(symbol: str, day: date, start: time, end: time, db_path: str,
         baseline=slot_baseline(symbol, day, start, end, force_sip=force_sip),
         signals=logged_signals(db_path, symbol, day),
         macd=macd,
+        benchmark=market_move(benchmark, day, start, end, force_sip),
     )
 
 
@@ -215,13 +250,32 @@ def band(fig, session: Session) -> None:
         ("Low", f"${candles['low'].min():,.2f}", INK_2),
         ("Volume", thousands(candles["volume"].sum()), INK_2),
     ]
+    if session.benchmark:
+        # The stock's own move minus the market's. This is the number that
+        # says whether anything happened HERE, rather than everywhere.
+        market, market_pct = session.benchmark
+        relative = pct - market_pct
+        stats.append((f"vs {market}", f"{relative:+.2f}%",
+                      UP if relative >= 0 else DOWN))
+
+    span = min(0.152, 0.90 / max(1, len(stats)))
     for i, (label, value, tone) in enumerate(stats):
-        x = 0.045 + i * 0.152
+        x = 0.045 + i * span
         fig.text(x, 0.9355, label.upper(), size=7, color=MUTED)
-        fig.text(x + 0.044, 0.934, value, size=10, color=tone)
+        fig.text(x + span * 0.29, 0.934, value, size=10, color=tone)
 
     fig.add_artist(plt.Line2D([0.045, 0.965], [0.920, 0.920],
                               color=AXIS, linewidth=0.8, transform=fig.transFigure))
+
+    notes = []
+    if session.benchmark:
+        market, market_pct = session.benchmark
+        notes.append(f"{market} {market_pct:+.2f}% over the same window")
+    unlock = lockups.headline(session.symbol, session.day)
+    if unlock:
+        notes.append(unlock)
+    if notes:
+        fig.text(0.045, 0.9035, "  ·  ".join(notes), size=8, color=INK_2)
 
 
 def tick_positions(stamps, every: int):
@@ -546,6 +600,9 @@ def main() -> int:
     load_env()
     parser = argparse.ArgumentParser(description="One session as a PDF.")
     parser.add_argument("--symbol", default=SYMBOL)
+    parser.add_argument("--benchmark", default=BENCHMARK,
+                        help=f"Compare the day against this symbol (default "
+                             f"{BENCHMARK}). Empty string turns it off.")
     parser.add_argument("--date", help="YYYY-MM-DD (default: the last trading day)")
     parser.add_argument("--from", dest="start", default=f"{WINDOW_START:%H:%M}")
     parser.add_argument("--until", dest="end", default=f"{WINDOW_END:%H:%M}")
@@ -560,7 +617,8 @@ def main() -> int:
     start, end = parse_clock(args.start), parse_clock(args.end)
 
     print(f"Building {symbol} report for {day}...")
-    session = gather(symbol, day, start, end, args.db)
+    session = gather(symbol, day, start, end, args.db,
+                     benchmark=args.benchmark)
     if session is None:
         print(f"  no bars for {symbol} on {day}. Market closed that day?")
         return 1
