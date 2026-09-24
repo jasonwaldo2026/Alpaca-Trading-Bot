@@ -90,6 +90,43 @@ ACCENT = "#2a78d6"      # categorical slot 1 -- signals
 SECOND = "#eb6834"      # categorical slot 2 -- the comparison series
 VWAP_HUE = "#4a3aa7"    # a contrasting hue, dashed, so it never reads as a series
 
+#: The sentiment ramp: the seven words the alerts use, as a diverging
+#: scale. Two hues with a NEUTRAL middle, never a red-orange-yellow-green
+#: rainbow -- a hue at the midpoint would colour "balanced" as though the
+#: tape were saying something. Strength is carried by how far from the
+#: middle a reading sits, which is what the eye reads on a diverging
+#: scale anyway. Upper edge, label, colour, opacity.
+SENTIMENT_BANDS = (
+    (18, "sellers in control", DOWN, 0.30),
+    (30, "sellers pressing", DOWN, 0.20),
+    (42, "sellers showing up", DOWN, 0.10),
+    (58, "balanced", MUTED, 0.10),
+    (70, "buyers showing up", UP, 0.10),
+    (82, "buyers pressing", UP, 0.20),
+    (100, "buyers in control", UP, 0.30),
+)
+
+
+def strip_opacity(score: float) -> float:
+    """How solid a ribbon block is: distance from the middle, not the band.
+
+    The bands behind the lean line are washes under a line and have to
+    stay out of its way. The ribbon has no line over it and one job --
+    being read at a glance from across the room -- so it runs far more
+    solid, and fades toward the middle so a balanced tape looks like
+    nothing rather than like a colour.
+    """
+    distance = min(1.0, abs(score - 50.0) / 50.0)
+    return round(0.14 + 0.72 * distance, 3)
+
+
+def sentiment_colour(score: float) -> tuple:
+    """A 0-100 reading to its band's colour and opacity."""
+    for edge, _, colour, alpha in SENTIMENT_BANDS:
+        if score < edge:
+            return colour, alpha
+    return SENTIMENT_BANDS[-1][2], SENTIMENT_BANDS[-1][3]
+
 plt.rcParams.update({
     "font.family": "DejaVu Sans",
     "font.size": 9,
@@ -347,14 +384,16 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
 
     fig = plt.figure(figsize=(11.7, 8.3))
     band(fig, session)
-    grid = fig.add_gridspec(5, 1, height_ratios=[3.0, 1.35, 1.05, 1.15, 0.75],
+    grid = fig.add_gridspec(6, 1,
+                            height_ratios=[3.0, 0.20, 1.30, 1.00, 1.10, 0.72],
                             hspace=0.23, left=0.062, right=0.965,
-                            top=0.893, bottom=0.052)
+                            top=0.879, bottom=0.052)
     price = fig.add_subplot(grid[0])
-    macd_ax = fig.add_subplot(grid[1], sharex=price)
-    lean_ax = fig.add_subplot(grid[2], sharex=price)
-    vol_ax = fig.add_subplot(grid[3], sharex=price)
-    size_ax = fig.add_subplot(grid[4], sharex=price)
+    strip_ax = fig.add_subplot(grid[1], sharex=price)
+    macd_ax = fig.add_subplot(grid[2], sharex=price)
+    lean_ax = fig.add_subplot(grid[3], sharex=price)
+    vol_ax = fig.add_subplot(grid[4], sharex=price)
+    size_ax = fig.add_subplot(grid[5], sharex=price)
 
     # --- price ------------------------------------------------------------
     for i, (_, row) in enumerate(candles.iterrows()):
@@ -442,14 +481,41 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
                                stamp + timedelta(minutes=BAR_MINUTES)]
         reading = read_lean(upto)
         scores.append(reading.score * 100 if reading else float("nan"))
-    lean_ax.axhline(50, color=AXIS, linewidth=1)
-    lean_ax.plot(x, scores, color=UP, linewidth=1.8, zorder=3)
+    # The bands behind the line are the same seven words the phone uses.
+    # Without them the panel says "68" and the alert says "buyers showing
+    # up", and nothing on the page tells you those are one fact.
+    floor = 0
+    for edge, label, colour, alpha in SENTIMENT_BANDS:
+        lean_ax.axhspan(floor, edge, color=colour, alpha=alpha, zorder=0,
+                        linewidth=0)
+        floor = edge
+    lean_ax.axhline(50, color=AXIS, linewidth=1, zorder=1)
+    lean_ax.plot(x, scores, color=INK, linewidth=1.6, zorder=3)
     lean_ax.set_ylim(0, 100)
-    lean_ax.set_yticks([0, 50, 100])
-    lean_ax.set_ylabel("in range")
-    panel_label(lean_ax, "Where price closed within its range \u2014 volume-weighted "
-                         "(100 = at the highs)")
+    # Ticks at the band edges that carry meaning, named rather than
+    # numbered: the number is arbitrary, the word is what he reads.
+    lean_ax.set_yticks([9, 50, 91])
+    lean_ax.set_yticklabels(["sellers", "balanced", "buyers"], size=7.5)
+    lean_ax.set_ylabel("")
+    panel_label(lean_ax, "Who is winning the range \u2014 the same reading your "
+                         "alerts name in words")
     lean_ax.spines[["top", "right"]].set_visible(False)
+
+    # --- the same reading as a ribbon, directly under the candles ---------
+    # The line above answers "how strong, exactly"; this answers "who had
+    # the tape, and for how long" without anyone tracing a line. Same
+    # numbers, same bands, no axis -- the whole session's mood as a stripe.
+    for i, score in enumerate(scores):
+        if score != score:      # NaN: a stretch with no reading
+            continue
+        colour, _ = sentiment_colour(score)
+        strip_ax.axvspan(i - 0.5, i + 0.5, color=colour,
+                         alpha=strip_opacity(score), linewidth=0)
+    strip_ax.set_yticks([])
+    strip_ax.set_ylabel("mood", rotation=0, ha="right", va="center",
+                        size=7.5, color=MUTED, labelpad=8)
+    strip_ax.tick_params(labelbottom=False, length=0)
+    strip_ax.spines[:].set_visible(False)
 
     # --- volume against the usual for that slot ---------------------------
     if session.baseline:
@@ -492,7 +558,7 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
             ax.axvline(sx, color=ACCENT, linewidth=0.7, alpha=0.18, zorder=0)
 
     idx, labels = tick_positions(stamps, 15)
-    for ax in (price, macd_ax, lean_ax, vol_ax):
+    for ax in (price, strip_ax, macd_ax, lean_ax, vol_ax):
         ax.tick_params(labelbottom=False)
     size_ax.set_xlim(-0.8, len(stamps) - 0.2)
     size_ax.set_xticks(idx)

@@ -285,6 +285,17 @@ def volume_baselines(symbol: str, day: date,
 # Which way the volume is leaning
 # --------------------------------------------------------------------------
 
+#: The slider's track. Eleven cells so there is an exact middle, and two
+#: hues plus a neutral centre rather than a red-orange-yellow-green ramp:
+#: a hue at the midpoint would colour "balanced" as though it meant
+#: something. Position on the track carries the strength instead.
+TRACK = ("🟥", "🟥", "🟥", "🟥",
+         "⬜", "⬜", "⬜",
+         "🟩", "🟩", "🟩", "🟩")
+TRACK_CELLS = len(TRACK)
+TRACK_KNOB = "🔘"
+
+
 @dataclass
 class Lean:
     """Where price closed within each minute's range, weighted by volume.
@@ -353,6 +364,27 @@ class Lean:
         if self.taking:
             return "↑↑" if self.score >= 0.5 else "↓↓"
         return self._band[1]
+
+    @property
+    def slider(self) -> str:
+        """The reading as a slider: a red-to-green track with a knob on it.
+
+        Built from emoji rather than HTML or box-drawing characters, and
+        the reason is Pushover's own rules. `html=1` and `monospace=1` are
+        mutually exclusive, and BOTH are stripped when the message is
+        shown as a notification -- which is the moment this has to work.
+        Emoji survive that, render in colour on the lock screen, and need
+        no font to line up.
+
+        The track is two hues either side of a neutral middle, never a
+        rainbow: a graded hue ramp would put a third colour at the point
+        where the tape is saying nothing, which is the one place a chart
+        must stay quiet. Distance from the middle carries the strength.
+        """
+        cell = max(0, min(TRACK_CELLS - 1, round(self.score * (TRACK_CELLS - 1))))
+        track = list(TRACK)
+        track[cell] = TRACK_KNOB
+        return "".join(track)
 
     def __str__(self) -> str:
         share = self.up_volume + self.down_volume
@@ -470,6 +502,120 @@ def to_candles(frame: pd.DataFrame, baseline: Dict[time, float]) -> List[Candle]
     ]
 
 
+@dataclass
+class Day:
+    """Where the stock stands, as opposed to what the last bar did.
+
+    The alerts used to describe one candle in isolation: "+2c" meant the
+    move inside that bar, so a message could say the same thing whether
+    the stock was up three percent on the day or down three. This is the
+    context that was missing.
+    """
+
+    last: float
+    high: float
+    low: float
+    prev_close: Optional[float] = None
+    vwap: Optional[float] = None
+
+    #: Where in the day's range the price sits, low to high. Five bands,
+    #: not a percentage: "68% of the range" invites arithmetic that the
+    #: number cannot support, where "upper half" says exactly what is
+    #: known. A range narrower than a cent has no position to report.
+    PLACES = ((0.08, "at the low"), (0.40, "lower half"),
+              (0.60, "mid-range"), (0.92, "upper half"), (1.01, "at the high"))
+
+    @property
+    def span(self) -> float:
+        return self.high - self.low
+
+    @property
+    def place(self) -> Optional[str]:
+        if self.span < 0.01:
+            return None
+        share = (self.last - self.low) / self.span
+        for edge, word in self.PLACES:
+            if share < edge:
+                return word
+        return self.PLACES[-1][1]
+
+    @property
+    def change_pct(self) -> Optional[float]:
+        """Against yesterday's close, which is the number every other
+        screen shows him. Measuring from today's open instead would be
+        defensible and would quietly disagree with his broker."""
+        if not self.prev_close:
+            return None
+        return 100.0 * (self.last - self.prev_close) / self.prev_close
+
+    def vwap_gap(self) -> Optional[str]:
+        if self.vwap is None or pd.isna(self.vwap):
+            return None
+        gap = self.last - self.vwap
+        side = "above" if gap >= 0 else "below"
+        return f"{cents(abs(gap))} {side} VWAP"
+
+    def line(self) -> str:
+        parts = [f"Day {self.low:,.2f} – {self.high:,.2f}"]
+        if self.place:
+            parts[0] += f", {self.place}"
+        gap = self.vwap_gap()
+        if gap:
+            parts.append(gap)
+        return " · ".join(parts)
+
+
+def read_day(frame: pd.DataFrame, prev_close: Optional[float] = None) -> Optional[Day]:
+    """The day so far, from the session's own bars.
+
+    Regular hours only. Pre-market prints would stretch the day's range
+    with a handful of thin trades and move VWAP before the session that
+    VWAP describes has started.
+    """
+    if frame.empty:
+        return None
+    session = frame[(frame.index.time >= time(9, 30))
+                    & (frame.index.time < time(16, 0))]
+    if session.empty:
+        return None
+    vwap = None
+    try:
+        from feed_check import add_vwap
+        vwap = float(add_vwap(session)["vwap"].iloc[-1])
+    except Exception:  # noqa: BLE001 -- a missing line is not a missing alert
+        vwap = None
+    return Day(last=float(session["close"].iloc[-1]),
+               high=float(session["high"].max()),
+               low=float(session["low"].min()),
+               prev_close=prev_close, vwap=vwap)
+
+
+def previous_close(symbol: str, before: date) -> Optional[float]:
+    """Yesterday's close, fetched once a session rather than per alert."""
+    try:
+        # Imported inside the try, not above it: an ImportError here has
+        # to cost the day's-move line and nothing else, exactly like a
+        # failed request does.
+        from alpaca.data.enums import DataFeed
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        frame = _client().get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbol, timeframe=TimeFrame.Day,
+            start=datetime.combine(before - timedelta(days=10), time(0, 0),
+                                   tzinfo=ET),
+            end=datetime.combine(before - timedelta(days=1), time(23, 59),
+                                 tzinfo=ET),
+            feed=DataFeed.SIP)).df
+        if frame is None or frame.empty:
+            return None
+        if isinstance(frame.index, pd.MultiIndex):
+            frame = frame.xs(symbol, level="symbol")
+        return float(frame["close"].iloc[-1])
+    except Exception:  # noqa: BLE001 -- the day's move is a nicety
+        return None
+
+
 def is_spike(candle: Candle, multiple: float = VOLUME_ALERT_MULTIPLE) -> bool:
     """Did this bar carry unusual volume for its time of day?
 
@@ -486,67 +632,43 @@ def spike_line(candle: Candle) -> str:
             f"{candle.at:%H:%M} **")
 
 
-def describe_minute(symbol: str, minute: Candle, forming: Optional[Candle],
-                    lean: Optional[Lean],
-                    multiple: float = VOLUME_ALERT_MULTIPLE) -> str:
-    """The once-a-minute update. Quiet, unless the volume is not."""
-    arrow = "▲" if minute.up else "▼"
-    change = minute.close - minute.open
-    volume = f"Minute volume {thousands(minute.volume)}"
-    if minute.vol_ratio is not None:
-        volume += f" ({minute.vol_ratio:.1f}× usual)"
-    if minute.trades:
-        volume += f" in {int(minute.trades):,} trades"
-
-    lines = []
-    if is_spike(minute, multiple):
-        lines.append(spike_line(minute))
-    lines += [
-        f"{symbol} {minute.at:%H:%M} {arrow} {money(minute.close)} "
-        f"({'+' if change >= 0 else ''}{cents(change)})",
-        volume,
-    ]
-    if forming is not None:
-        elapsed = int((minute.at - forming.at).total_seconds() // 60) + 1
-        lines.append(
-            f"Candle {forming.at:%H:%M} forming ({elapsed}/{BAR_MINUTES} min): "
-            f"O {forming.open:,.2f}  H {forming.high:,.2f}  "
-            f"L {forming.low:,.2f}  now {forming.close:,.2f}  "
-            f"{thousands(forming.volume)}"
-        )
-    if lean is not None:
-        lines.append(str(lean))
-    if minute.at.time() < time(9, 30):
-        lines.append("pre-market")
-    return "\n".join(lines)
-
-
-def describe(symbol: str, candle: Candle, lean: Optional[Lean] = None,
+def describe(symbol: str, candle: Candle, day: Optional[Day] = None,
+             lean: Optional[Lean] = None,
              multiple: float = VOLUME_ALERT_MULTIPLE) -> str:
-    """The five-minute alarm: one completed candle, spelled out."""
-    arrow = "▲" if candle.up else "▼"
-    change = candle.close - candle.open
+    """One alert, short enough to read at a traffic light.
+
+    Four lines at most: where the stock is, where that sits, which way
+    the tape is leaning, and the slider. Everything this used to spell
+    out -- open, high, low, close, wick and body measurements, the trade
+    count, the forming candle's progress -- is on the PDF that rides
+    along with a spike, and reading it on a phone was the cost of getting
+    to the one number that mattered.
+
+    Both cadences share this composer. Two of them drifted apart once.
+    """
     lines = []
     if is_spike(candle, multiple):
         lines.append(spike_line(candle))
-    lines += [
-        f"{symbol} {candle.at:%H:%M} {arrow} {money(candle.close)} "
-        f"({'+' if change >= 0 else ''}{cents(change)})",
-        f"Open {money(candle.open)}   Close {money(candle.close)}",
-        f"High {money(candle.high)}   Low {money(candle.low)}",
-        f"Upper wick {cents(candle.upper_wick)}   "
-        f"Lower wick {cents(candle.lower_wick)}   Body {cents(candle.body)}",
-    ]
-    volume = f"Volume {thousands(candle.volume)}"
-    if candle.vol_ratio is not None:
-        volume += f" ({candle.vol_ratio:.1f}× usual for {candle.at:%H:%M})"
-    if candle.trades:
-        volume += f" in {int(candle.trades):,} trades"
-    lines.append(volume)
-    if lean is not None:
-        lines.append(str(lean))
+
+    head = f"{symbol} {money(candle.close)}"
+    if day is not None:
+        change = day.change_pct
+        if change is not None:
+            arrow = "\u25b2" if change >= 0 else "\u25bc"
+            head += f"  {arrow} {change:+.2f}% today"
     if candle.at.time() < time(9, 30):
-        lines.append("pre-market")
+        head += "  (pre-market)"
+    lines.append(head)
+
+    if day is not None:
+        lines.append(day.line())
+
+    if lean is not None:
+        tail = f"{lean.word.capitalize()} {lean.arrow} \u00b7 {lean.score * 100:.0f}/100"
+        if candle.vol_ratio is not None:
+            tail += f" \u00b7 volume {candle.vol_ratio:.1f}\u00d7 usual"
+        lines.append(tail)
+        lines.append(lean.slider)
     return "\n".join(lines)
 
 
@@ -691,9 +813,12 @@ def run_replay(symbol: str, day: date, start: time, end: time,
     minute_base, candle_base = volume_baselines(symbol, day, force_sip=True)
     candles = to_candles(aggregate(minutes), candle_base)
 
+    # The replay knows yesterday's close too, so a replayed message is
+    # the same message the day would have sent.
+    prev_close = previous_close(symbol, day)
     for candle in candles:
         upto = minutes[minutes.index < candle.at + timedelta(minutes=BAR_MINUTES)]
-        print(describe(symbol, candle,
+        print(describe(symbol, candle, read_day(upto, prev_close),
                        read_lean(upto, baseline=minute_base), multiple))
         print()
         remember(db, symbol, candle, sent=False)
@@ -775,6 +900,16 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
     print()
 
     seen_minutes, seen_candles, collected = set(), set(), []
+    # Once a session, not once an alert. It only moves overnight, and a
+    # per-message fetch would put a network call between a spike and the
+    # phone. None is survivable: the day's move is the line that goes.
+    prev_close = previous_close(symbol, today)
+    if prev_close:
+        print(f"  yesterday's close {money(prev_close)} — today's move is "
+              f"measured from it\n")
+    else:
+        print("  yesterday's close unavailable — alerts will omit the "
+              "day's move\n")
     chart: Optional[str] = None
     last_pdf = datetime.now(ET) - timedelta(minutes=pdf_every or 0)
     try:
@@ -807,21 +942,14 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 upto = done_minutes[done_minutes.index <= stamp]
                 lean = read_lean(upto, baseline=minute_base)
 
-                # The candle this minute belongs to, as far as it has got.
-                edge = stamp.replace(minute=stamp.minute - (stamp.minute % BAR_MINUTES),
-                                     second=0, microsecond=0)
-                part = upto[upto.index >= edge]
-                forming = to_candles(aggregate(part), {})[0] if not part.empty else None
-                if forming is not None and forming.at + timedelta(minutes=BAR_MINUTES) <= stamp:
-                    forming = None
-
                 # A spike leaves the silent channel. That is the whole
                 # point of having two: the stream stays glanceable, and the
                 # unusual minute is the one that makes a noise.
                 spiked = is_spike(minute, multiple)
                 # Past the detail window only the unusual leaves the machine.
                 push = reaches_phone(stamp.time(), spiked, detail_until)
-                message = describe_minute(symbol, minute, forming, lean, multiple)
+                message = describe(symbol, minute, read_day(upto, prev_close),
+                                   lean, multiple)
                 fresh = remember_minute(db, symbol, minute, lean,
                                         sent=push and not dry_run)
                 title = (f"{symbol} {stamp:%H:%M} volume {minute.vol_ratio:.1f}x"
@@ -851,7 +979,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 collected.append(candle)
                 upto = done_minutes[done_minutes.index <
                                     candle.at + timedelta(minutes=BAR_MINUTES)]
-                message = describe(symbol, candle,
+                message = describe(symbol, candle, read_day(upto, prev_close),
                                    read_lean(upto, baseline=minute_base),
                                    multiple)
                 candle_spike = is_spike(candle, multiple)
@@ -1009,26 +1137,73 @@ def self_test() -> int:
     if read_lean(pd.DataFrame()) is not None:
         failures.append("no bars should yield no reading, not a default one")
 
-    # --- messages ----------------------------------------------------------
-    minute = Candle(at=at, open=152.30, high=152.45, low=152.28, close=152.41,
-                    volume=18_200, trades=131, usual_volume=13_000)
-    forming = Candle(at=at.replace(minute=35), open=152.18, high=152.45,
-                     low=152.05, close=152.41, volume=42_100)
-    update = describe_minute("SPCX", minute, forming, buyers)
-    for needed in ("Minute volume", "forming", "Volume leaning"):
-        if needed not in update:
-            failures.append(f"the minute update should carry {needed!r}")
+    # --- the slider --------------------------------------------------------
+    # A reading at either end must put the knob at that end, and the
+    # middle must stay neutral: a hue at the midpoint would colour
+    # "balanced" as though the tape were saying something.
+    ends = (Lean(0.0, 0, 10, 5).slider, Lean(1.0, 10, 0, 5).slider)
+    if ends[0].index(TRACK_KNOB) != 0:
+        failures.append("a floor reading should park the knob at the left end")
+    if ends[1].index(TRACK_KNOB) != len(ends[1]) - 1:
+        failures.append("a ceiling reading should park the knob at the right end")
+    if TRACK[TRACK_CELLS // 2] != "\u2b1c":
+        failures.append("the middle of the track must be neutral, not a hue")
+    if len(set(TRACK)) != 3:
+        failures.append(f"the track should be two hues and a neutral, "
+                        f"got {len(set(TRACK))} colours")
+    for score in (0.0, 0.25, 0.5, 0.75, 1.0):
+        if Lean(score, 5, 5, 5).slider.count(TRACK_KNOB) != 1:
+            failures.append(f"exactly one knob, at {score}")
 
-    alarm = describe("SPCX", up, buyers)
-    for needed in ("Open", "Close", "High", "Low", "Upper wick", "Lower wick", "Volume"):
-        if needed not in alarm:
-            failures.append(f"the candle alarm should carry {needed!r}")
+    # --- the day's context -------------------------------------------------
+    day = Day(last=153.60, high=154.00, low=150.00, prev_close=150.50,
+              vwap=152.90)
+    if abs(day.change_pct - 2.0598) > 0.01:
+        failures.append(f"the day's move is measured from yesterday's close, "
+                        f"got {day.change_pct}")
+    if Day(last=1.0, high=2.0, low=0.0).change_pct is not None:
+        failures.append("no previous close means no percentage, not a zero")
+    if day.place != "upper half":
+        failures.append(f"90% of the range is the upper half, got {day.place}")
+    if Day(last=150.0, high=154.0, low=150.0).place != "at the low":
+        failures.append("a price on the day's low reads 'at the low'")
+    if Day(last=154.0, high=154.0, low=150.0).place != "at the high":
+        failures.append("a price on the day's high reads 'at the high'")
+    if Day(last=10.0, high=10.0, low=10.0).place is not None:
+        failures.append("a day with no range has no position in it")
+    if "above VWAP" not in (day.vwap_gap() or ""):
+        failures.append(f"153.60 is above a VWAP of 152.90: {day.vwap_gap()}")
+    if Day(last=1.0, high=2.0, low=0.0).vwap_gap() is not None:
+        failures.append("no VWAP means no VWAP line, not a zero gap")
+
+    # --- messages ----------------------------------------------------------
+    alarm = describe("SPCX", up, day, buyers)
+    if TRACK_KNOB not in alarm:
+        failures.append("every reading should carry its slider")
+    if "+2.06% today" not in alarm:
+        failures.append(f"the day's move belongs on the first line: {alarm}")
+    # Four lines of reading, plus the volume alarm when there is one.
+    if len(alarm.splitlines()) > 5:
+        failures.append(f"five lines at most, got {len(alarm.splitlines())}")
+    if len(describe("SPCX", Candle(at=up.at, open=up.open, high=up.high,
+                                   low=up.low, close=up.close,
+                                   volume=up.volume), day,
+                    buyers).splitlines()) != 4:
+        failures.append("a quiet reading is four lines")
+    for gone in ("Upper wick", "Lower wick", "Open ", "forming"):
+        if gone in alarm:
+            failures.append(f"{gone!r} belongs on the PDF, not the phone")
     if "pre-market" in alarm:
         failures.append("09:35 is not pre-market")
     if "pre-market" not in describe("SPCX", Candle(
             at=at.replace(hour=8, minute=55), open=152.0, high=152.1, low=151.9,
             close=152.05, volume=1_200)):
         failures.append("08:55 should be marked pre-market")
+    # A message with nothing to say still says the price.
+    bare = describe("SPCX", Candle(at=up.at, open=up.open, high=up.high,
+                                   low=up.low, close=up.close, volume=up.volume))
+    if "SPCX" not in bare or len(bare.splitlines()) != 1:
+        failures.append(f"with no context, one line: {bare!r}")
 
     if PRIORITY_UPDATE >= PRIORITY_SUMMARY:
         failures.append("the routine stream must be quieter than the alarm")
@@ -1084,10 +1259,14 @@ def self_test() -> int:
     if not (WINDOW_START < DETAIL_UNTIL <= WINDOW_END):
         failures.append("the detail window should sit inside the session window")
 
-    print(update)
-    print()
     print("-" * 56)
     print(alarm)
+    print("-" * 56)
+    noon = datetime.combine(date(2026, 9, 18), time(10, 35), tzinfo=ET)
+    print(describe("SPCX", Candle(at=noon, open=153.1, high=154.05, low=153.0,
+                                  close=153.95, volume=96_000, trades=540,
+                                  usual_volume=40_000), day,
+                   Lean(0.94, 99_000, 1_000, 5, volume_ratio=2.4)))
     print("-" * 56)
     print(f"\n  Ten minutes → candles          : {len(rolled)}, aligned to the clock")
     print("  Forming bar dropped            : minute and candle")

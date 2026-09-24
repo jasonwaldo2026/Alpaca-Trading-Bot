@@ -146,6 +146,25 @@ def add_macd(frame: pd.DataFrame, macd: Macd) -> pd.DataFrame:
     return df
 
 
+def add_vwap(session: pd.DataFrame) -> pd.DataFrame:
+    """Session-anchored VWAP on a frame that is already one trading day.
+
+    Anchored, not rolling: VWAP is the running average price *within* a
+    day and resets each morning, which is the line every charting
+    platform draws. A rolling window would drift further from price with
+    every session and agree with nothing on your screen.
+
+    It lives here, alone, because the alerts quote it and the report
+    draws it. Two copies of this arithmetic would eventually disagree,
+    and the disagreement would be invisible until it mattered.
+    """
+    df = session.copy()
+    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    cum_volume = df["volume"].cumsum()
+    df["vwap"] = (typical * df["volume"]).cumsum() / cum_volume.replace(0, pd.NA)
+    return df
+
+
 def prepare(raw: pd.DataFrame, macd: Macd) -> pd.DataFrame:
     """Indicators on a full extended-hours frame, trimmed to regular hours.
 
@@ -174,9 +193,7 @@ def prepare(raw: pd.DataFrame, macd: Macd) -> pd.DataFrame:
     if session.empty:
         return session
 
-    typical = (session["high"] + session["low"] + session["close"]) / 3.0
-    cum_volume = session["volume"].cumsum()
-    session["vwap"] = (typical * session["volume"]).cumsum() / cum_volume.replace(0, pd.NA)
+    session = add_vwap(session)
 
     avg_volume = session["volume"].rolling(VOLUME_LOOKBACK_BARS).mean()
     session["volume_ratio"] = session["volume"] / avg_volume.replace(0, pd.NA)
