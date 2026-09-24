@@ -75,7 +75,15 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-import lockups
+try:
+    import lockups
+except ImportError:            # noqa: F401 -- the calendar is a convenience
+    # ...and the session is not. lockups.py already treats a missing or
+    # broken lockups.json as an empty calendar; importing it hard made the
+    # module itself mandatory, so one file that failed to copy took the
+    # whole morning down at 09:25. Losing the unlock line is a cost worth
+    # paying; losing the tape is not.
+    lockups = None
 from feed_check import ET, load_credentials, load_env, parse_clock, trading_days
 from spcx_alert import (
     PRIORITY_SUMMARY,
@@ -737,7 +745,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
     # The calendar before the tape. A known share unlock outweighs anything
     # the next six hours of minute bars will say, and it is the one thing
     # here that is knowable in advance.
-    notice = lockups.headline(symbol, today)
+    notice = lockups.headline(symbol, today) if lockups else None
     if notice:
         print("=" * 56)
         print(f"  {notice}")

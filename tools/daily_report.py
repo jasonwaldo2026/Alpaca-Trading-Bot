@@ -41,7 +41,15 @@ import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Rectangle
 
-import lockups
+try:
+    import lockups
+except ImportError:            # noqa: F401 -- the calendar is a convenience
+    # ...and the session is not. lockups.py already treats a missing or
+    # broken lockups.json as an empty calendar; importing it hard made the
+    # module itself mandatory, so one file that failed to copy took the
+    # whole morning down at 09:25. Losing the unlock line is a cost worth
+    # paying; losing the tape is not.
+    lockups = None
 from feed_check import ET, add_macd, load_env, parse_clock, trading_days
 from spcx_alert import MACD_SETTING, WARMUP_MINUTES
 from open_candles import BAR_MINUTES, aggregate, fetch_minutes, read_lean, thousands
@@ -271,7 +279,7 @@ def band(fig, session: Session) -> None:
     if session.benchmark:
         market, market_pct = session.benchmark
         notes.append(f"{market} {market_pct:+.2f}% over the same window")
-    unlock = lockups.headline(session.symbol, session.day)
+    unlock = lockups.headline(session.symbol, session.day) if lockups else None
     if unlock:
         notes.append(unlock)
     if notes:

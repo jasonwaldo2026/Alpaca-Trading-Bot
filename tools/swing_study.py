@@ -54,7 +54,10 @@ from typing import Dict, List, Sequence, Tuple
 
 import pandas as pd
 
-import lockups
+try:
+    import lockups
+except ImportError:            # noqa: F401 -- the calendar is a convenience
+    lockups = None             # a study is still a study without unlock dates
 from feed_check import (
     CONDITIONS,
     DEFAULT_MACD,
@@ -657,7 +660,8 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
         print("   the spread and counts as zero however it is signed.")
 
     # ---- 8. what actually happened on unlock days -----------------------
-    dated = [u for u in lockups.for_symbol(symbol) if u.day and u.day in sessions]
+    dated = [u for u in (lockups.for_symbol(symbol) if lockups else [])
+             if u.day and u.day in sessions]
     if dated:
         print("\n8. UNLOCK DAYS\n")
         print(f"   {len(dated)} dated unlock(s) fall inside this window. This is what")

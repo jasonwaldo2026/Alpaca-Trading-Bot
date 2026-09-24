@@ -38,7 +38,15 @@ import matplotlib.pyplot as plt  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib.backends.backend_pdf import PdfPages  # noqa: E402
 
-import lockups  # noqa: E402
+try:
+    import lockups
+except ImportError:            # noqa: F401 -- the calendar is a convenience
+    # ...and the session is not. lockups.py already treats a missing or
+    # broken lockups.json as an empty calendar; importing it hard made the
+    # module itself mandatory, so one file that failed to copy took the
+    # whole morning down at 09:25. Losing the unlock line is a cost worth
+    # paying; losing the tape is not.
+    lockups = None
 from daily_report import (  # noqa: E402
     ACCENT, AXIS, DOWN, INK, INK_2, MUTED, SECOND, SURFACE, UP, reveal,
 )
@@ -142,7 +150,7 @@ def ticks(days: List[date], count: int = 9):
 def mark_unlocks(ax, comparison: Comparison, label: bool = False) -> List[int]:
     """Vertical rules at every unlock inside the window."""
     positions = []
-    for unlock in lockups.for_symbol(comparison.symbol):
+    for unlock in (lockups.for_symbol(comparison.symbol) if lockups else []):
         if unlock.day is None or unlock.day not in comparison.days:
             continue
         i = comparison.days.index(unlock.day)
@@ -260,7 +268,7 @@ def table_page(pdf: PdfPages, comparison: Comparison) -> None:
     """Every unlock in the window, and how that day actually went."""
     stock_moves, market_moves = comparison.daily_moves()
     rows = []
-    for unlock in lockups.for_symbol(comparison.symbol):
+    for unlock in (lockups.for_symbol(comparison.symbol) if lockups else []):
         if unlock.day is None or unlock.day not in comparison.days:
             continue
         i = comparison.days.index(unlock.day)
