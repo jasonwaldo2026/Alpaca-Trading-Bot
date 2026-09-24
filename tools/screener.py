@@ -71,8 +71,8 @@ class Measured:
     range_pct: float          # median (high-low)/open
     dollar_volume: float      # median close * volume
     worthwhile: float         # share of days clearing WORTHWHILE_RANGE_PCT
-    morning_share: Optional[float]   # share of the day's range done by 11:00
-    trade_size: Optional[float]      # median shares per trade
+    morning_share: Optional[float]   # share of the day's movement done by 11:00
+    trade_dollars: Optional[float]   # median dollars per trade
 
     @property
     def thin(self) -> bool:
@@ -119,8 +119,33 @@ def daily_bars(symbol: str, start: date, end: date) -> pd.DataFrame:
     return frame.tz_convert(ET).sort_index()
 
 
+def morning_path_share(bars: pd.DataFrame) -> Optional[float]:
+    """Share of the day's *travelled distance* that happened before 11:00.
+
+    Distance, not range. The obvious version of this -- the morning's
+    high-to-low over the day's high-to-low -- measures where the day's two
+    extremes landed, and returns exactly 1.0 whenever both were set before
+    11:00. A stock that grinds upward all afternoon without exceeding its
+    10:15 high scores 100%, as though the afternoon had not happened, so
+    the column saturates and separates nothing.
+
+    Summing each minute's absolute move cannot saturate that way: an
+    afternoon that keeps working adds to the denominator whether or not it
+    sets a new extreme. A name genuinely finished by 11:00 still reads
+    high; one that merely opened wide drops to a truthful figure.
+    """
+    if bars.empty:
+        return None
+    step = bars["close"].diff().abs()
+    full = float(step.sum())
+    if full <= 0:
+        return None
+    early = float(step[bars.index.time < MORNING_END].sum())
+    return early / full
+
+
 def morning_share(symbol: str, days: Sequence[date]) -> Optional[float]:
-    """Median share of the day's range that had happened by 11:00.
+    """The median of `morning_path_share` over a handful of sessions.
 
     The question is not whether a stock moves but whether it moves while
     you are able to watch it. A name that does all its work at 15:45 is
@@ -138,15 +163,9 @@ def morning_share(symbol: str, days: Sequence[date]) -> Optional[float]:
                                  force_sip=True)
         except Exception:  # noqa: BLE001 -- one thin day is not the measurement
             continue
-        if bars.empty:
-            continue
-        full = float(bars["high"].max() - bars["low"].min())
-        if full <= 0:
-            continue
-        early = bars[bars.index.time < MORNING_END]
-        if early.empty:
-            continue
-        shares.append(float(early["high"].max() - early["low"].min()) / full)
+        share = morning_path_share(bars)
+        if share is not None:
+            shares.append(share)
     if not shares:
         return None
     return float(pd.Series(shares).median())
@@ -160,10 +179,14 @@ def measure(symbol: str, days: int, morning_days: int) -> Optional[Measured]:
 
     ranges = 100.0 * (bars["high"] - bars["low"]) / bars["open"]
     dollars = bars["close"] * bars["volume"]
-    size = None
+    # Dollars per trade, not shares. A share count compares the two
+    # stocks' prices: the same money buys ten times the shares of a $25
+    # name as of a $250 one, so SOFI reading 289 against TSLA's 39 says
+    # only that SOFI is cheap. Dollars are comparable across price levels.
+    per_trade = None
     if "trade_count" in bars:
         counts = bars["trade_count"].replace(0, pd.NA)
-        size = float((bars["volume"] / counts).median())
+        per_trade = float((dollars / counts).median())
 
     sample = [d.date() for d in bars.index[-morning_days:]] if morning_days else []
     return Measured(
@@ -173,7 +196,7 @@ def measure(symbol: str, days: int, morning_days: int) -> Optional[Measured]:
         dollar_volume=float(dollars.median()),
         worthwhile=float((ranges >= WORTHWHILE_RANGE_PCT).mean()),
         morning_share=morning_share(symbol, sample) if sample else None,
-        trade_size=size,
+        trade_dollars=per_trade,
     )
 
 
@@ -181,6 +204,15 @@ def money(value: float) -> str:
     if value >= 1_000_000_000:
         return f"${value / 1_000_000_000:.1f}bn"
     return f"${value / 1_000_000:.0f}M"
+
+
+def small_money(value: float) -> str:
+    """Per-trade sizes live in the thousands, where money() reads $0M."""
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"${value / 1_000:.1f}k"
+    return f"${value:.0f}"
 
 
 # ---------------------------------------------------------------------------
@@ -198,10 +230,10 @@ def report(rows: List[Measured], days: int) -> None:
     print("  against each other and the trade-off is yours, not a formula's.\n")
 
     print(f"  {'Symbol':<9}{'Days':>6}{'Range':>9}{'>=1%':>8}{'$ volume':>12}"
-          f"{'Morning':>10}{'Sh/trade':>11}")
+          f"{'Morning':>10}{'$/trade':>11}")
     for row in sorted(rows, key=lambda r: -r.range_pct):
         morning = f"{row.morning_share * 100:.0f}%" if row.morning_share else "--"
-        size = f"{row.trade_size:.0f}" if row.trade_size else "--"
+        size = small_money(row.trade_dollars) if row.trade_dollars else "--"
         flag = "  thin" if row.thin else ""
         mark = " <" if row.symbol == REFERENCE else ""
         print(f"  {row.symbol:<9}{row.days:>6}{row.range_pct:>8.2f}%"
@@ -211,9 +243,10 @@ def report(rows: List[Measured], days: int) -> None:
     print("\n  Range     median daily high-to-low, as a % of the open")
     print("  >=1%      share of sessions that moved at least 1%")
     print("  $ volume  median dollars traded a day -- can you get out")
-    print(f"  Morning   share of the day's range done by {MORNING_END:%H:%M},")
-    print("            which is the only part of the day you can watch")
-    print("  Sh/trade  median shares per trade, a hint at who is trading it")
+    print(f"  Morning   share of the day's movement done by {MORNING_END:%H:%M},")
+    print("            which is the only part of the day you can watch.")
+    print("            Distance travelled, not the spread of the extremes")
+    print("  $/trade   median dollars per trade, a hint at who is trading it")
     if any(r.thin for r in rows):
         print(f"\n  'thin' marks under {money(THIN_DOLLAR_VOLUME)} a day. Shown rather")
         print("  than filtered out: a screen that hides its rejects teaches")
@@ -310,7 +343,7 @@ def render_pdf(rows: List[Measured], days: int, path: str) -> str:
                  loc="left", size=9.5, color=INK_2, pad=6)
     ax.spines[["top", "right"]].set_visible(False)
 
-    heads = ("Symbol", "Range", ">=1%", "$ volume", "Morning", "Sh/trade")
+    heads = ("Symbol", "Range", ">=1%", "$ volume", "Morning", "$/trade")
     xs = (0.045, 0.165, 0.265, 0.365, 0.495, 0.605)
     for x, head in zip(xs, heads):
         fig.text(x, 0.395, head.upper(), size=7.5, color=MUTED)
@@ -321,7 +354,7 @@ def render_pdf(rows: List[Measured], days: int, path: str) -> str:
         cells = (row.symbol, f"{row.range_pct:.2f}%",
                  f"{row.worthwhile * 100:.0f}%", money(row.dollar_volume),
                  f"{row.morning_share * 100:.0f}%" if row.morning_share else "--",
-                 f"{row.trade_size:.0f}" if row.trade_size else "--")
+                 small_money(row.trade_dollars) if row.trade_dollars else "--")
         for x, cell in zip(xs, cells):
             fig.text(x, y, cell, size=9.5, color=tone)
         y -= 0.034
@@ -379,6 +412,51 @@ def self_test() -> int:
 
     if money(2.4e9) != "$2.4bn" or money(4.7e7) != "$47M":
         failures.append(f"money() formatting: {money(2.4e9)}, {money(4.7e7)}")
+    if small_money(4900) != "$4.9k" or small_money(820) != "$820":
+        failures.append(f"small_money(): {small_money(4900)}, {small_money(820)}")
+
+    # The morning column's whole point. This synthetic day sets BOTH its
+    # extremes before 11:00 and then oscillates all afternoon inside that
+    # band. The old high-to-low definition scored it 100% -- the afternoon
+    # was invisible to it. Distance travelled must not.
+    index = pd.date_range("2026-09-23 09:30", "2026-09-23 15:59",
+                          freq="1min", tz=ET)
+    closes = []
+    for stamp in index:
+        if stamp.time() < MORNING_END:
+            closes.append(102.0 if len(closes) % 2 else 98.0)   # sets the extremes
+        else:
+            closes.append(101.0 if len(closes) % 2 else 99.0)   # busy, inside them
+    busy = pd.DataFrame({"close": closes, "high": closes, "low": closes},
+                        index=index)
+    share = morning_path_share(busy)
+    extremes = ((busy[busy.index.time < MORNING_END]["high"].max()
+                 - busy[busy.index.time < MORNING_END]["low"].min())
+                / (busy["high"].max() - busy["low"].min()))
+    if share is None or share > 0.60:
+        failures.append(f"a busy afternoon must not read as a finished day: "
+                        f"{share}")
+    if round(extremes, 6) != 1.0:
+        failures.append("the fixture should saturate the old definition, "
+                        f"got {extremes}")
+
+    # A dead afternoon should still read high -- the fix must not simply
+    # push every symbol down.
+    quiet = busy.copy()
+    quiet.loc[quiet.index.time >= MORNING_END, ["close", "high", "low"]] = 100.0
+    if (morning_path_share(quiet) or 0) < 0.95:
+        failures.append("a day that truly finished by 11:00 should read high")
+
+    if morning_path_share(pd.DataFrame({"close": [], "high": [], "low": []},
+                                       index=pd.DatetimeIndex([], tz=ET))) is not None:
+        failures.append("an empty day should be skipped, not scored")
+
+    # $/trade must compare across price levels: same money per trade, same
+    # number, whatever the share price.
+    cheap = Measured("CHEAP", 60, 3.0, 1e9, 0.9, 0.5, 5_000.0)
+    dear = Measured("DEAR", 60, 3.0, 1e9, 0.9, 0.5, 5_000.0)
+    if small_money(cheap.trade_dollars) != small_money(dear.trade_dollars):
+        failures.append("dollars per trade should not depend on share price")
 
     # Candidate resolution, in its stated order of preference.
     if candidates(explicit="aapl, nvda ,") != ["AAPL", "NVDA"]:
@@ -408,6 +486,9 @@ def self_test() -> int:
     print(f"  Ranking                        : {' > '.join(ordered)}")
     print("  Thin symbols                   : shown, not filtered")
     print("  Crowded chart labels           : flipped, not stacked")
+    print(f"  Morning column                 : busy afternoon reads "
+          f"{share * 100:.0f}%, not 100%")
+    print("  $/trade                        : independent of share price")
     print("  Candidate file                 : comments and blanks stripped")
     print(f"  Missing candidate file         : falls back to {len(FALLBACK_CANDIDATES)} names")
     print("  Trading client in this file    : none")
