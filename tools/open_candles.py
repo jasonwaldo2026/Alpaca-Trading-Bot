@@ -957,6 +957,48 @@ BUILT_IN_SOUNDS = frozenset((
 ))
 
 
+#: The commit that taught send_pushover to carry a sound. Named in the
+#: message rather than left for someone to work out.
+SOUNDS_FROM_COMMIT = "8c94c8e"
+
+
+def sounds_supported() -> bool:
+    """Does the send_pushover we imported accept a sound?
+
+    Python resolves a keyword argument when the call runs, not when the
+    module loads. These two files travel separately and have been mixed
+    five times; the fifth was a new open_candles calling an old
+    send_pushover, and it got through the credential check, the device
+    check and the message before raising TypeError on the send.
+
+    Live, that call happens only when an alarm fires -- so the watcher
+    would have run all morning and died at the first ring, which is the
+    one moment it exists for. Asking at startup turns that into a
+    refusal to start.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(send_pushover).parameters
+    except (TypeError, ValueError):  # not introspectable: not our business
+        return True
+    # A wrapper taking **kwargs passes a sound straight through, so it is
+    # not stale even though no parameter is named.
+    if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        return True
+    return "sound" in params
+
+
+def stale_sender() -> Optional[str]:
+    """One line naming the problem and the fix, or None when all is well."""
+    if sounds_supported():
+        return None
+    return (f"spcx_alert.py is out of date: its send_pushover() takes no "
+            f"sound, so no alarm could play one.\n"
+            f"  Re-download it from {SOUNDS_FROM_COMMIT} or later, into the "
+            f"same folder as this file.")
+
+
 def test_push(buy_sound: str = SOUND_BUY, sell_sound: str = SOUND_SELL,
               pause: int = 6) -> int:
     """Send one of each kind to the phone, and say what happened.
@@ -969,6 +1011,10 @@ def test_push(buy_sound: str = SOUND_BUY, sell_sound: str = SOUND_SELL,
     one is a trap -- you would find it on a Monday and act on it.
     """
     load_env()
+    stale = stale_sender()
+    if stale:
+        print(f"{stale}\n")
+        return 1
     print("Checking the path to your phone...\n")
 
     present = {name: bool(os.getenv(name, "").strip())
@@ -1457,6 +1503,48 @@ def self_test() -> int:
         if Lean(score, 5, 5, 5).slider.count(TRACK_KNOB) != 1:
             failures.append(f"exactly one knob, at {score}")
 
+    # --- the guard against a half-updated folder ---------------------------
+    # Five mixes so far. The fifth could have waited until an alarm fired
+    # to show itself, which is the only moment this tool exists for.
+    if not sounds_supported():
+        failures.append("the sender in this folder takes no sound — these "
+                        "files are mismatched")
+    if stale_sender() is not None:
+        failures.append("with a current sender there is nothing to report")
+
+    def old_sender(message, title="", priority=0, attachment=None):
+        return None
+
+    # sys.modules[__name__], not "import open_candles": run as a script
+    # this module is __main__, and importing it by name would load a
+    # second copy whose globals the patch below would never reach.
+    import sys as _sys
+    _self = _sys.modules[__name__]
+    kept = _self.send_pushover
+    _self.send_pushover = old_sender
+    try:
+        if sounds_supported():
+            failures.append("a sender without 'sound' must be detected")
+        note = stale_sender()
+        if not note or "spcx_alert.py" not in note:
+            failures.append(f"the warning should name the file: {note!r}")
+        if not note or SOUNDS_FROM_COMMIT not in note:
+            failures.append("the warning should name the commit to fetch")
+        if _self.test_push(pause=0) != 1:
+            failures.append("test_push must refuse rather than crash on a "
+                            "stale sender")
+    finally:
+        _self.send_pushover = kept
+
+    # A wrapper that takes **kwargs passes a sound through untouched and
+    # must not be mistaken for an old file.
+    _self.send_pushover = lambda *a, **k: None
+    try:
+        if not sounds_supported():
+            failures.append("a **kwargs sender should not be called stale")
+    finally:
+        _self.send_pushover = kept
+
     # --- the test push -----------------------------------------------------
     # These are promises about a function that talks to a phone, so they
     # are checked by reading it rather than by running it.
@@ -1706,6 +1794,8 @@ def self_test() -> int:
     print("  23 Sep replayed                : 1 ring of 5 volume spikes")
     print("  Test push                      : devices and sound names "
           "checked first")
+    print("  Half-updated folder            : refused at startup, not at "
+          "the first alarm")
     print("  Trading client in this file    : none")
 
     if failures:
@@ -1763,6 +1853,12 @@ def main() -> int:
 
     if args.self_test:
         return self_test()
+    # Before anything long-running. A mismatch found at 09:41 is a
+    # mismatch found too late.
+    stale = stale_sender()
+    if stale and not args.list_sounds:
+        print(f"{stale}\n")
+        return 1
     if args.list_sounds:
         return list_sounds()
     if args.test_push:
