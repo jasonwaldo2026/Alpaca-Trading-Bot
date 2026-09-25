@@ -428,15 +428,19 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
 
     fig = plt.figure(figsize=(11.7, 8.3))
     band(fig, session)
+    # Price, then volume beneath it, then MACD in its own pane -- the order
+    # every charting platform uses, so the page reads the way the screen
+    # does. The mood ribbon stays tucked under the candles: it is a
+    # decoration of the price panel rather than a chart of its own.
     grid = fig.add_gridspec(6, 1,
-                            height_ratios=[3.0, 0.20, 1.30, 1.00, 1.10, 0.72],
+                            height_ratios=[3.0, 0.20, 1.05, 1.30, 1.00, 0.72],
                             hspace=0.23, left=0.062, right=0.965,
                             top=0.879, bottom=0.052)
     price = fig.add_subplot(grid[0])
     strip_ax = fig.add_subplot(grid[1], sharex=price)
-    macd_ax = fig.add_subplot(grid[2], sharex=price)
-    lean_ax = fig.add_subplot(grid[3], sharex=price)
-    vol_ax = fig.add_subplot(grid[4], sharex=price)
+    vol_ax = fig.add_subplot(grid[2], sharex=price)
+    macd_ax = fig.add_subplot(grid[3], sharex=price)
+    lean_ax = fig.add_subplot(grid[4], sharex=price)
     size_ax = fig.add_subplot(grid[5], sharex=price)
 
     # --- price ------------------------------------------------------------
@@ -568,11 +572,17 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
         ratios = [row["volume"] / session.baseline[s.time()]
                   if s.time() in session.baseline and session.baseline[s.time()] else float("nan")
                   for s, (_, row) in zip(stamps, candles.iterrows())]
+        # Red and green by the candle the volume belongs to, the way a
+        # trading platform draws it: a heavy bar under a red candle and a
+        # heavy bar under a green one mean opposite things, and a single
+        # hue for both made the reader look up to find out which.
+        rising = [row["close"] >= row["open"] for _, row in candles.iterrows()]
         vol_ax.bar(x, ratios, width=0.6,
-                   color=[ACCENT if (r == r and r >= 1) else MUTED for r in ratios])
+                   color=[UP if up else DOWN for up in rising],
+                   alpha=0.85)
         vol_ax.axhline(1.0, color=INK_2, linewidth=1, linestyle=(0, (2, 2)))
-        for i, r in enumerate(ratios):
-            if r == r and r >= 1.5:
+        for i, r in zip(x, ratios):
+            if r == r and i == i and r >= 1.5:
                 vol_ax.text(i, r, f"{r:.1f}\u00d7", ha="center", va="bottom",
                             size=7.5, color=INK_2)
         vol_ax.set_ylabel("\u00d7 usual")
@@ -604,7 +614,7 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
             ax.axvline(sx, color=ACCENT, linewidth=0.7, alpha=0.18, zorder=0)
 
     idx, labels = tick_positions(slots, label_every(slots))
-    for ax in (price, strip_ax, macd_ax, lean_ax, vol_ax):
+    for ax in (price, strip_ax, vol_ax, macd_ax, lean_ax):
         ax.tick_params(labelbottom=False)
     size_ax.set_xlim(-0.8, len(slots) - 0.2)
     size_ax.set_xticks(idx)
