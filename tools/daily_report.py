@@ -160,6 +160,8 @@ class Session:
     baseline: Dict[time, float]
     signals: pd.DataFrame
     macd: pd.DataFrame        # 1-minute, the bars the alerts read
+    start: time = WINDOW_START      # the window the page is drawn for,
+    end: time = WINDOW_END          # not the part of it that has printed
     benchmark: Optional[Tuple[str, float]] = None   # (symbol, % over the window)
 
 
@@ -270,6 +272,7 @@ def gather(symbol: str, day: date, start: time, end: time, db_path: str,
         baseline=slot_baseline(symbol, day, start, end, force_sip=force_sip),
         signals=logged_signals(db_path, symbol, day),
         macd=macd,
+        start=start, end=end,
         benchmark=market_move(benchmark, day, start, end, force_sip),
     )
 
@@ -330,6 +333,20 @@ def band(fig, session: Session) -> None:
         fig.text(0.045, 0.9035, "  ·  ".join(notes), size=8, color=INK_2)
 
 
+def label_every(slots) -> int:
+    """Minutes between time labels, so a full session is not a picket fence.
+
+    Fifteen-minute labels are right for an hour of tape and unreadable
+    across a whole session -- twenty-seven of them, overlapping. Aim for
+    roughly a dozen either way.
+    """
+    if len(slots) <= 36:
+        return 15
+    if len(slots) <= 96:
+        return 30
+    return 60
+
+
 def tick_positions(stamps, every: int):
     idx = [i for i, s in enumerate(stamps) if s.minute % every == 0]
     return idx, [f"{stamps[i]:%H:%M}" for i in idx]
@@ -344,6 +361,29 @@ def panel_label(ax, text: str) -> None:
     covers the data is not a saving.
     """
     ax.set_title(text, loc="left", size=8.5, color=INK_2, weight="normal", pad=3.5)
+
+
+def session_slots(session: "Session") -> list:
+    """Every candle slot in the window, printed or not.
+
+    The axis used to span however many candles had arrived, so at 09:55
+    six candles shared the whole panel and each was drawn a sixth of it
+    wide. The candles were not wide; the axis was narrow, and they
+    inflated to fill it -- which also meant the same bar was a different
+    size at 10:00 than at 14:00 and no two rebuilds were comparable.
+
+    Positioning on the full grid fixes the geometry for the whole day and
+    makes the axis time rather than bar number: a slot that never traded
+    leaves a gap where it happened instead of closing up and shifting
+    every later bar to the left.
+    """
+    opens = datetime.combine(session.day, session.start, tzinfo=ET)
+    closes = datetime.combine(session.day, session.end, tzinfo=ET)
+    slots, at = [], opens
+    while at < closes:
+        slots.append(at)
+        at += timedelta(minutes=BAR_MINUTES)
+    return slots
 
 
 def minute_positions(stamps, macd_index):
@@ -380,7 +420,11 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
     """
     candles = session.candles
     stamps = list(candles.index)
-    x = list(range(len(stamps)))
+    # Positions are slots in the whole session, not places in the list of
+    # bars that happen to have printed. See session_slots().
+    slots = session_slots(session)
+    slot_of = {stamp: i for i, stamp in enumerate(slots)}
+    x = [slot_of.get(stamp, float("nan")) for stamp in stamps]
 
     fig = plt.figure(figsize=(11.7, 8.3))
     band(fig, session)
@@ -396,7 +440,9 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
     size_ax = fig.add_subplot(grid[5], sharex=price)
 
     # --- price ------------------------------------------------------------
-    for i, (_, row) in enumerate(candles.iterrows()):
+    for i, (_, row) in zip(x, candles.iterrows()):
+        if i != i:      # a bar outside the drawn window
+            continue
         rising = row["close"] >= row["open"]
         colour = UP if rising else DOWN
         price.vlines(i, row["low"], row["high"], color=colour, linewidth=1.1)
@@ -422,8 +468,8 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
                 stamp = row["bar_time"]
                 slot = stamp.replace(minute=stamp.minute - (stamp.minute % BAR_MINUTES),
                                      second=0, microsecond=0)
-                if slot in candles.index:
-                    xs.append(list(candles.index).index(slot))
+                if slot in slot_of:
+                    xs.append(slot_of[slot])
                     ys.append(candles.loc[slot, "low"] * 0.9985)
             if xs:
                 price.scatter(xs, ys, marker=marker, s=58, color=ACCENT,
@@ -440,7 +486,7 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
     # --- MACD, on the 1-minute bars the alerts read -----------------------
     macd = session.macd
     if not macd.empty:
-        mx = minute_positions(stamps, macd.index)
+        mx = minute_positions(slots, macd.index)
         macd_ax.axhline(0, color=AXIS, linewidth=1)
         gaps = macd["macd_gap"].tolist()
         macd_ax.bar(mx, gaps, width=1.0 / BAR_MINUTES,
@@ -459,7 +505,7 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
         # say why, rather than leaving an unexplained gap or, worse,
         # drawing the warm-up curve as though it meant something.
         if macd.index[0] > stamps[0]:
-            edge = minute_positions(stamps, [macd.index[0]])[0]
+            edge = minute_positions(slots, [macd.index[0]])[0]
             macd_ax.axvspan(-0.8, edge, color=PLANE, zorder=0)
             macd_ax.text((edge - 0.8) / 2, macd_ax.get_ylim()[0],
                          f"settling until {macd.index[0]:%H:%M}",
@@ -505,8 +551,8 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
     # The line above answers "how strong, exactly"; this answers "who had
     # the tape, and for how long" without anyone tracing a line. Same
     # numbers, same bands, no axis -- the whole session's mood as a stripe.
-    for i, score in enumerate(scores):
-        if score != score:      # NaN: a stretch with no reading
+    for i, score in zip(x, scores):
+        if score != score or i != i:    # NaN: no reading, or outside the window
             continue
         colour, _ = sentiment_colour(score)
         strip_ax.axvspan(i - 0.5, i + 0.5, color=colour,
@@ -557,10 +603,10 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
         for sx in signal_x:
             ax.axvline(sx, color=ACCENT, linewidth=0.7, alpha=0.18, zorder=0)
 
-    idx, labels = tick_positions(stamps, 15)
+    idx, labels = tick_positions(slots, label_every(slots))
     for ax in (price, strip_ax, macd_ax, lean_ax, vol_ax):
         ax.tick_params(labelbottom=False)
-    size_ax.set_xlim(-0.8, len(stamps) - 0.2)
+    size_ax.set_xlim(-0.8, len(slots) - 0.2)
     size_ax.set_xticks(idx)
     size_ax.set_xticklabels(labels, size=8)
     size_ax.set_xlabel("Eastern time")
