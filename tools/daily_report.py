@@ -60,7 +60,9 @@ from open_candles import BAR_MINUTES, aggregate, fetch_minutes, read_lean, thous
 from spcx_alert import open_db
 
 SYMBOL = "SPCX"
-WINDOW_START = time(9, 25)
+#: Matches open_candles: the page covers the run-up as well as the
+#: session, so the tape a signal was read from is on the chart.
+WINDOW_START = time(9, 15)
 WINDOW_END = time(16, 0)
 BASELINE_SESSIONS = 10
 

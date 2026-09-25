@@ -99,7 +99,11 @@ from spcx_alert import (
 
 SYMBOL = "SPCX"
 BAR_MINUTES = 5
-WINDOW_START = time(9, 25)
+#: Fifteen minutes before the bell. Early enough to watch the run-up
+#: into the open, and far enough from it that the first real candle is
+#: not also the first thing on the page. The clock dial deliberately
+#: still starts at 09:30: it charts market hours, this charts a morning.
+WINDOW_START = time(9, 15)
 WINDOW_END = time(16, 0)
 
 # Up to here the phone gets everything: a quiet line each minute and an
