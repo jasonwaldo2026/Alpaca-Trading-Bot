@@ -89,26 +89,34 @@ COOLDOWN_MINUTES = 40
 EARLIEST_SIGNAL = SESSION_OPEN
 
 #: The phone stays quiet until this. Evaluating a bar and alerting on it
-#: are two different decisions: the opening stretch is for watching the
-#: candles yourself, not for being told about them. Every qualifying bar
-#: before this is still written to the database, marked as held back.
+#: remain two different decisions -- every qualifying bar outside the
+#: window is still written to the database, marked as held back -- but
+#: the window is now the whole session.
 #:
-#: 09:40 rather than 09:45 on purpose -- five minutes of setups before the
-#: hour you would actually act on, to get your eye in rather than to be
-#: acted upon. Move it with --alert-from; what gets logged does not change.
-ALERT_FROM = time(9, 40)
+#: It was 09:40-11:00, gated on the finding that the morning carries most
+#: of the day's movement while signals fire at a flat rate all day. That
+#: gate was right for an alert meant to be acted on directly. This one is
+#: a doorbell: it says come and look, and the looking happens on Level 2
+#: and the tape, where the decision actually gets made. The 1-1.5% runs
+#: being watched for happen four or five times a session, afternoons
+#: included, and a gate that silences two thirds of the day cannot catch
+#: them. Narrow it again with --alert-from and --alert-until.
+ALERT_FROM = SESSION_OPEN
 
-#: And quiet again after this. Measured, not guessed: over 70 sessions
-#: the 09:40-11:00 stretch carried 38% of the day's 0.5% swings on 22%
-#: of the signals, while 13:00-14:30 fired most often and moved least --
-#: four consecutive half hours where the typical signal went further
-#: against you than for you. The gate buys attention, not edge: the same
-#: measurement found no advantage over entering at random inside any
-#: window. Fifteen alerts a day get ignored; three get read.
+#: And quiet again after this -- now the closing bell.
 #:
-#: Everything is still evaluated and recorded after this, exactly as
-#: before 09:40. Move it with --alert-until.
-ALERT_UNTIL = time(11, 0)
+#: The measurement that produced the old 11:00 close still stands and is
+#: worth keeping written down: over 70 sessions the 09:40-11:00 stretch
+#: carried 38% of the day's 0.5% swings on 22% of the signals, while
+#: 13:00-14:30 fired most often and moved least, four consecutive half
+#: hours where the typical signal went further against you than for you.
+#: What it does NOT say is that the afternoon is empty -- only that the
+#: signal is a worse entry there. For a doorbell answered by eye, that
+#: is a reason to look harder in the afternoon, not to sleep through it.
+#:
+#: Everything is still evaluated and recorded outside the window.
+#: Move it with --alert-until.
+ALERT_UNTIL = SESSION_CLOSE
 
 #: Bars fetched behind the current moment. MACD is an exponential average
 #: of price and carries across the session boundary, so it is warmed on
@@ -125,6 +133,16 @@ PUSHOVER_VALIDATE_URL = "https://api.pushover.net/1/users/validate.json"
 #: or vibration; 1 sounds through a focus mode.
 PRIORITY_UPDATE = -1
 PRIORITY_SUMMARY = 1
+
+#: The uploaded sound this alert rings with. It lives HERE rather than in
+#: open_candles because open_candles imports this module and the reverse
+#: would be a circular import -- but the two must name the same sound, so
+#: the self-test imports open_candles late and checks they agree.
+#:
+#: A sound name Pushover does not recognise is not an error. The message
+#: is delivered with the account's default sound and reported as sent, so
+#: a typo announces itself only as the wrong noise at 09:41.
+SOUND_SETUP = "Buy_Stock"
 
 #: Minutes after a signal at which to record what price did.
 HORIZONS_MIN = (15, 30, 60)
@@ -247,16 +265,38 @@ def fetch_recent(symbol: str, now: datetime, minutes: int = WARMUP_MINUTES) -> p
 # --------------------------------------------------------------------------
 
 def compose(symbol: str, bar_time: datetime, row: pd.Series) -> str:
-    """One line, read at arm's length on a lock screen.
+    """The setup, read at arm's length on a lock screen.
 
-    The VWAP is given as a price rather than a distance: two dollar figures
-    say which side you are on and by how much without any arithmetic, and
-    the level itself is often where price heads back to.
+    The headline is which side of the zero line the turn began on,
+    because that is the difference between the best case and the ordinary
+    one. Below zero means the fast average is still under the slow one --
+    the stock has been falling or flat, and this is a turn starting from
+    a low base rather than more of a move already under way. Above zero
+    is the same shape of turn inside an advance that has already begun.
+
+    Neither is a verdict. The alert exists to say come and look; the
+    looking happens on Level 2 and the tape.
+
+    The points of interest below the headline are a list on purpose:
+    Point of Control and the 9 EMA are meant to join it, and adding one
+    should be adding a line rather than rewriting the message.
+
+    The VWAP is given as a price rather than a distance: two dollar
+    figures say which side you are on and by how much without any
+    arithmetic, and the level itself is often where price heads back to.
     """
-    side = "below" if row["macd"] < 0 else "above"
-    return (
-        f"{symbol} {bar_time:%H:%M} — {side} zero, rising · "
-        f"${row['close']:.2f} · VWAP ${row['vwap']:.2f}"
+    below = row["macd"] < 0
+    headline = ("** R&D BELOW 0 — best case **" if below
+                else "** R&D ABOVE 0 **")
+
+    points = ["Crossed up, rising and diverging"]
+    vwap = row.get("vwap") if hasattr(row, "get") else row["vwap"]
+    if vwap is not None and pd.notna(vwap):
+        where = "above" if row["close"] >= vwap else "below"
+        points.append(f"Price {where} VWAP ${vwap:.2f}")
+
+    return "\n".join(
+        [headline, f"{symbol} ${row['close']:.2f}   {bar_time:%H:%M}"] + points
     )
 
 
@@ -417,19 +457,30 @@ def test_push() -> int:
         return 1
     print(f"  devices                {', '.join(devices)}")
 
+    # The setup alert is built by compose() rather than written out here,
+    # so this test shows the message the morning will actually send. A
+    # hand-typed sample drifts away from the real one and then reassures
+    # you about a format that no longer exists.
+    sample_row = pd.Series({"macd": -0.04, "close": 152.41, "vwap": 152.68})
+    sample_at = datetime.combine(date.today(), time(10, 42), tzinfo=ET)
+
     checks = [
         (PRIORITY_UPDATE, "quiet update", f"{SYMBOL} 09:36 \u25bc $153.89 (-3\u00a2)\n"
                                           "Minute volume 13.2k (1.0x usual)\n"
-                                          "This is a test of the silent channel."),
+                                          "This is a test of the silent channel.",
+         None),
         (PRIORITY_SUMMARY, "alarm", f"{SYMBOL} 09:35 \u25b2 $152.41 (+23\u00a2)\n"
                                     "Open $152.18   Close $152.41\n"
-                                    "This is a test of the alarm channel."),
+                                    "This is a test of the alarm channel.",
+         None),
+        (PRIORITY_SUMMARY, f"setup alert ({SOUND_SETUP})",
+         compose(SYMBOL, sample_at, sample_row), SOUND_SETUP),
     ]
 
     failed = False
-    for priority, label, message in checks:
+    for priority, label, message, sound in checks:
         error = send_pushover(message, title=f"{SYMBOL} test — {label}",
-                              priority=priority)
+                              priority=priority, sound=sound)
         if error:
             print(f"\n  priority {priority:>2} ({label}): FAILED — {error}")
             failed = True
@@ -525,7 +576,8 @@ def check_once(db: sqlite3.Connection, symbol: str = SYMBOL,
         return Result(bar_time=bar_time, fired=True, message=message,
                       note="dry run — not sent")
 
-    error = send_pushover(message)
+    error = send_pushover(message, priority=PRIORITY_SUMMARY,
+                          sound=SOUND_SETUP)
     if error:
         db.execute("UPDATE signals SET suppressed = ? WHERE symbol = ? AND bar_time = ?",
                    (error, symbol, bar_time.isoformat()))
@@ -700,9 +752,41 @@ def self_test() -> int:
         failures.append(f"the alert should carry no percentages: {message}")
     if "VWAP $" not in message:
         failures.append(f"the alert should give VWAP as a price: {message}")
-    for word in ("zero", "rising"):
+    for word in ("R&D", "0", "rising", "diverging"):
         if word not in message:
             failures.append(f"the alert should say '{word}': {message}")
+    if not message.startswith("** R&D "):
+        failures.append(f"the case belongs in the headline: {message}")
+
+    # The headline must track the zero line, not just appear. A message
+    # that said "below" whichever side it was on would read perfectly and
+    # be wrong every other time.
+    for macd_value, expect, forbid in ((-0.05, "BELOW 0", "ABOVE 0"),
+                                       (0.05, "ABOVE 0", "BELOW 0")):
+        probe = sample.copy()
+        probe["macd"] = macd_value
+        text = compose("SPCX", qualifying[0], probe)
+        if expect not in text or forbid in text:
+            failures.append(f"MACD {macd_value} should read {expect}: {text}")
+    # And only the below-zero case is the best case.
+    best = sample.copy()
+    best["macd"] = 0.05
+    if "best case" in compose("SPCX", qualifying[0], best):
+        failures.append("above zero is not the best case")
+
+    # The sound name has one home, and open_candles must agree with it.
+    # Imported late and guarded: open_candles imports THIS module, so a
+    # top-level import would be a cycle, and the study should still run
+    # with the watcher absent from the folder.
+    try:
+        import open_candles as _watcher
+    except ImportError:
+        pass
+    else:
+        if _watcher.SOUND_BUY != SOUND_SETUP:
+            failures.append(f"the buy sound is spelled two ways: "
+                            f"{SOUND_SETUP!r} here, "
+                            f"{_watcher.SOUND_BUY!r} in open_candles")
 
     # Cooldown, against a real database.
     db = open_db(":memory:")
@@ -764,38 +848,40 @@ def self_test() -> int:
             if value is not None:
                 os.environ[name] = value
 
-    # Evaluating and alerting must be two different gates, not one.
-    if EARLIEST_SIGNAL >= ALERT_FROM:
-        failures.append("signals should be evaluated earlier than alerts are sent")
-    if not (SESSION_OPEN <= ALERT_FROM < SESSION_CLOSE):
-        failures.append(f"the alert gate should sit inside the session, got {ALERT_FROM}")
-    if not (ALERT_FROM < ALERT_UNTIL <= SESSION_CLOSE):
+    # Evaluating and alerting are two different gates. The window now
+    # defaults to the whole session, so the gate is exercised with an
+    # EXPLICIT time rather than with the constant -- otherwise widening
+    # the default would silently delete the test along with the gate.
+    gate = time(10, 0)
+    if not (SESSION_OPEN <= ALERT_FROM < ALERT_UNTIL <= SESSION_CLOSE):
         failures.append(f"the alert window should open before it closes and sit "
                         f"inside the session, got {ALERT_FROM}-{ALERT_UNTIL}")
-    held = [ts for ts in qualifying
-            if ts.time() < ALERT_FROM or ts.time() >= ALERT_UNTIL]
-    sendable = [ts for ts in qualifying
-                if ALERT_FROM <= ts.time() < ALERT_UNTIL]
+    if EARLIEST_SIGNAL > ALERT_FROM:
+        failures.append("a bar that cannot be evaluated can never be alerted on")
+    held = [ts for ts in qualifying if ts.time() < gate]
+    sendable = [ts for ts in qualifying if gate <= ts.time() < ALERT_UNTIL]
     if not held:
         failures.append(f"the fixture should produce a qualifying bar before "
-                        f"{ALERT_FROM:%H:%M}, "
+                        f"{gate:%H:%M}, "
                         "or the quiet period is not actually being tested")
-    early = [ts for ts in held if ts.time() < ALERT_FROM]
-    if not all(session.at[ts, "cond_e_time"] for ts in early):
-        failures.append(f"a bar before {ALERT_FROM:%H:%M} should still satisfy the "
-                        f"time condition, "
-                        "so that it is logged")
+    if not sendable:
+        failures.append(f"the fixture should also produce one at or after "
+                        f"{gate:%H:%M}, or the gate is not separating anything")
+    if not all(session.at[ts, "cond_e_time"] for ts in held):
+        failures.append(f"a bar before {gate:%H:%M} should still satisfy the "
+                        f"time condition, so that it is logged")
 
     # Both edges of the window, and the fact that closing it silences
     # rather than stops. A bar after ALERT_UNTIL is still evaluated and
     # still written down -- the gate decides what buzzes, never what is
     # measured, or a day of data would go missing to save a notification.
     edges = [
-        (time(9, 39), False, "a minute before the window opens"),
+        (time(9, 29), False, "a minute before the open"),
         (ALERT_FROM, True, "the opening minute itself"),
-        (time(10, 30), True, "the middle of the window"),
+        (time(10, 30), True, "the middle of the morning"),
+        (time(14, 0), True, "the afternoon, which is no longer silenced"),
         (ALERT_UNTIL, False, "the closing minute itself"),
-        (time(14, 0), False, "the afternoon, where the signal fires most"),
+        (time(16, 30), False, "after the close"),
     ]
     for at, expected, what in edges:
         inside = ALERT_FROM <= at < ALERT_UNTIL
@@ -814,7 +900,7 @@ def self_test() -> int:
         failures.append("every held bar should still be written to the database")
 
     print(f"  Qualifying bars in fixture     : {len(qualifying)}")
-    print(f"    outside the window (log only)  : {len(held)}")
+    print(f"    before 10:00 (gate exercise)   : {len(held)}")
     print(f"    {ALERT_FROM:%H:%M}-{ALERT_UNTIL:%H:%M} (may alert)      : {len(sendable)}")
     print(f"  Example alert                  : {message}")
     print(f"  Cooldown                       : {COOLDOWN_MINUTES} min, read from the database")
