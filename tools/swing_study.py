@@ -361,6 +361,74 @@ except ImportError:      # the study still runs without the watcher present
     ALARM_VOLUME, PRESSING_LOW, PRESSING_HIGH, PRESSURE_MINUTES = 1.5, 0.30, 0.70, 5
 
 
+#: The set-up Jason trades, staged. The bullish cross must happen with
+#: the MACD BELOW zero -- a turn beginning from a decline, while the
+#: chart still looks weak -- and the zero line must then be taken within
+#: this many bars or the set-up is stale. Thirty minutes is long enough
+#: for a turn to develop on 1-minute bars and short enough that a cross
+#: two hours later is plainly a different move.
+ZERO_CROSS_WINDOW_BARS = 30
+
+#: Bars of widening histogram that count as "diverging". Two running,
+#: the same as the live alert's condition (c) -- a second definition of
+#: the same word is how a study stops describing the thing it fires on.
+DIVERGENCE_BARS = 2
+
+
+def below_zero_setups(session: pd.DataFrame,
+                      window: int = ZERO_CROSS_WINDOW_BARS,
+                      ) -> List[Tuple[int, Optional[int], Optional[int]]]:
+    """Stage the below-zero MACD turn: the cross, the divergence, the zero line.
+
+    One tuple per bullish cross that happened below zero:
+    ``(cross, diverged, zero)``, where the later two are None if the
+    set-up died before reaching them.
+
+    A set-up dies the moment the MACD falls back below its signal line.
+    The turn did not hold, and whatever the indicator does afterwards
+    belongs to some other set-up rather than this one.
+
+    NOTHING HERE LOOKS FORWARD FROM AN ENTRY. The stages are recorded so
+    the follow-through rate can be reported, and a caller must not use
+    "it went on to cross zero" to pick an entry at the earlier bar: that
+    bar did not know. The two entries scored in section 12 are each
+    taken at the stage that defines them, on every set-up that reached
+    it, including the ones that then failed.
+    """
+    needed = ("macd", "macd_signal", "macd_gap")
+    if any(column not in session for column in needed):
+        return []
+
+    macd = session["macd"].astype(float)
+    signal = session["macd_signal"].astype(float)
+    gap = session["macd_gap"].astype(float)
+    above = (macd > signal).fillna(False)
+    widening = (gap > gap.shift(1)).fillna(False)
+    n = len(session)
+
+    setups: List[Tuple[int, Optional[int], Optional[int]]] = []
+    for i in range(1, n):
+        if not (bool(above.iloc[i]) and not bool(above.iloc[i - 1])):
+            continue
+        if not macd.iloc[i] < 0:           # NaN while warming up is not a cross
+            continue
+
+        diverged: Optional[int] = None
+        zero: Optional[int] = None
+        run = 0
+        for j in range(i + 1, min(i + 1 + window, n)):
+            if not bool(above.iloc[j]):
+                break                      # rolled back over; set-up is dead
+            run = run + 1 if bool(widening.iloc[j]) else 0
+            if diverged is None and run >= DIVERGENCE_BARS:
+                diverged = j
+            if macd.iloc[j] >= 0:
+                zero = j
+                break
+        setups.append((i, diverged, zero))
+    return setups
+
+
 def slot_volume(sessions: Dict[date, pd.DataFrame]) -> Dict[time, float]:
     """The usual volume for each clock minute, across these sessions.
 
@@ -1058,6 +1126,145 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
         print("   its own. The thresholds are imported from it, so this cannot")
         print("   drift from what actually rings.")
 
+    # ---- 12. the below-zero turn ----------------------------------------
+    print(f"\n{rule}")
+    print("12. THE BELOW-ZERO TURN -- the set-up actually being traded\n")
+    print("   Not section 11's \"MACD crossover\". That one fires on any")
+    print("   bullish cross, above or below zero, and never waits for the")
+    print("   zero line -- so it buys strength already visible on the chart.")
+    print("   This requires the cross to happen BELOW zero, with the chart")
+    print("   still weak, and then asks whether the move took the zero line.")
+
+    staged = {day: below_zero_setups(session) for day, session in sessions.items()}
+    crosses = sum(len(v) for v in staged.values())
+
+    if not crosses:
+        print("\n   No below-zero crosses in this sample.")
+    else:
+        diverged_n = sum(1 for v in staged.values() for _, d, _ in v if d is not None)
+        both_n = sum(1 for v in staged.values() for _, d, z in v
+                     if d is not None and z is not None)
+
+        print(f"\n   {len(sessions)} sessions."
+              f"  {crosses / len(sessions):.1f} below-zero crosses a session.\n")
+        print(f"   {'Stage':<46}{'Count':>8}{'of crosses':>13}")
+        print(f"   {'1. bullish cross, MACD below zero':<46}{crosses:>8}"
+              f"{'100%':>13}")
+        print(f"   {'2. ... histogram widening ' + str(DIVERGENCE_BARS) + ' bars running':<46}"
+              f"{diverged_n:>8}{100.0 * diverged_n / crosses:>12.0f}%")
+        print(f"   {'3. ... MACD takes zero within ' + str(ZERO_CROSS_WINDOW_BARS) + ' bars':<46}"
+              f"{both_n:>8}{100.0 * both_n / crosses:>12.0f}%")
+
+        follow = 100.0 * both_n / diverged_n if diverged_n else 0.0
+        print(f"\n   FOLLOW-THROUGH: {follow:.0f}% of the set-ups that diverge go on")
+        print("   to take the zero line. The rest are the calls to your screen")
+        print("   that should end with you closing the laptop.")
+
+        # Scored on the recent slice, so the count is comparable with 10 and 11.
+        if len(recent_sessions) < 10:
+            print("\n   Too few recent sessions to score the entries.")
+        else:
+            recent_staged = {d: staged[d] for d in recent_sessions}
+            early = {d: [x for _, x, _ in v if x is not None]
+                     for d, v in recent_staged.items()}
+            confirmed = {d: [z for _, x, z in v
+                             if z is not None and x is not None]
+                         for d, v in recent_staged.items()}
+
+            print(f"\n   Two entries, over the same {len(recent_sessions)} recent sessions"
+                  f" as sections 10 and 11:\n")
+            print(f"   {'Entry':<38}{'Entries':>9}{'Beat control':>15}{'Verdict':>12}")
+            for label, picked in (("at the divergence (unconfirmed)", early),
+                                  ("at the zero-line cross", confirmed)):
+                fired = sum(len(v) for v in picked.values())
+                beat, cells, _ = beat_the_control(recent_sessions, picked)
+                if not cells:
+                    print(f"   {label:<38}{fired:>9}{'too thin':>15}{'--':>12}")
+                    continue
+                share = 100.0 * beat / cells
+                verdict = ("edge?" if share >= 70 else
+                           "loses" if share <= 30 else "chance")
+                print(f"   {label:<38}{fired:>9}"
+                      f"{str(beat) + ' of ' + str(cells):>15}{verdict:>12}")
+
+            print("\n   The early entry is taken on EVERY set-up that diverged,")
+            print("   including the ones that never reached the zero line.")
+            print("   Scoring it only on the ones that worked would be reading")
+            print("   tomorrow's paper: at the divergence bar nobody knows yet")
+            print("   which kind this is. That is what the two rows cost --")
+            print("   the early entry buys room and pays for it in failures,")
+            print("   the confirmed one pays for certainty in giving up room.")
+
+            # How far it runs, for the entry that is actually confirmed.
+            runs = []
+            for day, session in recent_sessions.items():
+                runs += signal_outcomes(session, confirmed[day])
+            frame = pd.DataFrame(runs)
+            if len(frame) < MIN_TRADES:
+                print(f"\n   Only {len(frame)} confirmed entries -- too few to")
+                print("   describe the run. Ask for more days.")
+            else:
+                mfe, mae = frame["mfe_60"], frame["mae_60"]
+                higher = 100.0 * (frame["ret_60"] > 0).mean()
+                print(f"\n   Where price got to within 60 minutes of the zero-line")
+                print(f"   cross, over {len(frame)} entries:\n")
+                print(f"   {'':<22}{'median':>10}{'upper qtr':>12}{'best':>10}")
+                print(f"   {'best case reached':<22}{pct(mfe, 0.5):>9.2f}%"
+                      f"{pct(mfe, 0.75):>11.2f}%{mfe.max():>9.2f}%")
+                print(f"   {'worst case first':<22}{pct(mae, 0.5):>9.2f}%"
+                      f"{pct(mae, 0.25):>11.2f}%{mae.min():>9.2f}%")
+                print(f"\n   Higher an hour later: {higher:.0f}% of the time.")
+                print("   'Upper qtr' on the worst case is the lower quartile --")
+                print("   the bad end of the dip, which is the end a stop meets.")
+
+            # How much of the rise is already gone by the time the zero
+            # line is taken. The objection to waiting for confirmation,
+            # measured rather than argued.
+            legs = []
+            for day, session in recent_sessions.items():
+                closes = session["close"].to_numpy()
+                highs_a = session["high"].to_numpy()
+                n = len(session)
+                for cross, div, zero in recent_staged[day]:
+                    if div is None or zero is None:
+                        continue
+                    after = highs_a[zero + 1:min(zero + 1 + 60, n - 1) + 1]
+                    if not len(after):
+                        continue
+                    legs.append({
+                        "to_div": 100.0 * (closes[div] - closes[cross]) / closes[cross],
+                        "to_zero": 100.0 * (closes[zero] - closes[div]) / closes[div],
+                        "after": 100.0 * (float(after.max()) - closes[zero]) / closes[zero],
+                    })
+
+            if len(legs) >= MIN_TRADES:
+                parts = pd.DataFrame(legs)
+                print(f"\n   HOW MUCH IS LEFT. The move broken into its legs,"
+                      f" {len(parts)} set-ups:\n")
+                print(f"   {'':<40}{'median':>10}{'upper qtr':>12}")
+                for label, column in (
+                        ("cross below zero -> divergence", "to_div"),
+                        ("divergence -> zero-line cross", "to_zero"),
+                        ("left after the zero cross (60m)", "after")):
+                    print(f"   {label:<40}{pct(parts[column], 0.5):>9.2f}%"
+                          f"{pct(parts[column], 0.75):>11.2f}%")
+                spent = parts["to_div"].median() + parts["to_zero"].median()
+                left = parts["after"].median()
+                total = spent + left
+                if total > 0:
+                    print(f"\n   By the zero-line cross, {100.0 * spent / total:.0f}% of the"
+                          f" typical move is already")
+                    print(f"   behind you and {100.0 * left / total:.0f}% is still ahead.")
+                print("   The legs are measured close to close between the")
+                print("   indicator's own bars, and the last one is the best")
+                print("   price reached afterwards -- not a fill, which is why")
+                print("   it is not added up as a return.")
+
+        print("\n   A negative result in section 11 says nothing about this.")
+        print("   The two enter from opposite places: one after strength is")
+        print("   visible, this one before. Nor does a good result here prove")
+        print("   anything yet -- it means pre-register it and measure forward.")
+
     return outcomes
 
 
@@ -1205,6 +1412,69 @@ def self_test() -> int:
     if score([])["n"] != 0:
         failures.append("score([]) should report zero trades")
 
+    # ---- the below-zero turn -------------------------------------------
+    # Built from explicit MACD columns rather than from prices, so this
+    # tests the staging and not the indicator (which has its own test).
+    def macd_frame(macd_values, signal_values):
+        frame = _session([100.0] * len(macd_values))
+        frame["macd"] = macd_values
+        frame["macd_signal"] = signal_values
+        frame["macd_gap"] = [m - s for m, s in zip(macd_values, signal_values)]
+        return frame
+
+    # Crosses above signal at bar 2 while below zero, gap widens every bar
+    # after, takes the zero line at bar 6.
+    good = macd_frame([-.9, -.8, -.6, -.5, -.3, -.1, .1, .3],
+                      [-.5, -.5, -.7, -.8, -.9, -1., -1.1, -1.2])
+    staged = below_zero_setups(good)
+    if len(staged) != 1:
+        failures.append(f"one below-zero set-up expected, got {len(staged)}")
+    else:
+        cross, diverged, zero = staged[0]
+        if cross != 2:
+            failures.append(f"the cross is at bar 2, got {cross}")
+        if diverged != 4:
+            failures.append(f"divergence confirms two widening bars after "
+                            f"the cross, at bar 4, got {diverged}")
+        if zero != 6:
+            failures.append(f"the zero line is taken at bar 6, got {zero}")
+
+    # THE FILTER THAT SECTION 11's TRIGGER LACKED: an identical cross
+    # that happens ABOVE zero is not this set-up at all.
+    high = macd_frame([.1, .2, .4, .5, .7, .9, 1.1, 1.3],
+                      [.5, .5, .3, .2, .1, 0., -.1, -.2])
+    if below_zero_setups(high):
+        failures.append("a cross above zero is not a below-zero set-up")
+
+    # A set-up that rolls back under its signal line is dead there, and
+    # a later zero crossing belongs to some other move.
+    died = macd_frame([-.9, -.8, -.6, -.5, -.9, -.4, .2, .4],
+                      [-.5, -.5, -.7, -.8, -.7, -.6, -.5, -.4])
+    staged = below_zero_setups(died)
+    if not staged or staged[0][2] is not None:
+        failures.append("a set-up that rolls over must not claim the zero "
+                        "line it never reached alive")
+
+    # Never reaches zero inside the window: stage 3 is simply absent.
+    slow = macd_frame([-.9, -.8, -.7, -.65, -.6, -.55, -.5, -.45],
+                      [-.5, -.5, -.8, -.85, -.9, -.95, -1., -1.05])
+    staged = below_zero_setups(slow)
+    if not staged or staged[0][2] is not None:
+        failures.append("a set-up that never takes zero must report None")
+
+    # The anti-look-ahead property, stated as a test: the early entry is
+    # taken on set-ups that later failed. If it were only ever taken on
+    # the ones that worked, this list would be empty.
+    failed_early = [d for _, d, z in below_zero_setups(slow)
+                    if d is not None and z is None]
+    if not failed_early:
+        failures.append("the early entry must exist on set-ups that never "
+                        "reached the zero line, or it is reading ahead")
+
+    # A frame with no MACD columns is silence, not a crash.
+    if below_zero_setups(_session([100.0, 100.1, 100.2])):
+        failures.append("no MACD columns should yield no set-ups")
+
     print(f"  Triangle pivots found          : {kinds}")
     print("  Sub-threshold noise pivots     : 0 (expected)")
     print("  Bar touching both levels       : stop (pessimistic, as specified)")
@@ -1214,6 +1484,10 @@ def self_test() -> int:
     print(f"  40 sessions, half-life 10      : worth "
           f"{effective_n([w[d] for d in span]):.0f} equally-weighted")
     print("  Stop sizing                    : winners only, tighter than all")
+    print("  Below-zero turn                : cross 2, diverged 4, zero 6")
+    print("  Same cross above zero          : not a set-up")
+    print("  Set-up that rolls over         : dead at the re-cross")
+    print("  Early entry on failed set-ups  : present (no look-ahead)")
 
     if failures:
         print("\nFAILED:")
