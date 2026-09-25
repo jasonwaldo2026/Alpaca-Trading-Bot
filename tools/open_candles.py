@@ -586,12 +586,20 @@ class Day:
             return None
         return 100.0 * (self.last - self.prev_close) / self.prev_close
 
+    #: Past a dollar, cents stop reading as a distance. "190c below VWAP"
+    #: is arithmetic the reader has to do; "$1.90 below VWAP" is the
+    #: number. Only this line changes -- cents are right for the small
+    #: moves everywhere else.
+    DOLLARS_FROM = 1.00
+
     def vwap_gap(self) -> Optional[str]:
         if self.vwap is None or pd.isna(self.vwap):
             return None
         gap = self.last - self.vwap
         side = "above" if gap >= 0 else "below"
-        return f"{cents(abs(gap))} {side} VWAP"
+        size = (f"${abs(gap):,.2f}" if abs(gap) >= self.DOLLARS_FROM
+                else cents(abs(gap)))
+        return f"{size} {side} VWAP"
 
     def line(self) -> str:
         parts = [f"Day {self.low:,.2f} – {self.high:,.2f}"]
@@ -1501,6 +1509,17 @@ def self_test() -> int:
         failures.append("a day with no range has no position in it")
     if "above VWAP" not in (day.vwap_gap() or ""):
         failures.append(f"153.60 is above a VWAP of 152.90: {day.vwap_gap()}")
+    # Cents below a dollar, dollars above it, and the boundary itself
+    # belongs to dollars rather than to a 100c nobody says out loud.
+    for last, vwap, expected in ((153.60, 152.90, "70\u00a2 above VWAP"),
+                                 (149.90, 151.80, "$1.90 below VWAP"),
+                                 (100.99, 100.00, "99\u00a2 above VWAP"),
+                                 (101.00, 100.00, "$1.00 above VWAP"),
+                                 (88.00, 100.00, "$12.00 below VWAP")):
+        got = Day(last=last, high=last + 1, low=last - 1, vwap=vwap).vwap_gap()
+        if got != expected:
+            failures.append(f"vwap gap for {last}/{vwap}: {got!r}, "
+                            f"wanted {expected!r}")
     if Day(last=1.0, high=2.0, low=0.0).vwap_gap() is not None:
         failures.append("no VWAP means no VWAP line, not a zero gap")
 
