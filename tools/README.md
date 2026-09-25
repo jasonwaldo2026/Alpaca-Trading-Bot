@@ -7,7 +7,7 @@ rather than opinions — whether any of it is worth acting on.
 
 **Nothing here can place a trade.** Every file uses Alpaca's market-data
 client only. There is no trading client and no order object anywhere in
-the folder. Seven of the ten modules go further and assert it: their
+the folder. Eight of the eleven modules go further and assert it: their
 `--self-test` reads their own source and fails if the words
 `TradingClient`, `submit_order` or `MarketOrderRequest` appear in it.
 The three that do not carry that assertion are `feed_check.py`,
@@ -28,6 +28,7 @@ all. Trades are placed by hand, in DAS.
 | `benchmark_report.py` | The stock against the market, with share unlocks marked | research |
 | `screener.py` | Which other symbols are worth the same attention | research |
 | `session_clock.py` | The trading day as a clock face — where movement is, where signals fire | research |
+| `bracket.py` | The stop, target and share count to type, from an entry and a risk budget | **before entering** |
 | `lockups.py` + `lockups.json` | The share-unlock calendar | read by the others |
 | `launches.py` + `launches.json` | The notable-launch calendar | read by the others |
 | `primer/` | A 16-page PDF explaining the terms and the findings for a beginner | — |
@@ -128,6 +129,7 @@ signal.
 Every tool has an offline self-test. No network, no credentials:
 
 ```
+python bracket.py --self-test
 python feed_check.py --self-test
 python open_candles.py --self-test
 python spcx_alert.py --self-test
@@ -139,7 +141,7 @@ python session_clock.py --self-test
 python lockups.py
 ```
 
-All nine should pass before you rely on anything.
+All ten should pass before you rely on anything.
 
 ---
 
@@ -175,6 +177,7 @@ Useful flags:
 ### The research tools, run when you want them
 
 ```
+python bracket.py --entry 152.40 --risk 50
 python swing_study.py --symbol SPCX --days 90
 python benchmark_report.py
 python session_clock.py
