@@ -267,36 +267,35 @@ def fetch_recent(symbol: str, now: datetime, minutes: int = WARMUP_MINUTES) -> p
 def compose(symbol: str, bar_time: datetime, row: pd.Series) -> str:
     """The setup, read at arm's length on a lock screen.
 
-    The headline is which side of the zero line the turn began on,
-    because that is the difference between the best case and the ordinary
-    one. Below zero means the fast average is still under the slow one --
-    the stock has been falling or flat, and this is a turn starting from
-    a low base rather than more of a move already under way. Above zero
-    is the same shape of turn inside an advance that has already begun.
+    Which side of the zero line the turn began on rides in the same
+    sentence as the turn itself, rather than in a banner above it. Below
+    zero means the fast average is still under the slow one -- the stock
+    has been falling or flat, and this is a turn starting from a low base
+    rather than more of a move already under way. Above zero is the same
+    shape of turn inside an advance that has already begun.
 
-    Neither is a verdict. The alert exists to say come and look; the
-    looking happens on Level 2 and the tape.
+    Below zero is the better of the two and the message no longer says
+    so, because a line that tells you which one to like is doing your
+    judging for you. Neither is a verdict. The alert exists to say come
+    and look; the looking happens on Level 2 and the tape.
 
-    The points of interest below the headline are a list on purpose:
-    Point of Control and the 9 EMA are meant to join it, and adding one
-    should be adding a line rather than rewriting the message.
+    The points of interest are a list on purpose: Point of Control and
+    the 9 EMA are meant to join it, and adding one should be adding a
+    line rather than rewriting the message.
 
     The VWAP is given as a price rather than a distance: two dollar
     figures say which side you are on and by how much without any
     arithmetic, and the level itself is often where price heads back to.
     """
-    below = row["macd"] < 0
-    headline = ("** R&D BELOW 0 — best case **" if below
-                else "** R&D ABOVE 0 **")
-
-    points = ["Crossed up, rising and diverging"]
+    side = "below 0" if row["macd"] < 0 else "above 0"
+    points = [f"Crossed up {side}, rising and diverging"]
     vwap = row.get("vwap") if hasattr(row, "get") else row["vwap"]
     if vwap is not None and pd.notna(vwap):
         where = "above" if row["close"] >= vwap else "below"
         points.append(f"Price {where} VWAP ${vwap:.2f}")
 
     return "\n".join(
-        [headline, f"{symbol} ${row['close']:.2f}   {bar_time:%H:%M}"] + points
+        [f"{symbol} ${row['close']:.2f}   {bar_time:%H:%M}"] + points
     )
 
 
@@ -752,27 +751,31 @@ def self_test() -> int:
         failures.append(f"the alert should carry no percentages: {message}")
     if "VWAP $" not in message:
         failures.append(f"the alert should give VWAP as a price: {message}")
-    for word in ("R&D", "0", "rising", "diverging"):
+    for word in ("Crossed up", "rising and diverging"):
         if word not in message:
             failures.append(f"the alert should say '{word}': {message}")
-    if not message.startswith("** R&D "):
-        failures.append(f"the case belongs in the headline: {message}")
+    if not message.startswith("SPCX $"):
+        failures.append(f"the symbol and price lead the message: {message}")
 
-    # The headline must track the zero line, not just appear. A message
-    # that said "below" whichever side it was on would read perfectly and
-    # be wrong every other time.
-    for macd_value, expect, forbid in ((-0.05, "BELOW 0", "ABOVE 0"),
-                                       (0.05, "ABOVE 0", "BELOW 0")):
+    # The zero line must TRACK the MACD, not merely be mentioned. A line
+    # that said "below 0" whichever side it was on would read perfectly
+    # and be wrong every other time. "Price below VWAP" must not be
+    # mistaken for it, which is why the strings tested carry the zero.
+    for macd_value, expect, forbid in ((-0.05, "below 0", "above 0"),
+                                       (0.05, "above 0", "below 0")):
         probe = sample.copy()
         probe["macd"] = macd_value
         text = compose("SPCX", qualifying[0], probe)
-        if expect not in text or forbid in text:
-            failures.append(f"MACD {macd_value} should read {expect}: {text}")
-    # And only the below-zero case is the best case.
-    best = sample.copy()
-    best["macd"] = 0.05
-    if "best case" in compose("SPCX", qualifying[0], best):
-        failures.append("above zero is not the best case")
+        if f"Crossed up {expect}," not in text or forbid in text:
+            failures.append(f"MACD {macd_value} should read "
+                            f"'Crossed up {expect}': {text}")
+
+    # The message judges nothing. Below zero is the better setup and the
+    # alert says which it is, never which to like -- that is the part
+    # done by eye on Level 2.
+    for verdict in ("best case", "best-case", "strong", "weak"):
+        if verdict in message.lower():
+            failures.append(f"the alert should not grade the setup: {message}")
 
     # The sound name has one home, and open_candles must agree with it.
     # Imported late and guarded: open_candles imports THIS module, so a
