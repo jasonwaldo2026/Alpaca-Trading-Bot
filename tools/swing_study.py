@@ -351,6 +351,106 @@ HALF_LIVES = (30, 20, 10)
 WINNER_PCT = 0.5
 
 
+# The live alarm's own thresholds, imported rather than copied. A test
+# that used different numbers would not be testing the alarm.
+try:
+    from open_candles import (
+        ALARM_VOLUME, PRESSING_HIGH, PRESSING_LOW, PRESSURE_MINUTES,
+    )
+except ImportError:      # the study still runs without the watcher present
+    ALARM_VOLUME, PRESSING_LOW, PRESSING_HIGH, PRESSURE_MINUTES = 1.5, 0.30, 0.70, 5
+
+
+def slot_volume(sessions: Dict[date, pd.DataFrame]) -> Dict[time, float]:
+    """The usual volume for each clock minute, across these sessions.
+
+    Per clock slot, never a rolling average of the day. 09:35 and 14:35
+    are different animals, and a rolling baseline turns "is this bar
+    busy" into "is it the morning" -- the same reason the live watcher
+    builds its baseline this way.
+    """
+    buckets: Dict[time, List[float]] = {}
+    for session in sessions.values():
+        for stamp, volume in session["volume"].items():
+            buckets.setdefault(stamp.time(), []).append(float(volume))
+    return {slot: float(pd.Series(v).median()) for slot, v in buckets.items()}
+
+
+def lean_series(session: pd.DataFrame,
+                window: int = PRESSURE_MINUTES) -> pd.Series:
+    """Volume-weighted close position over a rolling window, 0 to 1.
+
+    The same reading the alerts name in words: where in each bar's range
+    the close landed, weighted by how much traded in it. A bar with no
+    range has no opinion and counts as the middle.
+    """
+    span = session["high"] - session["low"]
+    position = ((session["close"] - session["low"]) / span.replace(0, pd.NA)).fillna(0.5)
+    volume = session["volume"].astype(float)
+    weighted = (position * volume).rolling(window).sum()
+    total = volume.rolling(window).sum()
+    return (weighted / total.replace(0, pd.NA)).fillna(0.5)
+
+
+def loud(session: pd.DataFrame, usual: Dict[time, float],
+         window: int = PRESSURE_MINUTES,
+         multiple: float = ALARM_VOLUME) -> pd.Series:
+    """Was the last `window` bars' volume unusual for that time of day?"""
+    expected = pd.Series(
+        [sum(usual.get(t.time(), 0.0) for t in session.index[max(0, i - window + 1):i + 1])
+         for i in range(len(session))], index=session.index)
+    got = session["volume"].astype(float).rolling(window).sum()
+    return (got / expected.replace(0, pd.NA)) >= multiple
+
+
+def lean_entries(session: pd.DataFrame, usual: Dict[time, float]) -> List[int]:
+    """Where the live alarm would ring on the buy side: the tape leaning
+    past the pressing band with real volume behind it."""
+    lean = lean_series(session)
+    hot = loud(session, usual)
+    return [i for i in range(len(session))
+            if lean.iloc[i] >= PRESSING_HIGH and bool(hot.iloc[i])]
+
+
+def vwap_entries(session: pd.DataFrame, usual: Dict[time, float]) -> List[int]:
+    """Where price crosses above VWAP on the same volume condition."""
+    if "vwap" not in session:
+        return []
+    above = session["close"] >= session["vwap"]
+    hot = loud(session, usual)
+    return [i for i in range(1, len(session))
+            if bool(above.iloc[i]) and not bool(above.iloc[i - 1])
+            and bool(hot.iloc[i])]
+
+
+def beat_the_control(sessions: Dict[date, pd.DataFrame], picker):
+    """How many stop/target pairs beat entering every fifth bar regardless.
+
+    The count is the measurement. Any one cell can win on a thin sample
+    by accident; an edge that depends on the levels is not an edge, so a
+    real one shows up across most of the grid.
+    """
+    beat, cells, best = 0, 0, None
+    for stop_pct in STOP_GRID:
+        for target_pct in TARGET_GRID:
+            sig, base = [], []
+            for session in sessions.values():
+                sig += simulate(session, picker(session), stop_pct, target_pct)
+                base += simulate(session,
+                                 list(range(0, len(session) - 1, BASELINE_STRIDE)),
+                                 stop_pct, target_pct)
+            ss, bs = score(sig), score(base)
+            if ss["n"] < MIN_TRADES or bs["n"] < MIN_TRADES:
+                continue
+            cells += 1
+            edge = ss["avg_return"] - bs["avg_return"]
+            if edge > 0:
+                beat += 1
+            if best is None or edge > best[0]:
+                best = (edge, stop_pct, target_pct, ss, bs)
+    return beat, cells, best
+
+
 def winners(outcomes: pd.DataFrame) -> pd.DataFrame:
     """Signals that finished up an hour later -- the ones a stop must not
     have thrown away."""
@@ -860,26 +960,10 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
     if len(recent_sessions) < 10:
         print("   Too few recent sessions to score. Ask for more days.")
     else:
-        beat, cells, best_cell = 0, 0, None
-        for stop_pct in STOP_GRID:
-            for target_pct in TARGET_GRID:
-                sig, base = [], []
-                for session in recent_sessions.values():
-                    entries = [i for i in range(len(session))
-                               if bool(session["alert"].iloc[i])]
-                    sig += simulate(session, entries, stop_pct, target_pct)
-                    base += simulate(session,
-                                     list(range(0, len(session) - 1, BASELINE_STRIDE)),
-                                     stop_pct, target_pct)
-                ss, bs = score(sig), score(base)
-                if ss["n"] < MIN_TRADES or bs["n"] < MIN_TRADES:
-                    continue
-                cells += 1
-                edge = ss["avg_return"] - bs["avg_return"]
-                if edge > 0:
-                    beat += 1
-                if best_cell is None or edge > best_cell[0]:
-                    best_cell = (edge, stop_pct, target_pct, ss, bs)
+        beat, cells, best_cell = beat_the_control(
+            recent_sessions,
+            lambda session: [i for i in range(len(session))
+                             if bool(session["alert"].iloc[i])])
 
         if not cells:
             print(f"   No cell had {MIN_TRADES} trades on both sides. Too thin "
@@ -918,6 +1002,47 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
             print("\n   Do not trade that cell because it topped this table.")
             print("   Pick a bracket for reasons that exist before the search,")
             print("   then measure it forward.")
+
+    # ---- 11. the triggers that actually ring the phone ------------------
+    print(f"\n{rule}")
+    print("11. WHAT THE ALARM ACTUALLY FIRES ON\n")
+
+    if len(recent_sessions) < 10:
+        print("   Too few recent sessions to score.")
+    else:
+        usual = slot_volume(sessions)
+        triggers = (
+            ("MACD crossover",
+             lambda ses: [i for i in range(len(ses)) if bool(ses["alert"].iloc[i])]),
+            (f"lean >= {PRESSING_HIGH:.0%} on {ALARM_VOLUME:.1f}x volume",
+             lambda ses: lean_entries(ses, usual)),
+            (f"VWAP cross up on {ALARM_VOLUME:.1f}x volume",
+             lambda ses: vwap_entries(ses, usual)),
+        )
+        print("   Buy side only -- long-only, so a sell-side trigger is an exit")
+        print("   rather than an entry and cannot be scored this way.\n")
+        print(f"   {'Trigger':<38}{'Entries':>9}{'Beat control':>15}{'Verdict':>12}")
+        for label, picker in triggers:
+            fired = sum(len(picker(ses)) for ses in recent_sessions.values())
+            beat, cells, _ = beat_the_control(recent_sessions, picker)
+            if not cells:
+                print(f"   {label:<38}{fired:>9}{'too thin':>15}{'--':>12}")
+                continue
+            share = 100.0 * beat / cells
+            verdict = ("edge?" if share >= 70 else
+                       "loses" if share <= 30 else "chance")
+            print(f"   {label:<38}{fired:>9}"
+                  f"{str(beat) + ' of ' + str(cells):>15}{verdict:>12}")
+
+        print("\n   Same grid, same matched control, same count as section 10.")
+        print("   Noise scores about a third of the cells; a real edge scores")
+        print("   most of them. 'edge?' is a question, not a finding -- it means")
+        print("   this is worth pre-registering and measuring forward, not that")
+        print("   it has been proven.")
+        print("\n   The volume baseline here is the median for each clock minute")
+        print("   across all these sessions, which is how the live watcher builds")
+        print("   its own. The thresholds are imported from it, so this cannot")
+        print("   drift from what actually rings.")
 
     return outcomes
 

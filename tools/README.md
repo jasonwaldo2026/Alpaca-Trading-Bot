@@ -242,6 +242,16 @@ edge shows up as most cells beating the control, because it does not
 depend on the levels. Validated against synthetic sessions: a planted
 edge scores 36 of 36, noise scores 14 of 36.
 
+**What does the alarm actually fire on?** Section 11 runs the same grid
+and the same matched control over all three triggers side by side: the
+MACD crossover, the lean past a pressing band on volume, and a VWAP
+cross on volume. Buy side only — long-only, so a sell-side trigger is an
+exit and cannot be scored as an entry. The thresholds and the volume
+multiple are imported from `open_candles.py` rather than copied, so the
+test cannot drift from what actually rings, and the volume baseline is
+the median for each clock minute across the sessions, the way the
+watcher builds its own.
+
 **No out-of-sample past exists.** SPCX listed on 12 June 2026, so the
 90-day sample is its entire history. The VWAP hypothesis in
 `swing_study.py` is pre-registered in the source and can only be tested
