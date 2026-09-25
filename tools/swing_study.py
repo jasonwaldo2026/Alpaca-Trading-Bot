@@ -384,12 +384,17 @@ def lean_series(session: pd.DataFrame,
     the close landed, weighted by how much traded in it. A bar with no
     range has no opinion and counts as the middle.
     """
-    span = session["high"] - session["low"]
-    position = ((session["close"] - session["low"]) / span.replace(0, pd.NA)).fillna(0.5)
+    # .where, not .replace(0, pd.NA): pd.NA turns a float column into an
+    # object one, and .rolling() then refuses it. A minute with no range
+    # is ordinary in thin pre-market, so this path is not exotic -- it is
+    # most mornings.
+    span = (session["high"] - session["low"]).astype(float)
+    position = ((session["close"] - session["low"]).astype(float)
+                / span.where(span > 0)).fillna(0.5)
     volume = session["volume"].astype(float)
     weighted = (position * volume).rolling(window).sum()
     total = volume.rolling(window).sum()
-    return (weighted / total.replace(0, pd.NA)).fillna(0.5)
+    return (weighted / total.where(total > 0)).fillna(0.5)
 
 
 def loud(session: pd.DataFrame, usual: Dict[time, float],
@@ -400,7 +405,7 @@ def loud(session: pd.DataFrame, usual: Dict[time, float],
         [sum(usual.get(t.time(), 0.0) for t in session.index[max(0, i - window + 1):i + 1])
          for i in range(len(session))], index=session.index)
     got = session["volume"].astype(float).rolling(window).sum()
-    return (got / expected.replace(0, pd.NA)) >= multiple
+    return (got / expected.where(expected > 0)).fillna(0.0) >= multiple
 
 
 def lean_entries(session: pd.DataFrame, usual: Dict[time, float]) -> List[int]:
@@ -423,22 +428,30 @@ def vwap_entries(session: pd.DataFrame, usual: Dict[time, float]) -> List[int]:
             and bool(hot.iloc[i])]
 
 
-def beat_the_control(sessions: Dict[date, pd.DataFrame], picker):
+def beat_the_control(sessions: Dict[date, pd.DataFrame],
+                     picked: Dict[date, List[int]]):
     """How many stop/target pairs beat entering every fifth bar regardless.
 
     The count is the measurement. Any one cell can win on a thin sample
     by accident; an edge that depends on the levels is not an edge, so a
     real one shows up across most of the grid.
+
+    Takes entries already chosen rather than a picker, because they do
+    not depend on the bracket. Choosing them inside the grid meant doing
+    it 36 times per session -- unnoticeable for a lookup on an "alert"
+    column, minutes of silence for a trigger that has to compute a
+    rolling lean and a per-slot volume baseline first.
     """
+    control = {day: list(range(0, len(session) - 1, BASELINE_STRIDE))
+               for day, session in sessions.items()}
+
     beat, cells, best = 0, 0, None
     for stop_pct in STOP_GRID:
         for target_pct in TARGET_GRID:
             sig, base = [], []
-            for session in sessions.values():
-                sig += simulate(session, picker(session), stop_pct, target_pct)
-                base += simulate(session,
-                                 list(range(0, len(session) - 1, BASELINE_STRIDE)),
-                                 stop_pct, target_pct)
+            for day, session in sessions.items():
+                sig += simulate(session, picked[day], stop_pct, target_pct)
+                base += simulate(session, control[day], stop_pct, target_pct)
             ss, bs = score(sig), score(base)
             if ss["n"] < MIN_TRADES or bs["n"] < MIN_TRADES:
                 continue
@@ -960,10 +973,10 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
     if len(recent_sessions) < 10:
         print("   Too few recent sessions to score. Ask for more days.")
     else:
-        beat, cells, best_cell = beat_the_control(
-            recent_sessions,
-            lambda session: [i for i in range(len(session))
-                             if bool(session["alert"].iloc[i])])
+        macd_entries = {d: [i for i in range(len(ses))
+                            if bool(ses["alert"].iloc[i])]
+                        for d, ses in recent_sessions.items()}
+        beat, cells, best_cell = beat_the_control(recent_sessions, macd_entries)
 
         if not cells:
             print(f"   No cell had {MIN_TRADES} trades on both sides. Too thin "
@@ -1023,8 +1036,9 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
         print("   rather than an entry and cannot be scored this way.\n")
         print(f"   {'Trigger':<38}{'Entries':>9}{'Beat control':>15}{'Verdict':>12}")
         for label, picker in triggers:
-            fired = sum(len(picker(ses)) for ses in recent_sessions.values())
-            beat, cells, _ = beat_the_control(recent_sessions, picker)
+            picked = {d: picker(ses) for d, ses in recent_sessions.items()}
+            fired = sum(len(v) for v in picked.values())
+            beat, cells, _ = beat_the_control(recent_sessions, picked)
             if not cells:
                 print(f"   {label:<38}{fired:>9}{'too thin':>15}{'--':>12}")
                 continue
