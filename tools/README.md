@@ -217,6 +217,21 @@ finished at least 0.5% up an hour later, the median dipped only 0.27%
 first, so a 0.75% stop keeps 88% of them. This corrected earlier advice
 of 1%, which came from the all-signal median and is dominated by losers.
 
+**Has it settled down?** Section 9 of the swing study answers this rather
+than assuming either way. It splits the history into thirds and prints,
+for each, the median daily range, how far the winners dipped, and the
+stop that would have kept 88% of them — then repeats the stop with
+exponential recency weighting at three half-lives, alongside the
+unweighted answer and the effective sample size each weighting leaves.
+
+Read the thirds first. If the first is wild and the last two agree, the
+IPO weeks were a different stock and the honest fix is to drop them, not
+to bury them in an exponential. Weighting adds no information; it
+discards some, and this project has already been fooled once by a result
+resting on three days. A stop too wide costs a little on every loss; a
+stop too tight costs the trades that would have worked, so tighten only
+on a difference plainly larger than the wobble between the rows.
+
 **No out-of-sample past exists.** SPCX listed on 12 June 2026, so the
 90-day sample is its entire history. The VWAP hypothesis in
 `swing_study.py` is pre-registered in the source and can only be tested

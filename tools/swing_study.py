@@ -50,7 +50,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -329,6 +329,88 @@ def signal_outcomes(session: pd.DataFrame, entries: Sequence[int]) -> List[dict]
 
 def pct(values, q: float) -> float:
     return float(pd.Series(values).quantile(q)) if len(values) else float("nan")
+
+
+#: How much of the winners' adverse excursion a stop should cover. 88%
+#: is where 0.75% landed on the first 90 days; the number is reported
+#: rather than assumed, so a changed regime shows up as a changed stop.
+STOP_COVERS = 0.88
+
+#: Half-lives to report, in sessions. Short enough to catch a regime
+#: change, long enough that the effective sample is still worth reading.
+HALF_LIVES = (30, 20, 10)
+
+#: A winner is a signal that finished at least this far up an hour later.
+#: The stop is sized on what those trades needed, not on every signal:
+#: the all-signal median is dominated by losers and gives a stop wide
+#: enough to be useless.
+WINNER_PCT = 0.5
+
+
+def winners(outcomes: pd.DataFrame) -> pd.DataFrame:
+    """Signals that finished up an hour later -- the ones a stop must not
+    have thrown away."""
+    if outcomes.empty or "ret_60" not in outcomes:
+        return outcomes.iloc[0:0]
+    return outcomes[outcomes["ret_60"] >= WINNER_PCT]
+
+
+def stop_for(rows: pd.DataFrame, covers: float = STOP_COVERS,
+             weights: Optional[pd.Series] = None) -> Optional[float]:
+    """The stop distance that would have kept `covers` of these winners.
+
+    Their MAE is negative, so the quantile is taken on its magnitude:
+    cover 88% of them and the stop is wide enough that only the worst
+    12% were shaken out.
+    """
+    if rows.empty or "mae_60" not in rows:
+        return None
+    dips = rows["mae_60"].abs()
+    if weights is None:
+        return float(dips.quantile(covers))
+    return weighted_quantile(dips, weights.loc[dips.index], covers)
+
+
+def weighted_quantile(values: pd.Series, weights: pd.Series,
+                      q: float) -> Optional[float]:
+    """A quantile where some observations count more than others.
+
+    Sort, walk the cumulative weight, and take the first value at which
+    it passes q. No interpolation: with an effective sample this small,
+    interpolating between two points would be precision the data has not
+    earned.
+    """
+    frame = pd.DataFrame({"v": values, "w": weights}).dropna().sort_values("v")
+    total = frame["w"].sum()
+    if not len(frame) or total <= 0:
+        return None
+    running = frame["w"].cumsum() / total
+    hit = frame.loc[running >= q, "v"]
+    return float(hit.iloc[0]) if len(hit) else float(frame["v"].iloc[-1])
+
+
+def recency_weights(days: Sequence[date], half_life: float) -> Dict[date, float]:
+    """Exponential weights: the newest session counts 1, and a session
+    `half_life` sessions older counts half as much.
+
+    This adds no information -- it discards some. With a 90-session
+    history a 20-session half-life leaves an effective sample near 30,
+    and small samples in this project have a record of flattering
+    themselves. It exists to be compared against the unweighted answer,
+    not to replace it.
+    """
+    order = sorted(days)
+    newest = len(order) - 1
+    return {day: 0.5 ** ((newest - i) / half_life)
+            for i, day in enumerate(order)}
+
+
+def effective_n(weights: Sequence[float]) -> float:
+    """Kish's effective sample size: how many equally-weighted
+    observations this weighting is really worth."""
+    total = sum(weights)
+    squares = sum(w * w for w in weights)
+    return (total * total / squares) if squares else 0.0
 
 
 def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
@@ -703,6 +785,68 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
             print("   day is not itself evidence of anything.")
         print("\n   Dates are UNCONFIRMED unless lockups.json says otherwise.")
 
+    # ---- 9. has the stock settled down? ---------------------------------
+    print(f"\n{rule}")
+    print("9. HAS IT SETTLED DOWN?\n")
+    won = winners(outcomes) if not outcomes.empty else outcomes
+
+    if outcomes.empty or won.empty:
+        print("   No winning signals to size a stop on.")
+    else:
+        # A plain split first. If the first stretch is wild and the rest
+        # are alike, the answer is not a weighting scheme -- it is that
+        # the IPO weeks were a different stock, and saying so is cleaner
+        # than burying it in an exponential.
+        thirds = max(1, len(days) // 3)
+        parts = (("first", days[:thirds]), ("middle", days[thirds:2 * thirds]),
+                 ("recent", days[2 * thirds:]))
+        print(f"   {'Period':<9}{'Sessions':>10}{'Med range':>12}{'Signals':>9}"
+              f"{'Winners':>9}{'Their MAE':>12}{'Stop @88%':>11}")
+        for name, span in parts:
+            if not span:
+                continue
+            ranges = [100.0 * (s["high"].max() - s["low"].min()) / s["open"].iloc[0]
+                      for d, s in sessions.items() if d in span and len(s)]
+            here = outcomes[outcomes["date"].isin(span)]
+            hw = winners(here)
+            stop = stop_for(hw)
+            med_range = pd.Series(ranges).median() if ranges else float("nan")
+            dip = hw["mae_60"].abs().median() if len(hw) else float("nan")
+            print(f"   {name:<9}{len(span):>10}{med_range:>11.2f}%{len(here):>9}"
+                  f"{len(hw):>9}{dip:>11.2f}%"
+                  + (f"{stop:>10.2f}%" if stop is not None else f"{'--':>11}"))
+        print("\n   'Their MAE' is how far the winners dipped before working.")
+        print(f"   'Stop @88%' is the distance that would have kept {STOP_COVERS:.0%}")
+        print("   of them. If the recent column is much tighter than the first,")
+        print("   the IPO weeks were a different stock. If the last two columns")
+        print("   agree, nothing has changed and the whole history is usable.")
+
+        # Then the weighting, alongside the plain answer rather than
+        # instead of it.
+        flat = stop_for(won)
+        print(f"\n   {'Weighting':<22}{'Eff. sessions':>15}{'Stop @88%':>12}")
+        print(f"   {'none (all ' + str(len(days)) + ' equal)':<22}"
+              f"{len(days):>15}{flat:>11.2f}%")
+        for hl in HALF_LIVES:
+            if hl >= len(days):
+                continue
+            w = recency_weights(days, hl)
+            per_signal = won["date"].map(w)
+            stop = stop_for(won, weights=per_signal)
+            eff = effective_n([w[d] for d in days])
+            if stop is None:
+                continue
+            print(f"   {'half-life ' + str(hl) + ' sessions':<22}{eff:>15.0f}"
+                  f"{stop:>11.2f}%")
+        print("\n   Weighting adds no data -- it discards some. 'Eff. sessions'")
+        print("   is what the weighted sample is really worth, and this project")
+        print("   has already been fooled once by a result that rested on three")
+        print("   days. Treat a move of a few hundredths as noise.")
+        print("\n   A stop too wide costs a little on every loss. A stop too")
+        print("   tight costs the trades that would have worked. Those are not")
+        print("   the same mistake, so tighten only on a difference that is")
+        print("   plainly larger than the wobble between these rows.")
+
     return outcomes
 
 
@@ -783,6 +927,62 @@ def self_test() -> int:
     if t.outcome != "time":
         failures.append(f"an unresolved trade should close at the bell, got {t.outcome}")
 
+    # --- recency weighting -------------------------------------------------
+    span = [date(2026, 6, 12) + timedelta(days=i) for i in range(40)]
+    w = recency_weights(span, half_life=10)
+    if abs(w[span[-1]] - 1.0) > 1e-9:
+        failures.append("the newest session should weigh 1")
+    if abs(w[span[-11]] - 0.5) > 1e-9:
+        failures.append(f"ten sessions back should weigh a half, got {w[span[-11]]}")
+    if abs(w[span[-21]] - 0.25) > 1e-9:
+        failures.append("twenty back should weigh a quarter")
+    if any(w[span[i]] > w[span[i + 1]] for i in range(len(span) - 1)):
+        failures.append("weights must rise with recency, never fall")
+
+    # Weighting discards information, and the effective sample says how
+    # much. Equal weights must come back as the real count.
+    if abs(effective_n([1.0] * 40) - 40) > 1e-9:
+        failures.append("equal weights are worth their own count")
+    if effective_n([w[d] for d in span]) >= 40:
+        failures.append("a weighted sample cannot be worth more than its count")
+    if effective_n([]) != 0.0:
+        failures.append("nothing weighs nothing")
+
+    # A weighted quantile with equal weights is an ordinary one, and
+    # piling weight on the low values must pull it down.
+    flat = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+    even = pd.Series([1.0] * 10)
+    mid = weighted_quantile(flat, even, 0.5)
+    if mid is None or not (4.5 <= mid <= 6.0):
+        failures.append(f"an evenly weighted median should sit mid-range: {mid}")
+    low_heavy = pd.Series([10.0] * 5 + [0.01] * 5)
+    pulled = weighted_quantile(flat, low_heavy, 0.5)
+    if pulled is None or pulled >= mid:
+        failures.append(f"weighting the low half must pull the quantile down: "
+                        f"{pulled} vs {mid}")
+    if weighted_quantile(flat, pd.Series([0.0] * 10), 0.5) is not None:
+        failures.append("weights summing to zero should yield nothing")
+    if weighted_quantile(pd.Series([], dtype=float), pd.Series([], dtype=float),
+                         0.5) is not None:
+        failures.append("no values should yield nothing")
+
+    # The stop is sized on winners only. Including the losers is what
+    # produced the 1% that had to be corrected.
+    rows = pd.DataFrame({
+        "ret_60": [2.0, 1.5, 0.8, -3.0, -4.0],
+        "mae_60": [-0.2, -0.4, -0.6, -3.0, -5.0],
+    })
+    won = winners(rows)
+    if len(won) != 3:
+        failures.append(f"three of those finished up 0.5%, got {len(won)}")
+    tight = stop_for(won)
+    loose = stop_for(rows)
+    if tight is None or loose is None or tight >= loose:
+        failures.append("sizing on winners must give a tighter stop than "
+                        "sizing on everything")
+    if stop_for(rows.iloc[0:0]) is not None:
+        failures.append("no rows should size no stop")
+
     # MFE and MAE must bracket the realised move.
     rows = signal_outcomes(up, [0])
     if rows:
@@ -799,6 +999,10 @@ def self_test() -> int:
     print("  Bar touching both levels       : stop (pessimistic, as specified)")
     print("  Entry fill price               : next bar's open")
     print("  Unresolved trade               : closed at 16:00")
+    print("  Recency weights                : newest 1.0, one half-life back 0.5")
+    print(f"  40 sessions, half-life 10      : worth "
+          f"{effective_n([w[d] for d in span]):.0f} equally-weighted")
+    print("  Stop sizing                    : winners only, tighter than all")
 
     if failures:
         print("\nFAILED:")
