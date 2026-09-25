@@ -232,6 +232,16 @@ resting on three days. A stop too wide costs a little on every loss; a
 stop too tight costs the trades that would have worked, so tighten only
 on a difference plainly larger than the wobble between the rows.
 
+**Does the signal beat chance in the current regime?** Section 10 scores
+every stop/target pair on the recent third against a control entering
+every fifth bar over the same sessions, and reports **how many cells beat
+it** rather than which one won. That count is the answer. Search 36
+brackets on a thin sample and one will look excellent by accident — which
+is exactly how a three-day result once passed for an edge here. A real
+edge shows up as most cells beating the control, because it does not
+depend on the levels. Validated against synthetic sessions: a planted
+edge scores 36 of 36, noise scores 14 of 36.
+
 **No out-of-sample past exists.** SPCX listed on 12 June 2026, so the
 90-day sample is its entire history. The VWAP hypothesis in
 `swing_study.py` is pre-registered in the source and can only be tested

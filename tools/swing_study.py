@@ -88,6 +88,10 @@ HORIZONS_MIN = (15, 30, 60)
 # so an edge of a few thousandths of a percent per trade buys nothing.
 MIN_EDGE_PCT = 0.05
 
+#: Below this a cell is not scored at all. Twenty trades is already thin;
+#: fewer is a number with no business being compared to anything.
+MIN_TRADES = 20
+
 # The baseline samples every Nth bar rather than all 390. Entering at
 # every minute of 30 days is ~11,700 trades per grid cell, which is slow
 # and no more informative than a fifth of them.
@@ -515,7 +519,7 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
                     trades += simulate(session, entry_picker(session), stop_pct, target_pct)
                 s = score(trades)
                 cells.append(s["avg_return"])
-                if s["n"] >= 20 and (best is None or s["avg_return"] > best[0]):
+                if s["n"] >= MIN_TRADES and (best is None or s["avg_return"] > best[0]):
                     best = (s["avg_return"], stop_pct, target_pct, s)
             print(f"   {stop_pct:>6.2f}%       " + "".join(f"{c:>10.3f}" for c in cells))
         return best
@@ -846,6 +850,74 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
         print("   tight costs the trades that would have worked. Those are not")
         print("   the same mistake, so tighten only on a difference that is")
         print("   plainly larger than the wobble between these rows.")
+
+    # ---- 10. the recent regime, scored against its own control ----------
+    print(f"\n{rule}")
+    print("10. THE RECENT REGIME -- does the signal beat chance NOW?\n")
+    recent = days[2 * (len(days) // 3):]
+    recent_sessions = {d: s for d, s in sessions.items() if d in recent}
+
+    if len(recent_sessions) < 10:
+        print("   Too few recent sessions to score. Ask for more days.")
+    else:
+        beat, cells, best_cell = 0, 0, None
+        for stop_pct in STOP_GRID:
+            for target_pct in TARGET_GRID:
+                sig, base = [], []
+                for session in recent_sessions.values():
+                    entries = [i for i in range(len(session))
+                               if bool(session["alert"].iloc[i])]
+                    sig += simulate(session, entries, stop_pct, target_pct)
+                    base += simulate(session,
+                                     list(range(0, len(session) - 1, BASELINE_STRIDE)),
+                                     stop_pct, target_pct)
+                ss, bs = score(sig), score(base)
+                if ss["n"] < MIN_TRADES or bs["n"] < MIN_TRADES:
+                    continue
+                cells += 1
+                edge = ss["avg_return"] - bs["avg_return"]
+                if edge > 0:
+                    beat += 1
+                if best_cell is None or edge > best_cell[0]:
+                    best_cell = (edge, stop_pct, target_pct, ss, bs)
+
+        if not cells:
+            print(f"   No cell had {MIN_TRADES} trades on both sides. Too thin "
+                  f"to judge.")
+        else:
+            share = 100.0 * beat / cells
+            print(f"   {len(recent_sessions)} sessions, {cells} bracket "
+                  f"combinations with enough trades on both sides.\n")
+            print(f"   Cells where the signal beat its own control : "
+                  f"{beat} of {cells}  ({share:.0f}%)\n")
+            print("   This count is the answer, not the best cell. Search 36")
+            print("   brackets on a thin sample and one will look excellent by")
+            print("   accident -- that is how a three-day result once passed for")
+            print("   an edge here. A real edge shows up as MOST cells beating")
+            print("   the control, because it does not depend on the levels.")
+            if share >= 70:
+                verdict = ("Most cells beat chance. Worth a forward test with "
+                           "one bracket fixed in advance.")
+            elif share <= 30:
+                verdict = ("Most cells LOST to chance. The signal is not "
+                           "working in this regime.")
+            else:
+                verdict = ("About half either way, which is what a coin flip "
+                           "looks like. No edge here.")
+            print(f"\n   {verdict}")
+
+            edge, sp, tp, ss, bs = best_cell
+            print(f"\n   Best of the {cells}, and inflated by being the best "
+                  f"of {cells}:")
+            print(f"     {sp:.2f}% stop / {tp:.2f}% target")
+            print(f"     signal   {ss['avg_return']:+.3f}% over {ss['n']} trades")
+            print(f"     control  {bs['avg_return']:+.3f}% over {bs['n']} trades")
+            print(f"     edge     {edge:+.3f}% a trade"
+                  + ("  -- inside the spread, so it is nothing"
+                     if abs(edge) < MIN_EDGE_PCT else ""))
+            print("\n   Do not trade that cell because it topped this table.")
+            print("   Pick a bracket for reasons that exist before the search,")
+            print("   then measure it forward.")
 
     return outcomes
 
