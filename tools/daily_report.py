@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import json
 import os
 import sqlite3
@@ -32,6 +33,7 @@ import statistics
 import subprocess
 import sys
 import textwrap
+import zipfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -397,6 +399,87 @@ def load_notes(path: str, symbol: str, day: date) -> List[Note]:
     return sorted(notes, key=lambda note: note.at)
 
 
+def read_xlsx(path: str) -> List[Dict[str, str]]:
+    """A spreadsheet's cells, by column letter, using only the standard library.
+
+    An .xlsx is a zip of XML, so this needs no openpyxl and therefore no
+    pip install on the machine that actually runs it. Values are keyed by
+    COLUMN LETTER rather than position: IBKR's confirmation sheet merges
+    cells, so a row's tenth value is not its tenth column, and reading
+    positionally puts the price where the quantity should be.
+    """
+    with zipfile.ZipFile(path) as book:
+        shared: List[str] = []
+        if "xl/sharedStrings.xml" in book.namelist():
+            raw = book.read("xl/sharedStrings.xml").decode("utf-8")
+            shared = [re.sub(r"<[^>]+>", "", piece)
+                      for piece in re.findall(r"<si>(.*?)</si>", raw, re.S)]
+        sheet = book.read("xl/worksheets/sheet1.xml").decode("utf-8")
+
+    rows: List[Dict[str, str]] = []
+    for chunk in re.findall(r"<row[^>]*>.*?</row>", sheet, re.S):
+        cells: Dict[str, str] = {}
+        # An empty cell is written self-closing -- <c r="C22" s="100"/> --
+        # and a pattern that only knows the <c ...>...</c> form runs
+        # straight past it to the NEXT closing tag, swallowing the two
+        # columns in between. Merged sheets are full of empty cells, so
+        # this is the common case rather than an edge one.
+        for cell in re.finditer(
+                r'<c r="([A-Z]+)\d+"([^>]*?)(?:/>|>(.*?)</c>)', chunk, re.S):
+            column, attrs, body = cell.groups()
+            value = re.search(r"<v>(.*?)</v>", body or "", re.S)
+            if not value:
+                continue
+            if 't="s"' in attrs:
+                index = int(value.group(1))
+                cells[column] = shared[index] if index < len(shared) else ""
+            else:
+                cells[column] = value.group(1)
+        if cells:
+            rows.append(cells)
+    return rows
+
+
+#: Where each field sits in an IBKR Trade Confirmation spreadsheet.
+IBKR_COLUMNS = dict(symbol="B", at="E", exchange="I", side="J",
+                    quantity="L", price="N")
+
+
+def read_ibkr(path: str, symbol: str, day: date) -> List[Fill]:
+    """Fills from an IBKR Trade Confirmation spreadsheet.
+
+    The sheet lists every order TWICE: once as a summary with the
+    exchange shown as "-", then once per venue that actually filled it.
+    Reading both doubles the day. The summaries are dropped.
+
+    Sell quantities arrive negative, which is IBKR's convention for a
+    reduction rather than a direction to be preserved -- the side column
+    already says which way the trade went.
+    """
+    fills: List[Fill] = []
+    for row in read_xlsx(path):
+        got = {name: row.get(column, "") for name, column in IBKR_COLUMNS.items()}
+        if got["symbol"].strip().upper() != symbol.upper():
+            continue
+        if got["exchange"].strip() in ("", "-"):
+            continue                      # the order summary, not a fill
+        try:
+            at = datetime.strptime(got["at"].strip(), "%Y-%m-%d, %H:%M:%S")
+        except ValueError:
+            continue
+        if at.date() != day:
+            continue
+        try:
+            fills.append(Fill(
+                at=at.replace(tzinfo=ET),
+                side="buy" if got["side"].strip().upper().startswith("B") else "sell",
+                quantity=abs(float(got["quantity"].replace(",", ""))),
+                price=float(got["price"])))
+        except (TypeError, ValueError):
+            continue
+    return fills
+
+
 def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
     """The day's round trips for one symbol, or nothing at all.
 
@@ -405,6 +488,13 @@ def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
     did not trade, and that is a difference worth knowing about. The
     chart is still built either way.
     """
+    if path.lower().endswith((".xlsx", ".xlsm")):
+        try:
+            return pair_fills(read_ibkr(path, symbol, day))
+        except (OSError, KeyError, zipfile.BadZipFile) as exc:
+            print(f"  trades: could not read {path} — {type(exc).__name__}")
+            return []
+
     try:
         with open(path, newline="", encoding="utf-8-sig") as handle:
             rows = list(csv.DictReader(handle))
@@ -1297,6 +1387,58 @@ def self_test() -> int:
             failures.append("unrecognised headers should yield no trades")
         print("    ^ that complaint is the expected outcome, not a failure\n")
 
+    # --- reading a spreadsheet --------------------------------------------
+    # The failure this guards against did not raise: empty cells are
+    # written self-closing, and a pattern that only knows the
+    # <c ...>...</c> form runs past them to the next closing tag and
+    # swallows the columns in between. The reader returned rows, with
+    # the price where the quantity should be.
+    with tempfile.TemporaryDirectory() as folder:
+        book = os.path.join(folder, "trades.xlsx")
+        strings = "".join(f"<si><t>{s}</t></si>" for s in
+                          ("SPCX", "2026-09-25, 10:12:00", "NASDAQ", "BUY", "-"))
+        def cell(ref, value, shared=False):
+            if value is None:
+                return f'<c r="{ref}" s="1"/>'      # the self-closing kind
+            t = ' t="s"' if shared else ""
+            return f'<c r="{ref}" s="1"{t}><v>{value}</v></c>'
+        rows = "".join([
+            "<row r='1'>" + cell("B1", 0, True) + cell("C1", None)
+            + cell("D1", None) + cell("E1", 1, True) + cell("F1", None)
+            + cell("I1", 2, True) + cell("J1", 3, True) + cell("K1", None)
+            + cell("L1", 400) + cell("M1", None) + cell("N1", 152.4) + "</row>",
+            # The order summary for the same fill: exchange "-", and it
+            # must not be counted a second time.
+            "<row r='2'>" + cell("B2", 0, True) + cell("E2", 1, True)
+            + cell("I2", 4, True) + cell("J2", 3, True) + cell("L2", 400)
+            + cell("N2", 152.4) + "</row>",
+        ])
+        with zipfile.ZipFile(book, "w") as out:
+            out.writestr("xl/sharedStrings.xml",
+                         f'<sst xmlns="x">{strings}</sst>')
+            out.writestr("xl/worksheets/sheet1.xml",
+                         f'<worksheet xmlns="x"><sheetData>{rows}'
+                         f'</sheetData></worksheet>')
+
+        got = read_xlsx(book)
+        if not got or got[0].get("L") != "400":
+            failures.append(f"an empty cell should not swallow the columns "
+                            f"after it: {got[0] if got else got}")
+        if got and got[0].get("N") != "152.4":
+            failures.append(f"the price column should survive the gaps: "
+                            f"{got[0].get('N')}")
+        if got and got[0].get("E") != "2026-09-25, 10:12:00":
+            failures.append("a shared string should be resolved, not its index")
+
+        fills = read_ibkr(book, "SPCX", day)
+        if len(fills) != 1:
+            failures.append(f"the order summary row should be dropped, "
+                            f"leaving one fill, got {len(fills)}")
+        elif fills[0].quantity != 400 or fills[0].price != 152.4:
+            failures.append(f"fill read wrong: {fills[0]}")
+        if read_ibkr(book, "NVDA", day):
+            failures.append("another symbol's rows are not this one's")
+
     # The wrap keeps a label narrow enough to sit beside its candle.
     long_note = Note(at=time(10, 0), who="jason", text="word " * 40)
     if max(len(line) for line in long_note.label.splitlines()) > NOTE_WRAP + 2:
@@ -1312,6 +1454,8 @@ def self_test() -> int:
     print("  Unmatched buy                  : an open position, not an error")
     print("  Unmatched sell                 : a short, left alone")
     print("  Broker headers                 : sniffed; unknown ones reported")
+    print("  Spreadsheet, empty cells       : do not swallow the next columns")
+    print("  IBKR order summaries           : dropped, so nothing counts twice")
 
     if failures:
         print("\nFAILED:")
