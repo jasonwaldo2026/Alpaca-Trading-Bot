@@ -476,13 +476,38 @@ def loud(session: pd.DataFrame, usual: Dict[time, float],
     return (got / expected.where(expected > 0)).fillna(0.0) >= multiple
 
 
-def lean_entries(session: pd.DataFrame, usual: Dict[time, float]) -> List[int]:
+def lean_entries(session: pd.DataFrame, usual: Dict[time, float],
+                 window: int = PRESSURE_MINUTES) -> List[int]:
     """Where the live alarm would ring on the buy side: the tape leaning
     past the pressing band with real volume behind it."""
-    lean = lean_series(session)
+    lean = lean_series(session, window)
     hot = loud(session, usual)
     return [i for i in range(len(session))
             if lean.iloc[i] >= PRESSING_HIGH and bool(hot.iloc[i])]
+
+
+def sell_entries(session: pd.DataFrame, usual: Dict[time, float],
+                 window: int = PRESSURE_MINUTES) -> List[int]:
+    """Where the live alarm rings on the SELL side -- scored here as a BUY.
+
+    Section 11 left this out by assumption, not by measurement: "a
+    sell-side trigger is an exit rather than an entry and cannot be
+    scored this way". That is only true if the alarm marks the start of
+    a decline. It may mark the end of one.
+
+    The lean is a volume-weighted average of where price closed in its
+    range over the last `window` minutes. It is a description of selling
+    that has ALREADY happened, so it cannot fire at a top -- nothing
+    bearish has occurred there yet. It fires when the selling is at its
+    heaviest, which is either the middle of a slide or its exhaustion.
+    Which of those it usually is, is the question this scores.
+
+    Long-only, so if it marks exhaustion it marks an entry.
+    """
+    lean = lean_series(session, window)
+    hot = loud(session, usual)
+    return [i for i in range(len(session))
+            if lean.iloc[i] <= PRESSING_LOW and bool(hot.iloc[i])]
 
 
 def vwap_entries(session: pd.DataFrame, usual: Dict[time, float]) -> List[int]:
@@ -1264,6 +1289,89 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
         print("   The two enter from opposite places: one after strength is")
         print("   visible, this one before. Nor does a good result here prove")
         print("   anything yet -- it means pre-register it and measure forward.")
+
+    # ---- 13. the sell alarm, scored as a buy ---------------------------
+    print(f"\n{rule}")
+    print("13. THE SELL ALARM, SCORED AS A BUY\n")
+    print("   Section 11 left this out by assumption: a sell-side trigger")
+    print("   was called an exit and never scored. That holds only if the")
+    print("   alarm marks the START of a decline. The lean averages selling")
+    print("   that has already happened, so it cannot fire at a top -- it")
+    print("   fires where selling is heaviest, which is either mid-slide or")
+    print("   exhaustion. Long-only: if it is exhaustion, it is an entry.")
+
+    if len(recent_sessions) < 10:
+        print("\n   Too few recent sessions to score.")
+    else:
+        usual = slot_volume(sessions)
+        print(f"\n   {len(recent_sessions)} recent sessions, the same ones"
+              f" scored in 10, 11 and 12.\n")
+        print(f"   {'Lean window':<26}{'Entries':>9}{'Beat control':>15}"
+              f"{'Verdict':>12}")
+
+        scored: Dict[int, List[int]] = {}
+        for minutes in (2, 3, PRESSURE_MINUTES):
+            picked = {d: sell_entries(ses, usual, minutes)
+                      for d, ses in recent_sessions.items()}
+            scored[minutes] = picked
+            fired = sum(len(v) for v in picked.values())
+            beat, cells, _ = beat_the_control(recent_sessions, picked)
+            label = (f"{minutes} minutes"
+                     + (" (live now)" if minutes == PRESSURE_MINUTES else ""))
+            if not cells:
+                print(f"   {label:<26}{fired:>9}{'too thin':>15}{'--':>12}")
+                continue
+            share = 100.0 * beat / cells
+            verdict = ("edge?" if share >= 70 else
+                       "loses" if share <= 30 else "chance")
+            print(f"   {label:<26}{fired:>9}"
+                  f"{str(beat) + ' of ' + str(cells):>15}{verdict:>12}")
+
+        print("\n   The window is how many minutes of tape the lean averages.")
+        print("   Shorter fires earlier and noisier; longer is surer and")
+        print("   later. That trade-off is the whole tuning question, so it")
+        print("   is shown rather than chosen.")
+
+        # What the alarm looks like from either side, at the live window.
+        # Joined on the signal's timestamp, never on position: an entry
+        # too close to the bell to fill is dropped by signal_outcomes,
+        # so zipping the two lists would silently pair each alarm with
+        # some other alarm's outcome.
+        live = scored[PRESSURE_MINUTES]
+        rows: List[dict] = []
+        for day, session in recent_sessions.items():
+            closes = session["close"].to_numpy()
+            fell = {}
+            for i in live[day]:
+                before = closes[max(0, i - PRESSURE_MINUTES)]
+                fell[session.index[i]] = 100.0 * (closes[i] - before) / before
+            for row in signal_outcomes(session, live[day]):
+                row["drop"] = fell[row["time"]]
+                rows.append(row)
+
+        frame = pd.DataFrame(rows)
+        if len(frame) < MIN_TRADES or "mfe_60" not in frame:
+            print(f"\n   Only {len(frame)} alarms -- too few to describe.")
+        else:
+            higher = 100.0 * (frame["ret_60"] > 0).mean()
+            print(f"\n   Either side of the alarm, {len(frame)} of them:\n")
+            print(f"   {'':<34}{'median':>10}{'lower qtr':>12}{'upper qtr':>12}")
+            for label, column in (
+                    (f"fell in the {PRESSURE_MINUTES} min before", "drop"),
+                    ("best case reached, next 60 min", "mfe_60"),
+                    ("worst case first, next 60 min", "mae_60")):
+                print(f"   {label:<34}{pct(frame[column], 0.5):>9.2f}%"
+                      f"{pct(frame[column], 0.25):>11.2f}%"
+                      f"{pct(frame[column], 0.75):>11.2f}%")
+            print(f"\n   Higher an hour later: {higher:.0f}% of the time.")
+            print("   A flush that gets bought back shows a deep 'fell")
+            print("   before' and a best case larger than the worst case.")
+            print("   A slide that kept going shows the opposite.")
+
+        print("\n   Whatever this says, it says it about one stock over a few")
+        print("   dozen recent sessions, and the grid cells are not")
+        print("   independent. A good number here means pre-register it and")
+        print("   watch it forward, exactly as everywhere else in this file.")
 
     return outcomes
 

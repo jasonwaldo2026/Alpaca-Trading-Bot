@@ -744,9 +744,55 @@ def spike_line(candle: Candle) -> str:
             f"{candle.at:%H:%M} **")
 
 
+#: The S&P 500 stand-in. SPY rather than the index itself: the index
+#: has no minute bars on this feed and the ETF that tracks it does, and
+#: for "is the whole market down or just this one" they are the same
+#: statement to within a rounding error.
+BENCHMARK = "SPY"
+
+
+def market_line(change_pct: Optional[float]) -> Optional[str]:
+    """The market's move today, or nothing at all.
+
+    It sits under the stock's own move so the two read as a pair: a 1%
+    fall while the market falls 1% is a different trade from a 1% fall
+    while the market is flat, and the difference should not require
+    opening another app at the moment it matters.
+
+    Returns None rather than a placeholder when the number is missing.
+    A line reading "S&P 500 --" spends a line of a lock-screen alert on
+    the news that we do not know something.
+    """
+    if change_pct is None:
+        return None
+    arrow = "▲" if change_pct >= 0 else "▼"
+    return f"S&P 500 {arrow} {change_pct:+.2f}%"
+
+
+def market_move(prev_close: Optional[float], start: datetime,
+                end: datetime) -> Optional[float]:
+    """The benchmark's percentage move today, or None.
+
+    Every failure path returns None and the alert simply omits the line.
+    The S&P is context: an alert that did not send because a second
+    symbol was unreachable would trade the thing the tool exists for
+    against a nicety.
+    """
+    if prev_close is None or prev_close <= 0:
+        return None
+    try:
+        frame = fetch_minutes(BENCHMARK, start, end)
+        if frame is None or frame.empty:
+            return None
+        return 100.0 * (float(frame["close"].iloc[-1]) - prev_close) / prev_close
+    except Exception:      # noqa: BLE001 -- context, never a blocker
+        return None
+
+
 def describe(symbol: str, candle: Candle, day: Optional[Day] = None,
              lean: Optional[Lean] = None,
-             multiple: float = VOLUME_ALERT_MULTIPLE) -> str:
+             multiple: float = VOLUME_ALERT_MULTIPLE,
+             market: Optional[float] = None) -> str:
     """One alert, short enough to read at a traffic light.
 
     Four lines at most: where the stock is, where that sits, which way
@@ -771,6 +817,10 @@ def describe(symbol: str, candle: Candle, day: Optional[Day] = None,
     if candle.at.time() < time(9, 30):
         head += "  (pre-market)"
     lines.append(head)
+
+    benchmark = market_line(market)
+    if benchmark is not None:
+        lines.append(benchmark)
 
     if day is not None:
         lines.append(day.line())
@@ -1238,6 +1288,10 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
     # phone. None is survivable: the day's move is the line that goes.
     alarms = Alarms()
     prev_close = previous_close(symbol, today)
+    # The benchmark's own yesterday, fetched once. If either half is
+    # missing the market line is simply absent -- it is context, and no
+    # alert should fail to send because the S&P was unreachable.
+    market_prev = previous_close(BENCHMARK, today)
     if prev_close:
         print(f"  yesterday's close {money(prev_close)} — today's move is "
               f"measured from it\n")
@@ -1263,6 +1317,11 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
 
             done_minutes = drop_forming(minutes, now, 1)
 
+            # The market's move, read once per pass rather than once per
+            # minute: several minutes can arrive together after a slow
+            # fetch, and they all happened under the same S&P reading.
+            market = market_move(market_prev, window_start, min(now, window_end))
+
             # --- the quiet per-minute update ---------------------------
             for stamp, row in done_minutes.iterrows():
                 if stamp in seen_minutes:
@@ -1286,7 +1345,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 ringing = call is not None and alarms.should_sound(call[0], stamp)
                 # Past the detail window only the unusual leaves the machine.
                 push = reaches_phone(stamp.time(), spiked, detail_until) or ringing
-                message = describe(symbol, minute, day, lean, multiple)
+                message = describe(symbol, minute, day, lean, multiple, market)
                 fresh = remember_minute(db, symbol, minute, lean,
                                         sent=push and not dry_run)
                 if ringing:
@@ -1639,6 +1698,38 @@ def self_test() -> int:
                                    low=up.low, close=up.close, volume=up.volume))
     if "SPCX" not in bare or len(bare.splitlines()) != 1:
         failures.append(f"with no context, one line: {bare!r}")
+
+    # ---- the market line -----------------------------------------------
+    # It must track the benchmark's sign, sit directly under the stock's
+    # own move so the two read as a pair, and vanish entirely when the
+    # number is missing rather than printing that we do not know.
+    if market_line(None) is not None:
+        failures.append("an unknown market move should add no line at all")
+    if "▲ +0.40%" not in (market_line(0.4) or ""):
+        failures.append(f"a rising market reads up: {market_line(0.4)}")
+    if "▼ -1.20%" not in (market_line(-1.2) or ""):
+        failures.append(f"a falling market reads down: {market_line(-1.2)}")
+    if market_line(0.0) is None or "▲" not in market_line(0.0):
+        failures.append("an unchanged market is not a missing one")
+
+    withmkt = describe("SPCX", up, day, buyers, market=-1.2).splitlines()
+    if len(withmkt) != len(alarm.splitlines()) + 1:
+        failures.append("the market line should add exactly one line")
+    # Directly under the stock's own move, wherever that line lands -- a
+    # volume spike pushes a banner above it, so this cannot be a fixed
+    # line number.
+    head = next(i for i, line in enumerate(withmkt) if line.startswith("SPCX $"))
+    if not withmkt[head + 1].startswith("S&P 500"):
+        failures.append(f"the market belongs directly under the stock's own "
+                        f"move, got {withmkt[head + 1]!r}")
+    if "S&P" in describe("SPCX", up, day, buyers):
+        failures.append("no market line when no market number was passed")
+
+    # And every failure path in the fetch is silence, not an exception.
+    if market_move(None, at, at) is not None:
+        failures.append("no benchmark close should yield no market move")
+    if market_move(0.0, at, at) is not None:
+        failures.append("a zero benchmark close should not divide")
 
     if PRIORITY_UPDATE >= PRIORITY_SUMMARY:
         failures.append("the routine stream must be quieter than the alarm")
