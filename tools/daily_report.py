@@ -231,7 +231,19 @@ NOTE_LINE, NOTE_PAD = 0.046, 0.020
 #: Where the day's fills live. NEVER committed -- .gitignore carries a
 #: rule for it, because these are account records rather than research.
 #: Absent, the chart draws without them, so a fresh checkout still works.
-TRADES_PATH = "trades.csv"
+#: Looked for in this order when --trades is not given. The
+#: spreadsheet comes first because it is the one with execution times.
+TRADES_PATHS = ("trades.xlsx", "trades.csv")
+
+
+def find_trades(given: Optional[str]) -> Optional[str]:
+    """The trades file to read: the one asked for, or the first that exists."""
+    if given:
+        return given
+    for candidate in TRADES_PATHS:
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 #: Column names the two brokers might use for the same thing. Robinhood
 #: and DAS disagree with each other and with themselves across export
@@ -731,7 +743,8 @@ def market_move(symbol: str, day: date, start: time, end: time,
 
 
 def gather(symbol: str, day: date, start: time, end: time, db_path: str,
-           force_sip: bool = True, benchmark: str = BENCHMARK) -> Optional[Session]:
+           force_sip: bool = True, benchmark: str = BENCHMARK,
+           trades_path: Optional[str] = None) -> Optional[Session]:
     """Build a session. `force_sip` is right for a past day -- the free plan
     serves the full tape historically -- and wrong for today, where SIP is
     15 minutes behind and the live feed is what the alerts are reading."""
@@ -760,7 +773,7 @@ def gather(symbol: str, day: date, start: time, end: time, db_path: str,
         baseline=slot_baseline(symbol, day, start, end, force_sip=force_sip),
         signals=logged_signals(db_path, symbol, day),
         notes=load_notes(NOTES_PATH, symbol, day),
-        trades=load_trades(TRADES_PATH, symbol, day),
+        trades=load_trades(trades_path, symbol, day) if trades_path else [],
         macd=macd,
         start=start, end=end,
         benchmark=market_move(benchmark, day, start, end, force_sip),
@@ -1478,6 +1491,9 @@ def main() -> int:
     parser.add_argument("--until", dest="end", default=f"{WINDOW_END:%H:%M}")
     parser.add_argument("--db", default="spcx_alerts.db")
     parser.add_argument("--out", help="Where to write it")
+    parser.add_argument("--trades", metavar="FILE", default=None,
+                        help="IBKR .xlsx or a fills .csv "
+                             "(default: trades.xlsx, then trades.csv)")
     parser.add_argument("--self-test", action="store_true",
                         help="Check the notes layer offline")
     parser.add_argument("--no-open", action="store_true", help="Write it, do not open it")
@@ -1493,6 +1509,7 @@ def main() -> int:
 
     print(f"Building {symbol} report for {day}...")
     session = gather(symbol, day, start, end, args.db,
+                     trades_path=find_trades(args.trades),
                      benchmark=args.benchmark)
     if session is None:
         print(f"  no bars for {symbol} on {day}. Market closed that day?")
