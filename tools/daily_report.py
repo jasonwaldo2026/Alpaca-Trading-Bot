@@ -436,16 +436,46 @@ class Note:
     at: time
     who: str
     text: str
+    kind: str = ""            # "" an observation, "in"/"out" a read
 
     @property
     def mine(self) -> bool:
         return self.who.lower() not in ("jason", "you")
 
     @property
+    def read(self) -> bool:
+        """What was seen BEFORE acting, as opposed to about the day.
+
+        Kept apart from an observation because the two answer different
+        questions and only one of them can be scored. A read precedes an
+        outcome it does not know; an observation written at 21:00 knows
+        everything, which is what makes it useless as evidence.
+        """
+        return self.kind in ("in", "out")
+
+    @property
     def label(self) -> str:
         head = "Me" if self.mine else "You"
+        if self.kind == "in":
+            head = "IN"
+        elif self.kind == "out":
+            head = "OUT"
         body = "\n".join(textwrap.wrap(self.text, NOTE_WRAP))
         return f"{self.at:%H:%M}  {head}\n{body}"
+
+
+def split_read(text: str) -> Tuple[str, str]:
+    """An "IN:"/"OUT:" prefix off the front of a note.
+
+    The prefix exists because the note has to be writable on a phone
+    with a position open. Typing {"kind": "in"} at 11:03 is not going to
+    happen; typing "IN: sellers exhausted" might. An explicit "kind" in
+    the file still wins, so the JSON stays the source of truth.
+    """
+    head, sep, rest = text.partition(":")
+    if sep and head.strip().lower() in ("in", "out"):
+        return head.strip().lower(), rest.strip()
+    return "", text
 
 
 def load_notes(path: str, symbol: str, day: date) -> List[Note]:
@@ -468,8 +498,10 @@ def load_notes(path: str, symbol: str, day: date) -> List[Note]:
             if entry["date"] != f"{day:%Y-%m-%d}":
                 continue
             hh, mm = (int(part) for part in entry["time"].split(":"))
+            kind, text = split_read(str(entry["note"]))
             notes.append(Note(at=time(hh, mm), who=str(entry.get("who", "")),
-                              text=str(entry["note"])))
+                              text=text,
+                              kind=str(entry.get("kind", kind)).strip().lower()))
         except (KeyError, TypeError, ValueError):
             continue          # one bad entry is not the whole file
     return sorted(notes, key=lambda note: note.at)
@@ -874,10 +906,47 @@ def draw_trades(price, trades: List[Trade], slot_of: Dict, candles) -> None:
                        zorder=6)
 
 
-def draw_notes(price, notes: List[Note], slot_of: Dict, candles) -> None:
+#: How near a fill a read has to be to count as that fill's reason.
+#: Three minutes: long enough that a note typed one-handed while an
+#: order works still lands on it, short enough that it cannot reach
+#: past the next decision and explain the wrong trade.
+READ_MINUTES = 3
+
+
+def reason_for(note: Note, trades: Sequence[Trade]) -> Optional[Tuple[datetime, float]]:
+    """The fill a read is the reason for, if one is close enough.
+
+    An IN: note looks for an entry and an OUT: note for an exit --
+    never the other way round, since a read taken before buying does
+    not explain a sale eleven seconds later. Nothing near enough
+    returns None and the note is drawn where any other note would be."""
+    if not note.read:
+        return None
+    want = []
+    for trade in trades:
+        if note.kind == 'in':
+            want.append((trade.opened, trade.entry))
+        elif trade.closed is not None and trade.exit is not None:
+            want.append((trade.closed, trade.exit))
+    if not want:
+        return None
+    when = datetime.combine(want[0][0].date(), note.at, tzinfo=ET)
+    nearest = min(want, key=lambda w: abs((w[0] - when).total_seconds()))
+    if abs((nearest[0] - when).total_seconds()) > READ_MINUTES * 60:
+        return None
+    return nearest
+
+
+def draw_notes(price, notes: List[Note], slot_of: Dict, candles,
+               trades: Sequence[Trade] = ()) -> None:
     """Ring the bar a note is about, and write the note beside it.
 
-    Two decisions worth keeping:
+    Three decisions worth keeping:
+
+    A read -- what was seen just before acting -- is pinned to the
+    fill it explains rather than to the middle of the candle, so the
+    reason and the price paid for it are the same mark on the page.
+    An observation about the day still rings the whole bar.
 
     The ring goes round the whole candle rather than a single price, so
     it marks the moment rather than a point inside it, and it is drawn
@@ -932,6 +1001,9 @@ def draw_notes(price, notes: List[Note], slot_of: Dict, candles) -> None:
         x = slot_of[slot]
         bar = candles.loc[slot]
         middle = float(bar["high"] + bar["low"]) / 2.0
+        fill = reason_for(note, trades)
+        if fill is not None:
+            middle = fill[1]        # the price actually paid
 
         # Sit above anything already occupying this stretch of x. Two
         # notes on the same minute -- yours and mine on the same moment
@@ -945,7 +1017,7 @@ def draw_notes(price, notes: List[Note], slot_of: Dict, candles) -> None:
         margin = wide * 0.085
         x_text = min(max(x, margin), wide - margin)
 
-        spots.append([x, x_text, note, middle, 0.0])
+        spots.append([x, x_text, note, middle, 0.0, fill is not None])
 
     bottoms = stack_notes(heights, columns, BOX_SLOTS)
     for spot, bottom in zip(spots, bottoms):
@@ -964,8 +1036,11 @@ def draw_notes(price, notes: List[Note], slot_of: Dict, candles) -> None:
     low, _ = price.get_ylim()
     price.set_ylim(low, low + (top - low) / floor)
 
-    for x, x_text, note, middle, bottom in spots:
-        price.scatter([x], [middle], s=300, facecolors="none",
+    for x, x_text, note, middle, bottom, pinned in spots:
+        # A read pinned to a fill rings tighter, because it is marking
+        # one price rather than a whole bar's worth of them.
+        price.scatter([x], [middle], s=140 if pinned else 300,
+                      facecolors="none",
                       edgecolors=INK_2, linewidths=1.4, zorder=5,
                       linestyle=(0, (2, 1.5)) if note.mine else "solid")
         price.annotate(
@@ -1267,7 +1342,8 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
                linestyle=(0, (5, 2)), label="VWAP", zorder=3)
 
     draw_trades(price, session.trades, slot_of, candles)
-    draw_notes(price, session.notes, slot_of, candles)
+    draw_notes(price, session.notes, slot_of, candles,
+               session.trades)
 
     signal_x = []
     if not session.signals.empty:
@@ -1515,8 +1591,10 @@ def build(session: Session, path: str) -> str:
         page_overview(pdf, session)
         page_signals(pdf, session)
         info = pdf.infodict()
-        info["Title"] = f"{session.symbol} {session.day:%Y-%m-%d}"
-        info["Subject"] = "Session report — read-only market data, no trades"
+        info["Title"] = f"{session.symbol} Daily Debrief {session.day:%Y-%m-%d}"
+        info["Subject"] = ("Daily Debrief — what was read against what price "
+                           "did. Read-only market data; this tool places no "
+                           "orders.")
     return path
 
 
@@ -1806,6 +1884,42 @@ def self_test() -> int:
     print("  Bad date / time / missing key  : skipped, rest still read")
     print("  Malformed or absent file       : no notes, no exception")
     print("  Author                         : jason -> You, else Me")
+    # --- reads: what was seen before acting --------------------------------
+    for text, want in (("IN: sellers exhausted", ("in", "sellers exhausted")),
+                       ("out: buyers gone", ("out", "buyers gone")),
+                       ("OUT : spaced", ("out", "spaced")),
+                       ("Alarm fired, not a sell", ("", "Alarm fired, not a sell")),
+                       ("11:03 was the bottom", ("", "11:03 was the bottom"))):
+        if split_read(text) != want:
+            failures.append(f"split_read({text!r}) -> {split_read(text)}, "
+                            f"wanted {want}")
+    if not Note(time(11, 3), "jason", "x", "in").read:
+        failures.append("an IN: note is a read")
+    if Note(time(11, 3), "jason", "x").read:
+        failures.append("a plain observation is not a read")
+    if "IN" not in Note(time(11, 3), "jason", "sellers gone", "in").label:
+        failures.append("a read's label should say IN, not You")
+
+    # A read is pinned to the fill it explains, and only to the right
+    # kind of fill: an IN: note must never anchor itself to an exit.
+    trips = [Trade(opened=at(10, 58), closed=at(12, 12), quantity=2300,
+                   entry=146.79, exit=149.41)]
+    got = reason_for(Note(time(10, 59), "jason", "buyers stepping in", "in"),
+                     trips)
+    if not got or round(got[1], 2) != 146.79:
+        failures.append(f"an IN: a minute after the entry should pin to it: {got}")
+    got = reason_for(Note(time(12, 12), "jason", "buyers gone", "out"), trips)
+    if not got or round(got[1], 2) != 149.41:
+        failures.append(f"an OUT: should pin to the exit, got {got}")
+    # The failure that would misattribute a reason: an IN: note near the
+    # EXIT has no entry within reach and must not borrow the exit's.
+    if reason_for(Note(time(12, 12), "jason", "buyers gone", "in"), trips):
+        failures.append("an IN: note must not pin itself to an exit")
+    if reason_for(Note(time(11, 30), "jason", "drifting", "in"), trips):
+        failures.append("a read 32 minutes from any fill explains nothing")
+    if reason_for(Note(time(10, 59), "jason", "quiet"), trips):
+        failures.append("a plain observation is never pinned to a fill")
+
     # --- 12-hour times with no meridiem ------------------------------------
     # The export is newest-first, as Robinhood writes it. 4 through 8 are
     # the genuinely ambiguous hours -- 04:04 is pre-market and 16:04 is
@@ -1951,6 +2065,7 @@ def self_test() -> int:
     print("  Robinhood export               : fills grouped into orders")
     print("  Two accounts                   : never paired with each other")
     print("  A date with no time            : dropped, never mispaired")
+    print("  IN:/OUT: reads                 : pinned to the fill they explain")
 
     if failures:
         print("\nFAILED:")
@@ -2000,7 +2115,9 @@ def main() -> int:
         print(f"  no bars for {symbol} on {day}. Market closed that day?")
         return 1
 
-    path = args.out or f"{symbol}_{day:%Y%m%d}.pdf"
+    # "Daily Debrief" rather than "report": it is read once, argued
+    # with, and used to change something -- not filed.
+    path = args.out or f"{symbol}_debrief_{day:%Y-%m-%d}.pdf"
     build(session, path)
     signals = "no signals logged" if session.signals.empty else \
         f"{len(session.signals)} signals"
