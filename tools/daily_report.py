@@ -24,14 +24,16 @@ READ-ONLY. Market-data client only. No trading client, no order object.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sqlite3
 import statistics
 import subprocess
 import sys
-from dataclasses import dataclass
+import textwrap
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -162,6 +164,7 @@ class Session:
     baseline: Dict[time, float]
     signals: pd.DataFrame
     macd: pd.DataFrame        # 1-minute, the bars the alerts read
+    notes: List[Note] = field(default_factory=list)
     start: time = WINDOW_START      # the window the page is drawn for,
     end: time = WINDOW_END          # not the part of it that has printed
     benchmark: Optional[Tuple[str, float]] = None   # (symbol, % over the window)
@@ -199,6 +202,206 @@ def slot_baseline(symbol: str, day: date, start: time = time(9, 30),
         for stamp, row in aggregate(bars).iterrows():
             gathered.setdefault(stamp.time(), []).append(float(row["volume"]))
     return {slot: statistics.median(v) for slot, v in gathered.items() if v}
+
+
+#: Where the read-at-the-time notes live. Data, not code: adding one is
+#: editing a line of text, and the file is read fresh on every rebuild.
+#: Like the two calendars, a missing or malformed file costs the notes
+#: and nothing else -- a chart that refuses to draw because an annotation
+#: had a typo would be a worse trade than a chart with no annotations.
+NOTES_PATH = "notes.json"
+
+#: A note's text is wrapped to this many characters. Wider than this and
+#: a label swallows the candles it is pointing at; much narrower and a
+#: sentence becomes a column.
+NOTE_WRAP = 30
+
+#: One 6.3pt line of note text as a share of the price panel's height,
+#: and the padding a box adds around its lines. Fractions of the panel
+#: rather than dollars: raising the ceiling to fit a stack changes how
+#: many dollars tall a line of text is, so measuring in price is
+#: circular and the boxes grow as fast as the room made for them.
+NOTE_LINE, NOTE_PAD = 0.046, 0.020
+
+
+def stack_notes(heights: Sequence[float], xs: Sequence[float],
+                width: float) -> List[float]:
+    """Bottom edge for each label so none overlaps another, from zero up.
+
+    A label is placed above anything already occupying its stretch of x,
+    where "its stretch" is `width` slots either side -- the width of the
+    box being avoided. Everything is relative to zero; where the whole
+    layer finally sits is the caller's decision, once the total height
+    is known. Clamping each box as it is placed instead folds the top of
+    a tall stack back down into the one beneath it.
+    """
+    placed: List[Tuple[float, float]] = []
+    bottoms: List[float] = []
+    for height, x in zip(heights, xs):
+        bottom = 0.0
+        for other_x, other_top in placed:
+            if abs(x - other_x) < width:
+                bottom = max(bottom, other_top)
+        bottoms.append(bottom)
+        placed.append((x, bottom + height))
+    return bottoms
+
+
+@dataclass
+class Note:
+    """One observation, made at a moment, by a named someone.
+
+    `who` is carried by the ring's line style AND spelled out in the
+    label, never by colour alone. Notes are annotation rather than a
+    measure, so they wear ink and leave the categorical hues to the
+    series that need them.
+    """
+    at: time
+    who: str
+    text: str
+
+    @property
+    def mine(self) -> bool:
+        return self.who.lower() not in ("jason", "you")
+
+    @property
+    def label(self) -> str:
+        head = "Me" if self.mine else "You"
+        body = "\n".join(textwrap.wrap(self.text, NOTE_WRAP))
+        return f"{self.at:%H:%M}  {head}\n{body}"
+
+
+def load_notes(path: str, symbol: str, day: date) -> List[Note]:
+    """The notes for one symbol on one day, oldest first.
+
+    Every failure is silence: no file, bad JSON, a missing key, a time
+    that will not parse. The chart is the deliverable and an annotation
+    is a garnish on it.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+        entries = raw.get(symbol, [])
+    except (OSError, ValueError, AttributeError):
+        return []
+
+    notes: List[Note] = []
+    for entry in entries:
+        try:
+            if entry["date"] != f"{day:%Y-%m-%d}":
+                continue
+            hh, mm = (int(part) for part in entry["time"].split(":"))
+            notes.append(Note(at=time(hh, mm), who=str(entry.get("who", "")),
+                              text=str(entry["note"])))
+        except (KeyError, TypeError, ValueError):
+            continue          # one bad entry is not the whole file
+    return sorted(notes, key=lambda note: note.at)
+
+
+def draw_notes(price, notes: List[Note], slot_of: Dict, candles) -> None:
+    """Ring the bar a note is about, and write the note beside it.
+
+    Two decisions worth keeping:
+
+    The ring goes round the whole candle rather than a single price, so
+    it marks the moment rather than a point inside it, and it is drawn
+    hollow so the bar it circles stays readable.
+
+    Labels alternate above and below the price and step further out when
+    two land close together. That is cruder than a solver, and it is
+    enough: a day carries a handful of notes, not a hundred. What it
+    guarantees is that consecutive notes never write over each other --
+    the failure that makes an annotated chart worse than a bare one.
+    """
+    if not notes:
+        return
+
+    span = float(candles["high"].max() - candles["low"].min()) or 1.0
+    top = float(candles["high"].max())
+    wide = max(slot_of.values()) if slot_of else 1
+
+    # Everything goes ABOVE the candles. Below looks tempting -- it
+    # halves the stacking -- but the price panel has the mood strip and
+    # the volume chart immediately under it, so a label placed below
+    # does not overflow into empty paper, it overflows onto another
+    # chart. Above there is headroom, and what there is not can be made
+    # by lifting the ceiling, which costs nothing.
+    # Labels are stacked in AXES FRACTION, not in price. Measuring a
+    # box's height in dollars is circular: raising the ceiling to fit
+    # the stack changes how many dollars tall a line of text is, so the
+    # boxes grow as fast as the room made for them and keep colliding.
+    # A fraction of the panel is fixed, whatever the ylim ends up being.
+    LINE = NOTE_LINE            # one 6.3pt line as a share of the panel
+    PAD = 0.020                 # the box's own padding, plus a gap
+    FLOOR = 0.52                # notes usually begin here
+    FLOOR_MIN = 0.34            # and never squeeze the candles below this
+    ROOF = 0.97                 # nothing is drawn above this
+    #: How many slots wide a label is, near enough. At NOTE_WRAP
+    #: characters of 6.3pt across a session of 5-minute slots this is
+    #: about thirteen. Set it too wide and notes an hour apart stack on
+    #: each other and climb off the top of the panel; too narrow and
+    #: neighbours overlap. It is the width of the thing being avoided.
+    BOX_SLOTS = 13
+
+    heights: List[float] = []
+    columns: List[float] = []
+    spots: List[list] = []
+
+    for note in notes:
+        stamp = datetime.combine(candles.index[0].date(), note.at, tzinfo=ET)
+        slot = stamp.replace(minute=stamp.minute - (stamp.minute % BAR_MINUTES),
+                             second=0, microsecond=0)
+        if slot not in slot_of or slot not in candles.index:
+            continue
+        x = slot_of[slot]
+        bar = candles.loc[slot]
+        middle = float(bar["high"] + bar["low"]) / 2.0
+
+        # Sit above anything already occupying this stretch of x. Two
+        # notes on the same minute -- yours and mine on the same moment
+        # -- are the common case here, not the exception.
+        height = (note.label.count("\n") + 1) * LINE + PAD
+        heights.append(height)
+        columns.append(x)
+        # Keep the box inside the panel. At the last slot of the day a
+        # centred label hangs off the right edge, which is how the 15:43
+        # note got itself clipped the first time this was drawn.
+        margin = wide * 0.085
+        x_text = min(max(x, margin), wide - margin)
+
+        spots.append([x, x_text, note, middle, 0.0])
+
+    bottoms = stack_notes(heights, columns, BOX_SLOTS)
+    for spot, bottom in zip(spots, bottoms):
+        spot[4] = bottom
+    ceiling = max((b + h for b, h in zip(bottoms, heights)), default=0.0)
+
+    # The deepest stack decides where the notes begin. Usually that is
+    # FLOOR; a crowded few minutes pushes the whole layer down, taking
+    # room from the candles rather than running off the top of the page.
+    # Below FLOOR_MIN the candles would be squeezed to a ribbon, so a
+    # busier day than that accepts an overlap instead.
+    floor = max(FLOOR_MIN, min(FLOOR, ROOF - ceiling))
+
+    # Make room BEFORE drawing, so the stack computed above is the one
+    # that gets drawn.
+    low, _ = price.get_ylim()
+    price.set_ylim(low, low + (top - low) / floor)
+
+    for x, x_text, note, middle, bottom in spots:
+        price.scatter([x], [middle], s=300, facecolors="none",
+                      edgecolors=INK_2, linewidths=1.4, zorder=5,
+                      linestyle=(0, (2, 1.5)) if note.mine else "solid")
+        price.annotate(
+            note.label, xy=(x, middle), xycoords="data",
+            xytext=(x_text, floor + bottom),
+            textcoords=price.get_xaxis_transform(),
+            ha="center", va="bottom",
+            fontsize=6.3, color=INK, zorder=6, linespacing=1.35,
+            bbox=dict(boxstyle="round,pad=0.32", facecolor=SURFACE,
+                      edgecolor=AXIS, linewidth=0.6, alpha=0.94),
+            arrowprops=dict(arrowstyle="-", color=INK_2, linewidth=0.8,
+                            shrinkA=1, shrinkB=9, alpha=0.75))
 
 
 def logged_signals(db_path: str, symbol: str, day: date) -> pd.DataFrame:
@@ -273,6 +476,7 @@ def gather(symbol: str, day: date, start: time, end: time, db_path: str,
         candles=aggregate(minutes), vwap=session_vwap(minutes),
         baseline=slot_baseline(symbol, day, start, end, force_sip=force_sip),
         signals=logged_signals(db_path, symbol, day),
+        notes=load_notes(NOTES_PATH, symbol, day),
         macd=macd,
         start=start, end=end,
         benchmark=market_move(benchmark, day, start, end, force_sip),
@@ -460,6 +664,8 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
     vwap_at = session.vwap.reindex(candles.index, method="ffill")
     price.plot(x, vwap_at.values, color=VWAP_HUE, linewidth=1.6,
                linestyle=(0, (5, 2)), label="VWAP", zorder=3)
+
+    draw_notes(price, session.notes, slot_of, candles)
 
     signal_x = []
     if not session.signals.empty:
@@ -735,6 +941,114 @@ def reveal(path: str) -> None:
         print(f"  (could not open it automatically: {type(exc).__name__})")
 
 
+def self_test() -> int:
+    """Check the notes layer offline. No network, no credentials."""
+    import tempfile
+
+    print("Self-test: checking the notes layer...\n")
+    failures = []
+
+    # --- the stacker ------------------------------------------------------
+    # The property that matters: two labels whose x ranges overlap must
+    # not have overlapping y ranges. Eyeballing a rendered page finds
+    # this once; asserting it finds it every time.
+    def overlapping(heights, xs, width=13.0):
+        bottoms = stack_notes(heights, xs, width)
+        bad = []
+        for i in range(len(xs)):
+            for j in range(i + 1, len(xs)):
+                if abs(xs[i] - xs[j]) >= width:
+                    continue
+                a0, a1 = bottoms[i], bottoms[i] + heights[i]
+                b0, b1 = bottoms[j], bottoms[j] + heights[j]
+                if a0 < b1 - 1e-9 and b0 < a1 - 1e-9:
+                    bad.append((i, j))
+        return bad, bottoms
+
+    # Three notes inside one another's width, of different heights --
+    # the 12:45/13:00 cluster that overlapped on the first four drafts.
+    bad, cluster = overlapping([0.20, 0.16, 0.20], [30.0, 33.0, 33.0])
+    if bad:
+        failures.append(f"labels within a box-width overlapped: {bad}")
+    if cluster[0] != 0.0:
+        failures.append("the first label should sit on the floor")
+    if not cluster[1] >= 0.20:
+        failures.append("a neighbour should clear the one below it")
+    if not cluster[2] >= cluster[1] + 0.16:
+        failures.append("the third should clear the second, not the first")
+
+    # Far apart, so both belong on the floor rather than in a tower.
+    bad, bottoms = overlapping([0.20, 0.20], [10.0, 60.0])
+    if bad or bottoms != [0.0, 0.0]:
+        failures.append(f"distant labels should not stack: {bottoms}")
+
+    # Exactly a box-width apart counts as clear, and nothing stacks on
+    # an empty list.
+    if stack_notes([0.2, 0.2], [10.0, 23.0], 13.0) != [0.0, 0.0]:
+        failures.append("a full box-width apart is far enough")
+    if stack_notes([], [], 13.0) != []:
+        failures.append("no notes should place no labels")
+
+    # --- reading the file -------------------------------------------------
+    day = date(2026, 9, 25)
+    with tempfile.TemporaryDirectory() as folder:
+        good = os.path.join(folder, "notes.json")
+        with open(good, "w", encoding="utf-8") as handle:
+            json.dump({"SPCX": [
+                {"date": "2026-09-25", "time": "14:15", "who": "claude",
+                 "note": "second by time, first in the file"},
+                {"date": "2026-09-25", "time": "09:45", "who": "jason",
+                 "note": "earlier"},
+                {"date": "2026-09-24", "time": "10:00", "who": "jason",
+                 "note": "a different day"},
+                {"date": "2026-09-25", "time": "oops", "who": "jason",
+                 "note": "unparseable time"},
+                {"date": "2026-09-25", "who": "jason", "note": "no time"},
+            ]}, handle)
+        notes = load_notes(good, "SPCX", day)
+        if [f"{n.at:%H:%M}" for n in notes] != ["09:45", "14:15"]:
+            failures.append(f"notes should be this day's, in time order: "
+                            f"{[str(n.at) for n in notes]}")
+        if notes and notes[0].mine:
+            failures.append("'jason' should read as You")
+        if notes and not notes[1].mine:
+            failures.append("anyone else should read as Me")
+        if notes and not notes[0].label.startswith("09:45  You"):
+            failures.append(f"the label leads with time and who: "
+                            f"{notes[0].label!r}")
+        if load_notes(good, "NOPE", day):
+            failures.append("another symbol's notes are not this one's")
+
+        # Every failure is silence: the chart is the deliverable.
+        broken = os.path.join(folder, "broken.json")
+        with open(broken, "w", encoding="utf-8") as handle:
+            handle.write("{not json at all")
+        if load_notes(broken, "SPCX", day) != []:
+            failures.append("malformed JSON should cost the notes, not raise")
+        if load_notes(os.path.join(folder, "absent.json"), "SPCX", day) != []:
+            failures.append("a missing file should cost the notes, not raise")
+
+    # The wrap keeps a label narrow enough to sit beside its candle.
+    long_note = Note(at=time(10, 0), who="jason", text="word " * 40)
+    if max(len(line) for line in long_note.label.splitlines()) > NOTE_WRAP + 2:
+        failures.append("a long note should wrap to NOTE_WRAP")
+
+    print(f"  Stacker, 3 in one cluster      : "
+          f"{[round(b, 3) for b in cluster]} -> no overlap")
+    print("  Distant labels                 : both on the floor, no tower")
+    print("  Bad date / time / missing key  : skipped, rest still read")
+    print("  Malformed or absent file       : no notes, no exception")
+    print("  Author                         : jason -> You, else Me")
+
+    if failures:
+        print("\nFAILED:")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
+    print("\nAll checks passed.")
+    return 0
+
+
 def main() -> int:
     load_env()
     parser = argparse.ArgumentParser(description="One session as a PDF.")
@@ -747,12 +1061,17 @@ def main() -> int:
     parser.add_argument("--until", dest="end", default=f"{WINDOW_END:%H:%M}")
     parser.add_argument("--db", default="spcx_alerts.db")
     parser.add_argument("--out", help="Where to write it")
+    parser.add_argument("--self-test", action="store_true",
+                        help="Check the notes layer offline")
     parser.add_argument("--no-open", action="store_true", help="Write it, do not open it")
     args = parser.parse_args()
 
     symbol = args.symbol.upper()
     day = (datetime.strptime(args.date, "%Y-%m-%d").date() if args.date
            else trading_days(date.today() - timedelta(days=1), 1)[0])
+    if args.self_test:
+        return self_test()
+
     start, end = parse_clock(args.start), parse_clock(args.end)
 
     print(f"Building {symbol} report for {day}...")
