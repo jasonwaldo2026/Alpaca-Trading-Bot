@@ -236,13 +236,18 @@ NOTE_LINE, NOTE_PAD = 0.046, 0.020
 TRADES_PATHS = ("trades.xlsx", "trades.csv")
 
 
-def find_trades(given: Optional[str]) -> Optional[str]:
-    """The trades file to read: the one asked for, or the first that exists."""
+def find_trades(given: Optional[Sequence[str]]) -> List[str]:
+    """The trades files to read: the ones asked for, or whichever exist.
+
+    A list rather than one path because a day can be spread over two
+    brokers, and on 25 September it was: 2,300 shares at IBKR and 2,060
+    at Robinhood, long in both at once for six separate stretches. A tool
+    that could only read one of them would report half the position and
+    call it the day.
+    """
     if given:
-        return given
-    for candidate in TRADES_PATHS:
-        if os.path.exists(candidate):
-            return candidate
+        return list(given)
+    return [c for c in TRADES_PATHS if os.path.exists(c)]
     return None
 
 #: Column names the two brokers might use for the same thing. Robinhood
@@ -263,11 +268,23 @@ TRADE_COLUMNS = {
 
 @dataclass
 class Fill:
-    """One execution. Long-only, so a buy opens and a sell closes."""
+    """One ORDER. Long-only, so a buy opens and a sell closes.
+
+    Deliberately an order rather than an execution. A broker splits one
+    decision across every venue that filled it -- 25 September was 96
+    IBKR executions from 19 orders -- and pairing executions turns nine
+    round trips into 86, which is 86 labels on one chart. The broker
+    already knows which executions were one order; where it says so,
+    that grouping is used rather than guessed at.
+
+    `commission` is the whole order's, so a partially closed lot takes
+    its share per share rather than all of it.
+    """
     at: datetime
     side: str                 # "buy" or "sell"
     quantity: float
     price: float
+    commission: float = 0.0   # positive = a cost
 
 
 @dataclass
@@ -283,12 +300,22 @@ class Trade:
     quantity: float
     entry: float
     exit: Optional[float]
+    commission: float = 0.0   # both legs' share, positive = a cost
+    account: str = ""         # which broker, so two of them can be told apart
 
     @property
-    def profit(self) -> Optional[float]:
+    def gross(self) -> Optional[float]:
         if self.exit is None:
             return None
         return (self.exit - self.entry) * self.quantity
+
+    @property
+    def profit(self) -> Optional[float]:
+        """NET. A trade that made $10 and cost $19 to place lost money,
+        and a label saying +$10 would be the wrong lesson."""
+        if self.exit is None:
+            return None
+        return self.gross - self.commission
 
     @property
     def won(self) -> bool:
@@ -296,14 +323,39 @@ class Trade:
 
     def label(self) -> str:
         shares = f"{self.quantity:,.0f}"
+        tail = f" · {self.account}" if self.account else ""
         if self.profit is None:
-            return f"{shares} sh · open"
+            return f"{shares} sh · open{tail}"
         return f"{shares} sh · {'+' if self.profit >= 0 else '-'}$" \
-               f"{abs(self.profit):,.0f}"
+               f"{abs(self.profit):,.0f}{tail}"
 
 
-def pair_fills(fills: Sequence[Fill]) -> List[Trade]:
-    """Fills into round trips, oldest lot closed first.
+def per_share(fill: Fill) -> float:
+    """The order's commission spread over its shares.
+
+    A 2,300-share buy closed by two sells is two round trips, and each
+    owes the part of the entry's commission it actually used. Charging
+    the whole thing to the first would make the first look worse and the
+    second free.
+    """
+    return fill.commission / fill.quantity if fill.quantity else 0.0
+
+
+def carried_in(fills: Sequence[Fill]) -> float:
+    """Shares sold today that were bought before today.
+
+    Reported, never drawn: the file holds no entry for them, so there is
+    no cost basis and any P&L would be invented. On 25 September it was
+    800 shares at IBKR and 2,069 at Robinhood -- a $426,000 position held
+    overnight, which is worth knowing even though it cannot be charted.
+    """
+    sold = sum(f.quantity for f in fills if f.side == "sell")
+    bought = sum(f.quantity for f in fills if f.side == "buy")
+    return max(0.0, sold - bought)
+
+
+def pair_fills(fills: Sequence[Fill], account: str = "") -> List[Trade]:
+    """Orders into round trips, oldest lot closed first.
 
     FIFO because that is what a broker reports and what the tax year
     assumes; matching some other way would make the chart disagree with
@@ -311,29 +363,41 @@ def pair_fills(fills: Sequence[Fill]) -> List[Trade]:
 
     A buy left unmatched at the end of the day is an open position, not
     an error -- it is drawn with an entry and no exit.
+
+    Fills from two different accounts must never be passed in together.
+    They are separate books: a Robinhood buy at 09:53 pairing with an
+    IBKR sell at 10:43 would invent a round trip that never happened,
+    and with real timestamps on both it would look entirely plausible.
     """
-    open_lots: List[List[float]] = []          # [quantity, price, opened]
+    open_lots: List[List[float]] = []   # [quantity, price, opened, comm/share]
     trades: List[Trade] = []
     for fill in sorted(fills, key=lambda f: f.at):
         if fill.side == "buy":
-            open_lots.append([fill.quantity, fill.price, fill.at])
+            open_lots.append([fill.quantity, fill.price, fill.at,
+                              per_share(fill)])
             continue
+        exit_each = per_share(fill)
         remaining = fill.quantity
         while remaining > 1e-9 and open_lots:
             lot = open_lots[0]
             took = min(lot[0], remaining)
             trades.append(Trade(opened=lot[2], closed=fill.at, quantity=took,
-                                entry=lot[1], exit=fill.price))
+                                entry=lot[1], exit=fill.price,
+                                commission=took * (lot[3] + exit_each),
+                                account=account))
             lot[0] -= took
             remaining -= took
             if lot[0] <= 1e-9:
                 open_lots.pop(0)
-        # A sell with nothing open is a short, and this is a long-only
-        # book -- so it is someone else's row, and it is left alone.
+        # A sell with nothing open closes shares carried in from an
+        # earlier session, or is a short in a long-only book. Either way
+        # this file has no entry for it, so it is left alone and
+        # reported by carried_in() rather than given an invented basis.
 
-    for quantity, price, opened in open_lots:
+    for quantity, price, opened, each in open_lots:
         trades.append(Trade(opened=opened, closed=None, quantity=quantity,
-                            entry=price, exit=None))
+                            entry=price, exit=None,
+                            commission=quantity * each, account=account))
     return sorted(trades, key=lambda t: t.opened)
 
 
@@ -454,27 +518,36 @@ def read_xlsx(path: str) -> List[Dict[str, str]]:
 
 #: Where each field sits in an IBKR Trade Confirmation spreadsheet.
 IBKR_COLUMNS = dict(symbol="B", at="E", exchange="I", side="J",
-                    quantity="L", price="N")
+                    quantity="L", price="N", commission="Q")
 
 
 def read_ibkr(path: str, symbol: str, day: date) -> List[Fill]:
-    """Fills from an IBKR Trade Confirmation spreadsheet.
+    """Orders from an IBKR Trade Confirmation spreadsheet.
 
-    The sheet lists every order TWICE: once as a summary with the
-    exchange shown as "-", then once per venue that actually filled it.
-    Reading both doubles the day. The summaries are dropped.
+    The sheet lists every order TWICE: once as a rollup with the exchange
+    shown as "-", then once per venue that actually filled it. Reading
+    both doubles the day, so exactly one of the two is used.
 
-    Sell quantities arrive negative, which is IBKR's convention for a
-    reduction rather than a direction to be preserved -- the side column
-    already says which way the trade went.
+    The ROLLUP is the one to keep, and this reader used to keep the other.
+    An order is the decision; the per-venue executions are how the router
+    happened to spread it. On 25 September the sheet holds 96 executions
+    from 19 orders, and pairing executions produced 86 round trips --
+    numerically right, and 86 labels stacked on one chart. The rollup also
+    carries the order's commission and its average price, both of which
+    would otherwise have to be recomputed from the parts.
+
+    Quantities on the sell side arrive negative, which is IBKR's
+    convention for a reduction rather than a direction to be preserved --
+    the side column already says which way the order went. Commission
+    arrives negative for the same reason and is stored as a positive cost.
     """
     fills: List[Fill] = []
     for row in read_xlsx(path):
         got = {name: row.get(column, "") for name, column in IBKR_COLUMNS.items()}
         if got["symbol"].strip().upper() != symbol.upper():
             continue
-        if got["exchange"].strip() in ("", "-"):
-            continue                      # the order summary, not a fill
+        if got["exchange"].strip() != "-":
+            continue              # a per-venue execution, not the order
         try:
             at = datetime.strptime(got["at"].strip(), "%Y-%m-%d, %H:%M:%S")
         except ValueError:
@@ -486,26 +559,198 @@ def read_ibkr(path: str, symbol: str, day: date) -> List[Fill]:
                 at=at.replace(tzinfo=ET),
                 side="buy" if got["side"].strip().upper().startswith("B") else "sell",
                 quantity=abs(float(got["quantity"].replace(",", ""))),
-                price=float(got["price"])))
+                price=float(got["price"]),
+                commission=abs(float(got["commission"] or 0.0))))
         except (TypeError, ValueError):
             continue
     return fills
 
 
+#: Robinhood's export, and the one column that is not Robinhood's.
+#: It gives Activity Date but no time of day, so the execution times are
+#: filled in by hand. They land in "Process Date" -- which is not what
+#: that column means, but is where they are, and a header renamed every
+#: morning is a step that gets skipped on the morning it matters. A
+#: column actually called Time wins if one is present.
+ROBINHOOD_COLUMNS = dict(symbol="instrument", side="trans code",
+                         quantity="quantity", amount="amount",
+                         day="activity date")
+ROBINHOOD_TIME_COLUMNS = ("time", "process date")
+
+#: The earliest a US equity trades: pre-market opens 04:00 ET.
+PREMARKET_HOUR = 4
+
+
+def resolve_clock(clocks: Sequence[str]) -> List[Optional[int]]:
+    """12-hour times with no AM/PM, resolved to minutes past midnight.
+
+    The times are typed off a phone screen that shows "4:04", so the
+    meridiem is simply absent and guessing it wrong puts a trade on a
+    candle twelve hours from the one it happened on.
+
+    Most of them are not actually ambiguous. 9, 10 and 11 can only be
+    morning, because 21:00-23:59 is after every session. 12 can only be
+    noon. 1, 2 and 3 can only be afternoon, because 01:00-03:59 is before
+    the pre-market opens.
+
+    4 through 8 ARE ambiguous -- 04:04 is pre-market and 16:04 is
+    after-hours, and both are real trading times. Those are settled by
+    the file's own ORDER, not by which reading is nearer the clock: an
+    export runs in time order, so a row sitting above a 15:58 row is
+    later than 15:58, which makes it 16:04 and not 04:04.
+
+    The direction is read off the rows that are already certain rather
+    than assumed, and if fewer than two of those exist there is no
+    direction to read. An ambiguous time with no direction, or one where
+    both readings fit it, returns None and is dropped with a complaint.
+    Proximity was the first rule tried here and it is wrong: "4:10"
+    beside a single "9:49" is 339 minutes from 04:10 and 381 from 16:10,
+    so the nearer reading is pre-market -- on no evidence whatsoever.
+    """
+    parsed: List[Optional[Tuple[int, int]]] = []
+    for raw in clocks:
+        try:
+            hh, mm = (int(part) for part in str(raw).strip().split(":")[:2])
+        except (TypeError, ValueError):
+            parsed.append(None)
+            continue
+        parsed.append((hh, mm) if 0 <= hh <= 23 and 0 <= mm <= 59 else None)
+
+    fixed: List[Optional[int]] = []
+    for item in parsed:
+        if item is None:
+            fixed.append(None)
+            continue
+        hh, mm = item
+        if hh in (9, 10, 11):
+            fixed.append(hh * 60 + mm)               # morning, necessarily
+        elif hh == 12 or 13 <= hh <= 23 or hh == 0:
+            fixed.append(hh * 60 + mm)               # already 24-hour, or noon
+        elif 1 <= hh <= 3:
+            fixed.append((hh + 12) * 60 + mm)        # afternoon, necessarily
+        else:
+            fixed.append(None)                       # 4-8: decided below
+
+    certain = [(i, v) for i, v in enumerate(fixed) if v is not None]
+    if len(certain) < 2:
+        return fixed                  # no direction to read: refuse the rest
+    values = [v for _, v in certain]
+    descending = all(a >= b for a, b in zip(values, values[1:]))
+    ascending = all(a <= b for a, b in zip(values, values[1:]))
+    if descending == ascending:        # unordered, or all equal: no direction
+        return fixed
+
+    for i, item in enumerate(parsed):
+        if fixed[i] is not None or item is None:
+            continue
+        hh, mm = item
+        before = next((v for j, v in reversed(certain) if j < i), None)
+        after = next((v for j, v in certain if j > i), None)
+        lo, hi = ((after, before) if descending else (before, after))
+        fits = [o for o in (hh * 60 + mm, (hh + 12) * 60 + mm)
+                if (lo is None or o >= lo) and (hi is None or o <= hi)]
+        if len(fits) == 1:             # exactly one reading fits the order
+            fixed[i] = fits[0]
+    return fixed
+
+
+def read_robinhood(path: str, rows: Sequence[Dict[str, str]],
+                   symbol: str, day: date) -> List[Fill]:
+    """Orders from a Robinhood activity export.
+
+    Robinhood reports one row per venue fill and no order id, but every
+    fill of one order shares a timestamp and a side, so that pair is the
+    order. 25 September: 71 rows, 13 orders, 6 round trips.
+
+    The price comes from Amount / Quantity rather than from the Price
+    column. Price is the round number the order was written at -- every
+    row of the 16:04 sell says $148.50 -- while Amount is the cash that
+    actually moved, so the regulatory fees on the sells are inside the
+    P&L instead of missing from it. There is no commission column
+    because there is no commission; that is what "free trades" buys, and
+    the cost shows up in the fill price instead.
+    """
+    headers = {(name or "").strip().lower(): name for name in (rows[0] if rows else {})}
+    column = {field: headers.get(name) for field, name in ROBINHOOD_COLUMNS.items()}
+    clock = next((headers[name] for name in ROBINHOOD_TIME_COLUMNS
+                  if name in headers), None)
+    if clock is None or any(v is None for v in column.values()):
+        return []
+
+    minutes = resolve_clock([row.get(clock, "") for row in rows])
+    orders: Dict[Tuple[datetime, str], List[float]] = {}
+    dropped = 0
+    for row, since_midnight in zip(rows, minutes):
+        if str(row.get(column["symbol"], "")).strip().upper() != symbol.upper():
+            continue
+        try:
+            when = pd.to_datetime(str(row[column["day"]]).strip()).date()
+        except (TypeError, ValueError):
+            continue
+        if when != day:
+            continue
+        if since_midnight is None:
+            dropped += 1
+            continue
+        side = str(row[column["side"]]).strip().lower()
+        try:
+            quantity = abs(float(str(row[column["quantity"]]).replace(",", "")))
+            amount = abs(float(str(row[column["amount"]]).strip()
+                               .replace("$", "").replace(",", "")
+                               .strip("()")))
+        except (TypeError, ValueError):
+            continue
+        at = datetime.combine(day, time(since_midnight // 60,
+                                        since_midnight % 60), tzinfo=ET)
+        key = (at, "buy" if side.startswith("b") else "sell")
+        bucket = orders.setdefault(key, [0.0, 0.0])
+        bucket[0] += quantity
+        bucket[1] += amount
+
+    if dropped:
+        print(f"  trades: {os.path.basename(path)} — {dropped} row(s) had a "
+              f"time of day that could not be placed; dropped")
+    spelled = ", ".join(f"{m // 60:02d}:{m % 60:02d}" for m in
+                        sorted({m for m in minutes if m is not None}))
+    if spelled:
+        print(f"  trades: {os.path.basename(path)} — times read as {spelled}")
+    return [Fill(at=at, side=side, quantity=q, price=cash / q)
+            for (at, side), (q, cash) in sorted(orders.items()) if q]
+
+
+def account_of(path: str) -> str:
+    """A short tag for the chart, taken from the file's own name.
+
+    The file name is the one place the owner of the account has already
+    said which account it is, and renaming a file is easier than adding a
+    flag to remember.
+    """
+    stem = os.path.splitext(os.path.basename(path))[0]
+    words = [w for w in re.split(r"[^A-Za-z]+", stem) if w]
+    # Broker exports arrive named for the date first -- 9-25-26_Robinhood --
+    # and "9 25 26 ROBI" is not a label. The longest run of letters is.
+    return max(words, key=len).upper()[:12] if words else "TRADES"
+
+
 def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
-    """The day's round trips for one symbol, or nothing at all.
+    """The day's round trips for one symbol, from ONE account's file.
 
     Unlike the notes, a problem here is worth saying out loud on the
     terminal: a chart drawn without trades looks exactly like a day you
     did not trade, and that is a difference worth knowing about. The
     chart is still built either way.
+
+    One file, one book. Two accounts' files are read separately and
+    paired separately -- see pair_fills.
     """
+    account = account_of(path)
     if path.lower().endswith((".xlsx", ".xlsm")):
         try:
-            return pair_fills(read_ibkr(path, symbol, day))
+            fills = read_ibkr(path, symbol, day)
         except (OSError, KeyError, zipfile.BadZipFile) as exc:
             print(f"  trades: could not read {path} — {type(exc).__name__}")
             return []
+        return report_and_pair(path, fills, account)
 
     try:
         with open(path, newline="", encoding="utf-8-sig") as handle:
@@ -515,8 +760,12 @@ def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
     if not rows:
         return []
 
-    found = {}
     headers = {(name or "").strip().lower(): name for name in rows[0]}
+    if ROBINHOOD_COLUMNS["side"] in headers and ROBINHOOD_COLUMNS["symbol"] in headers:
+        return report_and_pair(path, read_robinhood(path, rows, symbol, day),
+                               account)
+
+    found = {}
     for field, names in TRADE_COLUMNS.items():
         for candidate in names:
             if candidate in headers:
@@ -529,6 +778,7 @@ def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
         return []
 
     fills: List[Fill] = []
+    undated = 0
     for row in rows:
         try:
             if "symbol" in found:
@@ -540,6 +790,16 @@ def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
                   else at.tz_convert(ET))
             if at.date() != day:
                 continue
+            # A date with no time of day parses cleanly as midnight, which
+            # is not a failure and not a trade. Left in, it would sort
+            # before every real fill and become the oldest open lot, so
+            # the 09:49 sell would close IT instead of the 09:36 buy and
+            # every round trip on the chart would shift by one. Nothing
+            # would be drawn at midnight, so the corruption would be
+            # invisible. Dropped, loudly.
+            if (at.hour, at.minute) == (0, 0):
+                undated += 1
+                continue
             side = str(row[found["side"]]).strip().lower()
             side = "buy" if side.startswith("b") else "sell"
             fills.append(Fill(at=at.to_pydatetime(), side=side,
@@ -549,7 +809,28 @@ def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
                                           .replace("$", "").replace(",", ""))))
         except (KeyError, TypeError, ValueError):
             continue          # one unreadable row is not the whole file
-    return pair_fills(fills)
+    if undated:
+        print(f"  trades: {os.path.basename(path)} — {undated} row(s) carry a "
+              f"date but no time of day; dropped, because a fill with no "
+              f"time cannot be placed on a candle")
+    return report_and_pair(path, fills, account)
+
+
+def report_and_pair(path: str, fills: Sequence[Fill],
+                    account: str) -> List[Trade]:
+    """Pair one account's orders, and say what could not be paired."""
+    before = carried_in(fills)
+    if before:
+        print(f"  trades: {os.path.basename(path)} — {before:,.0f} share(s) "
+              f"sold today were bought before today; shown as an exit with "
+              f"no entry, because the file holds no cost basis for them")
+    trades = pair_fills(fills, account=account)
+    net = sum(t.profit for t in trades if t.profit is not None)
+    fees = sum(t.commission for t in trades)
+    print(f"  trades: {os.path.basename(path)} — {len(fills)} order(s), "
+          f"{len(trades)} round trip(s), net ${net:,.2f}"
+          + (f" after ${fees:,.2f} commission" if fees else ""))
+    return trades
 
 
 def draw_trades(price, trades: List[Trade], slot_of: Dict, candles) -> None:
@@ -744,7 +1025,7 @@ def market_move(symbol: str, day: date, start: time, end: time,
 
 def gather(symbol: str, day: date, start: time, end: time, db_path: str,
            force_sip: bool = True, benchmark: str = BENCHMARK,
-           trades_path: Optional[str] = None) -> Optional[Session]:
+           trades_paths: Optional[Sequence[str]] = None) -> Optional[Session]:
     """Build a session. `force_sip` is right for a past day -- the free plan
     serves the full tape historically -- and wrong for today, where SIP is
     15 minutes behind and the live feed is what the alerts are reading."""
@@ -773,7 +1054,8 @@ def gather(symbol: str, day: date, start: time, end: time, db_path: str,
         baseline=slot_baseline(symbol, day, start, end, force_sip=force_sip),
         signals=logged_signals(db_path, symbol, day),
         notes=load_notes(NOTES_PATH, symbol, day),
-        trades=load_trades(trades_path, symbol, day) if trades_path else [],
+        trades=[t for path in (trades_paths or [])
+                for t in load_trades(path, symbol, day)],
         macd=macd,
         start=start, end=end,
         benchmark=market_move(benchmark, day, start, end, force_sip),
@@ -812,6 +1094,16 @@ def band(fig, session: Session) -> None:
         relative = pct - market_pct
         stats.append((f"vs {market}", f"{relative:+.2f}%",
                       UP if relative >= 0 else DOWN))
+    # The day's own P&L, across every account, net of commission. The
+    # point of this page is comparing what was read against what price
+    # did next; what it actually came to belongs at the top with the rest
+    # of the numbers you would say out loud.
+    closed = [t for t in session.trades if t.profit is not None]
+    if closed:
+        total = sum(t.profit for t in closed)
+        stats.append(("Net P&L", f"{'+' if total >= 0 else '-'}$"
+                                 f"{abs(total):,.0f}",
+                      UP if total >= 0 else DOWN))
 
     span = min(0.152, 0.90 / max(1, len(stats)))
     for i, (label, value, tone) in enumerate(stats):
@@ -823,6 +1115,18 @@ def band(fig, session: Session) -> None:
                               color=AXIS, linewidth=0.8, transform=fig.transFigure))
 
     notes = []
+    # Per account, because one number hides the thing worth seeing: two
+    # books running the same trade at once is double the position, and
+    # the totals are the only place that shows up as arithmetic.
+    if closed:
+        books: Dict[str, float] = {}
+        for trade in closed:
+            books[trade.account or "?"] = \
+                books.get(trade.account or "?", 0.0) + trade.profit
+        if len(books) > 1:
+            notes.append("  ·  ".join(
+                f"{name} {'+' if net >= 0 else '-'}${abs(net):,.0f}"
+                for name, net in sorted(books.items())))
     if session.benchmark:
         market, market_pct = session.benchmark
         notes.append(f"{market} {market_pct:+.2f}% over the same window")
@@ -1406,10 +1710,19 @@ def self_test() -> int:
     # <c ...>...</c> form runs past them to the next closing tag and
     # swallows the columns in between. The reader returned rows, with
     # the price where the quantity should be.
+    # The fixture is ONE order of 400 shares filled on two venues at two
+    # different prices, plus IBKR's own rollup of it. That asymmetry is
+    # the point: an earlier version of this test used a rollup and a fill
+    # carrying identical numbers, so reading either gave one Fill of 400
+    # at 152.4 and the test passed whichever row the reader chose. It was
+    # checking nothing. Here the two readings differ -- two fills at
+    # 152.3/152.5, or one order at 152.4 with its commission -- so the
+    # test can only pass on the intended one.
     with tempfile.TemporaryDirectory() as folder:
         book = os.path.join(folder, "trades.xlsx")
         strings = "".join(f"<si><t>{s}</t></si>" for s in
-                          ("SPCX", "2026-09-25, 10:12:00", "NASDAQ", "BUY", "-"))
+                          ("SPCX", "2026-09-25, 10:12:00", "NASDAQ", "BUY",
+                           "-", "ARCA"))
         def cell(ref, value, shared=False):
             if value is None:
                 return f'<c r="{ref}" s="1"/>'      # the self-closing kind
@@ -1419,12 +1732,16 @@ def self_test() -> int:
             "<row r='1'>" + cell("B1", 0, True) + cell("C1", None)
             + cell("D1", None) + cell("E1", 1, True) + cell("F1", None)
             + cell("I1", 2, True) + cell("J1", 3, True) + cell("K1", None)
-            + cell("L1", 400) + cell("M1", None) + cell("N1", 152.4) + "</row>",
-            # The order summary for the same fill: exchange "-", and it
-            # must not be counted a second time.
+            + cell("L1", 300) + cell("M1", None) + cell("N1", 152.3)
+            + cell("Q1", -1.5) + "</row>",
             "<row r='2'>" + cell("B2", 0, True) + cell("E2", 1, True)
-            + cell("I2", 4, True) + cell("J2", 3, True) + cell("L2", 400)
-            + cell("N2", 152.4) + "</row>",
+            + cell("I2", 5, True) + cell("J2", 3, True) + cell("L2", 100)
+            + cell("N2", 152.5) + cell("Q2", -0.5) + "</row>",
+            # IBKR's rollup of those two: exchange "-", the average price,
+            # and the whole order's commission.
+            "<row r='3'>" + cell("B3", 0, True) + cell("E3", 1, True)
+            + cell("I3", 4, True) + cell("J3", 3, True) + cell("L3", 400)
+            + cell("N3", 152.35) + cell("Q3", -2.0) + "</row>",
         ])
         with zipfile.ZipFile(book, "w") as out:
             out.writestr("xl/sharedStrings.xml",
@@ -1434,10 +1751,10 @@ def self_test() -> int:
                          f'</sheetData></worksheet>')
 
         got = read_xlsx(book)
-        if not got or got[0].get("L") != "400":
+        if not got or got[0].get("L") != "300":
             failures.append(f"an empty cell should not swallow the columns "
                             f"after it: {got[0] if got else got}")
-        if got and got[0].get("N") != "152.4":
+        if got and got[0].get("N") != "152.3":
             failures.append(f"the price column should survive the gaps: "
                             f"{got[0].get('N')}")
         if got and got[0].get("E") != "2026-09-25, 10:12:00":
@@ -1445,12 +1762,38 @@ def self_test() -> int:
 
         fills = read_ibkr(book, "SPCX", day)
         if len(fills) != 1:
-            failures.append(f"the order summary row should be dropped, "
-                            f"leaving one fill, got {len(fills)}")
-        elif fills[0].quantity != 400 or fills[0].price != 152.4:
-            failures.append(f"fill read wrong: {fills[0]}")
+            failures.append(f"one order filled on two venues is ONE Fill, "
+                            f"got {len(fills)}")
+        elif fills[0].quantity != 400 or fills[0].price != 152.35:
+            failures.append(f"the rollup should be read, not the executions: "
+                            f"{fills[0]}")
+        elif fills[0].commission != 2.0:
+            failures.append(f"commission comes off the rollup as a positive "
+                            f"cost, got {fills[0].commission}")
         if read_ibkr(book, "NVDA", day):
             failures.append("another symbol's rows are not this one's")
+
+        # Commission makes a winner into a loser, and the label must say so.
+        trip = pair_fills([Fill(at(10, 0), "buy", 100, 150.0, commission=11.5),
+                           Fill(at(10, 5), "sell", 100, 150.1, commission=19.0)],
+                          account="IBKR")[0]
+        if round(trip.gross, 2) != 10.0:
+            failures.append(f"gross should ignore commission: {trip.gross}")
+        if round(trip.profit, 2) != -20.5:
+            failures.append(f"profit should be net of commission: {trip.profit}")
+        if trip.won:
+            failures.append("a trade that made $10 and cost $30.50 to place "
+                            "is not a winner")
+        if "IBKR" not in trip.label():
+            failures.append(f"the label should name the account: {trip.label()}")
+
+        # A partly closed lot owes its SHARE of the entry's commission.
+        half = pair_fills([Fill(at(10, 0), "buy", 100, 150.0, commission=10.0),
+                           Fill(at(10, 5), "sell", 40, 151.0, commission=4.0)])
+        if round(half[0].commission, 4) != 8.0:
+            failures.append(f"40 of 100 shares owes 40% of a $10 entry "
+                            f"commission plus the $4 exit, got "
+                            f"{half[0].commission}")
 
     # The wrap keeps a label narrow enough to sit beside its candle.
     long_note = Note(at=time(10, 0), who="jason", text="word " * 40)
@@ -1463,12 +1806,151 @@ def self_test() -> int:
     print("  Bad date / time / missing key  : skipped, rest still read")
     print("  Malformed or absent file       : no notes, no exception")
     print("  Author                         : jason -> You, else Me")
-    print("  Fills -> round trips           : FIFO, oldest lot closes first")
+    # --- 12-hour times with no meridiem ------------------------------------
+    # The export is newest-first, as Robinhood writes it. 4 through 8 are
+    # the genuinely ambiguous hours -- 04:04 is pre-market and 16:04 is
+    # after-hours -- and are settled by the neighbour, not by a rule of
+    # thumb. Getting one wrong puts a trade twelve hours from where it is.
+    friday = ["4:04", "3:58", "3:44", "1:58", "12:51", "10:59", "9:49"]
+    want = [16 * 60 + 4, 15 * 60 + 58, 15 * 60 + 44, 13 * 60 + 58,
+            12 * 60 + 51, 10 * 60 + 59, 9 * 60 + 49]
+    if resolve_clock(friday) != want:
+        failures.append(f"Friday's clock times resolved wrong: "
+                        f"{resolve_clock(friday)} != {want}")
+    if resolve_clock(["9:49"]) != [9 * 60 + 49]:
+        failures.append("9:49 can only be morning")
+    if resolve_clock(["1:34"]) != [13 * 60 + 34]:
+        failures.append("1:34 can only be afternoon -- 01:34 is not a session")
+    # Alone, an hour in 4-8 has nothing to lean on, and a guess would be
+    # a coin flip on a real trade. It is refused.
+    if resolve_clock(["4:04"]) != [None]:
+        failures.append("4:04 with no neighbour should be refused, not guessed")
+    if resolve_clock(["7:05", "6:30"]) != [None, None]:
+        failures.append("two ambiguous times with no anchor stay refused")
+    # One anchor gives no direction, so 4:10 stays refused -- picking the
+    # nearer reading here would choose 04:10 over 16:10 on no evidence.
+    if resolve_clock(["4:10", "9:49"]) != [None, 9 * 60 + 49]:
+        failures.append("one anchor is not a direction; 4:10 stays unresolved")
+    # Two anchors do give one. Descending, above a 12:00 row, 4:10 is 16:10.
+    if resolve_clock(["4:10", "12:00", "9:49"]) != [16 * 60 + 10, 12 * 60,
+                                                    9 * 60 + 49]:
+        failures.append(f"a descending export should place 4:10 at 16:10: "
+                        f"{resolve_clock(['4:10', '12:00', '9:49'])}")
+    # Ascending too, where the same row means the opposite.
+    if resolve_clock(["9:49", "12:00", "4:10"]) != [9 * 60 + 49, 12 * 60,
+                                                    16 * 60 + 10]:
+        failures.append("an ascending export should also place 4:10 at 16:10")
+    if resolve_clock(["9:49", "4:10", "12:00"]) != [9 * 60 + 49, None,
+                                                    12 * 60]:
+        failures.append("an out-of-order file has no direction to lean on")
+    if resolve_clock(["nonsense", "9:49"]) != [None, 9 * 60 + 49]:
+        failures.append("an unreadable clock costs its row, not the file")
+
+    # --- the Robinhood export ---------------------------------------------
+    # 71 rows of one venue fill each, sharing a timestamp and a side per
+    # order. Price must come from Amount/Quantity, not the Price column:
+    # every row of the real 16:04 sell says $148.50 while the cash that
+    # moved was less, and the difference is the regulatory fee.
+    rh_rows = [
+        {"Activity Date": "9/25/2026", "Process Date": "10:59",
+         "Instrument": "SPCX", "Trans Code": "Buy",
+         "Quantity": "1,060", "Price": "$146.70 ", "Amount": "($155,502.00)"},
+        {"Activity Date": "9/25/2026", "Process Date": "10:59",
+         "Instrument": "SPCX", "Trans Code": "Buy",
+         "Quantity": "1000", "Price": "$146.70 ", "Amount": "($146,710.30)"},
+        {"Activity Date": "9/25/2026", "Process Date": "12:12",
+         "Instrument": "SPCX", "Trans Code": "Sell",
+         "Quantity": "2060", "Price": "$149.27 ", "Amount": "$307,491.31 "},
+        {"Activity Date": "9/25/2026", "Process Date": "12:12",
+         "Instrument": "NVDA", "Trans Code": "Sell",
+         "Quantity": "5", "Price": "$100.00 ", "Amount": "$500.00 "},
+        {"Activity Date": "9/24/2026", "Process Date": "10:00",
+         "Instrument": "SPCX", "Trans Code": "Buy",
+         "Quantity": "10", "Price": "$140.00 ", "Amount": "($1,400.00)"},
+    ]
+    rh = read_robinhood("RH.csv", rh_rows, "SPCX", day)
+    if len(rh) != 2:
+        failures.append(f"two orders share two timestamps, got {len(rh)}")
+    else:
+        buy, sell = rh
+        if buy.quantity != 2060:
+            failures.append(f"fills sharing a timestamp are one order: "
+                            f"{buy.quantity}")
+        if round(buy.price, 4) != round(302212.30 / 2060, 4):
+            failures.append(f"price should be cash/shares, not the Price "
+                            f"column: {buy.price}")
+        if round(sell.price, 4) != round(307491.31 / 2060, 4):
+            failures.append(f"the sell's fee should be inside its price: "
+                            f"{sell.price}")
+        if buy.at.hour != 10 or sell.at.hour != 12:
+            failures.append(f"times placed wrong: {buy.at}, {sell.at}")
+        if buy.commission or sell.commission:
+            failures.append("Robinhood charges no commission; the cost is "
+                            "already in the fill price")
+
+    # --- two accounts are two books ---------------------------------------
+    # The failure this prevents: with real timestamps on both files, a
+    # Robinhood buy pairing with an IBKR sell produces a round trip that
+    # looks entirely plausible and never happened.
+    rh_only = pair_fills([Fill(at(9, 53), "buy", 2060, 147.65),
+                          Fill(at(10, 40), "sell", 2060, 146.90)], "RH")
+    ib_only = pair_fills([Fill(at(9, 51), "buy", 2300, 147.83),
+                          Fill(at(10, 43), "sell", 2300, 146.79)], "IBKR")
+    mixed = pair_fills([Fill(at(9, 51), "buy", 2300, 147.83),
+                        Fill(at(9, 53), "buy", 2060, 147.65),
+                        Fill(at(10, 40), "sell", 2060, 146.90),
+                        Fill(at(10, 43), "sell", 2300, 146.79)])
+    if len(rh_only) != 1 or len(ib_only) != 1:
+        failures.append("each account on its own is one round trip")
+    if [t.account for t in rh_only + ib_only] != ["RH", "IBKR"]:
+        failures.append("the account should travel with the trade")
+    # Pooled, FIFO closes part of the IBKR buy with the Robinhood sell:
+    # three trades out of two real ones, including a 240-share round trip
+    # that never happened. Asserted positively, so this test fails if the
+    # pooling ever becomes harmless rather than passing by luck.
+    if len(mixed) != 3 or not any(round(t.quantity) == 240 for t in mixed):
+        failures.append(f"pooling two accounts should visibly corrupt the "
+                        f"pairing (3 trips, one of 240 shares); got "
+                        f"{[round(t.quantity) for t in mixed]} -- if that is "
+                        f"now clean, this test no longer proves separation")
+
+    # --- a date with no time of day ---------------------------------------
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "mixed.csv")
+        with open(path, "w", newline="") as handle:
+            handle.write("Exec Time,B/S,Filled Qty,Fill Price,Ticker\n"
+                         "2026-09-25,B,100,100.00,SPCX\n"          # no time
+                         "2026-09-25 09:36:00,B,500,148.53,SPCX\n"
+                         "2026-09-25 09:49:00,S,500,147.73,SPCX\n")
+        got = load_trades(path, "SPCX", day)
+        if len(got) != 1:
+            failures.append(f"a date-only row should be dropped, leaving the "
+                            f"timed pair, got {len(got)} trades")
+        elif round(got[0].entry, 2) != 148.53:
+            failures.append(f"the midnight row became the oldest open lot and "
+                            f"stole the exit: entry {got[0].entry}")
+
+    for name, tag in (("/x/y/9-25-26_Robinhood.csv", "ROBINHOOD"),
+                      ("9-25-26_IBKR.xlsx", "IBKR"),
+                      ("RH.csv", "RH"),
+                      ("2026-09-25.csv", "TRADES")):
+        if account_of(name) != tag:
+            failures.append(f"{name} should label as {tag}, got "
+                            f"{account_of(name)}")
+    if len(account_of("a" * 40 + ".csv")) > 12:
+        failures.append("an account tag long enough to cover the chart")
+
+    print("  Orders -> round trips          : FIFO, oldest lot closes first")
     print("  Unmatched buy                  : an open position, not an error")
-    print("  Unmatched sell                 : a short, left alone")
+    print("  Unmatched sell                 : carried in, reported not drawn")
     print("  Broker headers                 : sniffed; unknown ones reported")
     print("  Spreadsheet, empty cells       : do not swallow the next columns")
-    print("  IBKR order summaries           : dropped, so nothing counts twice")
+    print("  IBKR rollups                   : kept; the executions dropped")
+    print("  Commission                     : net, and pro-rata on a part lot")
+    print("  12-hour times                  : 4:04 after 3:58 is 16:04")
+    print("  Robinhood export               : fills grouped into orders")
+    print("  Two accounts                   : never paired with each other")
+    print("  A date with no time            : dropped, never mispaired")
 
     if failures:
         print("\nFAILED:")
@@ -1491,8 +1973,11 @@ def main() -> int:
     parser.add_argument("--until", dest="end", default=f"{WINDOW_END:%H:%M}")
     parser.add_argument("--db", default="spcx_alerts.db")
     parser.add_argument("--out", help="Where to write it")
-    parser.add_argument("--trades", metavar="FILE", default=None,
-                        help="IBKR .xlsx or a fills .csv "
+    parser.add_argument("--trades", metavar="FILE", action="append",
+                        default=None,
+                        help="IBKR .xlsx, a Robinhood export, or a fills "
+                             ".csv. Repeat it once per account -- each "
+                             "file is paired into round trips on its own "
                              "(default: trades.xlsx, then trades.csv)")
     parser.add_argument("--self-test", action="store_true",
                         help="Check the notes layer offline")
@@ -1509,7 +1994,7 @@ def main() -> int:
 
     print(f"Building {symbol} report for {day}...")
     session = gather(symbol, day, start, end, args.db,
-                     trades_path=find_trades(args.trades),
+                     trades_paths=find_trades(args.trades),
                      benchmark=args.benchmark)
     if session is None:
         print(f"  no bars for {symbol} on {day}. Market closed that day?")
