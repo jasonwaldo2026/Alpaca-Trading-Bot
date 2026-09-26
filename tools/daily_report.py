@@ -1410,6 +1410,143 @@ def minute_positions(stamps, macd_index):
     return xs
 
 
+#: Rows on the capture sheet. Friday was sixteen round trips across two
+#: accounts, so twelve is a normal day and not a generous allowance.
+SHEET_ROWS = 14
+
+
+def sheet_figure(symbol: str):
+    """A page to print, carry, and circle during the session.
+
+    Built FROM `FACTORS` rather than typed out beside it. A printed sheet
+    and a parser that disagree about the vocabulary is the worst of both:
+    readings get circled all day in a column the reader will not accept,
+    and nothing says so until the transcription at nine in the evening.
+    Change the dict and the sheet changes with it.
+
+    Deliberately not fillable on a screen. The point is that it can be
+    done in three seconds with a pen next to the keyboard, at the moment
+    the decision is made, because a read reconstructed after the close
+    already knows how it turned out.
+    """
+    fig = plt.figure(figsize=(11.0, 8.5))     # letter, landscape
+    fig.patch.set_facecolor(SURFACE)
+    axes = fig.add_axes((0, 0, 1, 1))
+    axes.set_xlim(0, 1)
+    axes.set_ylim(0, 1)
+    axes.axis("off")
+
+    tags = list(FACTORS)
+    fig.text(0.035, 0.955, f"{symbol}  ·  READ CAPTURE", size=14,
+             weight="bold", color=INK)
+    fig.text(0.035, 0.925, "Date ________________      "
+                           "Circle what you were reading. Leave a tag blank "
+                           "if you did not look at it.",
+             size=8.5, color=INK_2)
+
+    # --- geometry ---------------------------------------------------------
+    left, right = 0.035, 0.965
+    # The legend and the rules underneath are not a footer to be
+    # squeezed -- they are why the sheet works without remembering
+    # anything. Their height is budgeted FIRST, from the number of tags
+    # actually defined, and the table gets what is left. Hardcoding the
+    # split worked at seven tags and ran off the bottom of the page at
+    # ten, which is a real case: this list is meant to be edited.
+    LEGEND_STEP, RULE_STEP, MIN_ROW = 0.027, 0.020, 0.030
+    needed = (0.055 + 0.054 + (len(FACTORS) - 1) * LEGEND_STEP
+              + 0.038 + 3 * RULE_STEP + 0.022)
+    top = 0.885
+    bottom = min(0.66, max(0.42, needed))
+    # Short rows are unwritable, so a long legend costs rows rather than
+    # making every one of them too thin to put a pen in.
+    rows = max(6, min(SHEET_ROWS, int((top - bottom) / MIN_ROW) - 1))
+    time_w, side_w, conv_w = 0.052, 0.062, 0.058
+    notes_w = 0.150
+    factor_w = (right - left - time_w - side_w - conv_w - notes_w) / len(tags)
+    row_h = (top - bottom) / (rows + 1)
+
+    columns = [("Time", time_w), ("In/Out", side_w), ("Conv", conv_w)]
+    columns += [(tag, factor_w) for tag in tags]
+    columns += [("Notes", notes_w)]
+
+    edges, x = [], left
+    for _, width in columns:
+        edges.append(x)
+        x += width
+    edges.append(x)
+
+    header = top - row_h
+    for (title, _), x0, x1 in zip(columns, edges, edges[1:]):
+        fig.text((x0 + x1) / 2, header + row_h * 0.33, title, size=8.5,
+                 weight="bold", ha="center", va="center", color=INK)
+
+    def line(x0, x1, y, width=0.6, colour=AXIS):
+        fig.add_artist(plt.Line2D([x0, x1], [y, y], color=colour,
+                                  linewidth=width, transform=fig.transFigure))
+
+    line(left, right, top, 1.1, INK)
+    line(left, right, header, 1.1, INK)
+    for r in range(rows + 1):
+        y = header - r * row_h
+        line(left, right, y, 0.5)
+    for x in edges:
+        fig.add_artist(plt.Line2D([x, x], [bottom, top], color=AXIS,
+                                  linewidth=0.5, transform=fig.transFigure))
+
+    # --- the cells to circle ---------------------------------------------
+    for r in range(rows):
+        middle = header - (r + 0.5) * row_h
+        fig.text((edges[1] + edges[2]) / 2, middle, "IN   OUT", size=7,
+                 ha="center", va="center", color=INK_2)
+        fig.text((edges[2] + edges[3]) / 2, middle, "1  2  3", size=7,
+                 ha="center", va="center", color=INK_2)
+        for i in range(len(tags)):
+            fig.text((edges[3 + i] + edges[4 + i]) / 2, middle, "+   −   0",
+                     size=7.5, ha="center", va="center", color=INK_2)
+
+    # --- the legend, so nothing has to be remembered ----------------------
+    title_y = bottom - 0.055
+    fig.text(left, title_y, "WHAT THE TAGS MEAN", size=8.5,
+             weight="bold", color=INK)
+    y = title_y - 0.030
+    fig.text(left, y, "tag", size=7.5, weight="bold", color=MUTED)
+    fig.text(left + 0.055, y, "what you are reading", size=7.5,
+             weight="bold", color=MUTED)
+    fig.text(left + 0.290, y, "+", size=7.5, weight="bold", color=MUTED)
+    fig.text(left + 0.560, y, "−", size=7.5, weight="bold", color=MUTED)
+    for n, (tag, (what, plus, minus)) in enumerate(FACTORS.items()):
+        y = title_y - 0.054 - n * LEGEND_STEP
+        fig.text(left, y, tag, size=8, color=INK, weight="bold")
+        fig.text(left + 0.055, y, what, size=8, color=INK_2)
+        fig.text(left + 0.290, y, plus, size=8, color=INK_2)
+        fig.text(left + 0.560, y, minus, size=8, color=INK_2)
+    rules_y = title_y - 0.054 - (len(FACTORS) - 1) * LEGEND_STEP - 0.038
+
+    rules = [
+        "0  means you looked and could not tell.  A tag left BLANK means "
+        "you never looked — those are different and are stored differently.",
+        "Conv  is how strongly you felt it, 1 to 3.  Optional.  Whether "
+        "conviction predicts anything is one of the questions here.",
+        "Fill it in AT THE MOMENT.  A read written after the close already "
+        "knows how it turned out, so it feels like evidence and is not.",
+        "Missed one?  Leave the row blank.  Blanks cost nothing; "
+        "reconstructed rows poison the sample.",
+    ]
+    for n, text in enumerate(rules):
+        fig.text(left, rules_y - n * RULE_STEP, text, size=7.4,
+                 color=INK if n >= 2 else INK_2)
+
+    return fig
+
+
+def capture_sheet(path: str, symbol: str) -> None:
+    """The sheet, written as a one-page PDF."""
+    fig = sheet_figure(symbol)
+    with PdfPages(path) as pdf:
+        pdf.savefig(fig, facecolor=SURFACE)
+    plt.close(fig)
+
+
 def page_overview(pdf: PdfPages, session: Session) -> None:
     """The whole session on one page, every panel on one clock.
 
@@ -2004,6 +2141,39 @@ def self_test() -> int:
     print("  Bad date / time / missing key  : skipped, rest still read")
     print("  Malformed or absent file       : no notes, no exception")
     print("  Author                         : jason -> You, else Me")
+    # --- the printed capture sheet -----------------------------------------
+    # It is built FROM FACTORS rather than typed out beside it, so the
+    # page and the parser cannot disagree about the vocabulary. The
+    # failure that would cause: readings circled all day in a column the
+    # reader will not accept, discovered at nine in the evening.
+    original = dict(FACTORS)
+    try:
+        for extra in ("spread", "halt", "news"):
+            FACTORS[extra] = (f"{extra} test", "yes", "no")
+        fig = sheet_figure("SPCX")
+        titles = [t.get_text() for t in fig.texts]
+        for tag in FACTORS:
+            if tag not in titles:
+                failures.append(f"a tag added to FACTORS should appear as a "
+                                f"column: {tag} missing")
+                break
+        # The bug this pins: the legend grew down past the page edge and
+        # printed on top of the rules underneath it. Budget, not luck.
+        lowest = min(t.get_position()[1] for t in fig.texts)
+        if lowest < 0.005:
+            failures.append(f"with {len(FACTORS)} tags the sheet runs off the "
+                            f"bottom of the page: lowest text at {lowest:.3f}")
+        plt.close(fig)
+    finally:
+        FACTORS.clear()
+        FACTORS.update(original)
+
+    with tempfile.TemporaryDirectory() as folder:
+        out = os.path.join(folder, "sheet.pdf")
+        capture_sheet(out, "SPCX")
+        if not os.path.exists(out) or os.path.getsize(out) < 1000:
+            failures.append("the capture sheet should write a real PDF")
+
     # --- factors: the checklist, not the conclusion ------------------------
     full = parse_note("11:03 IN c3: of+ poc+ vw- form+ wick+ macd+ big-")
     if full.kind != "in" or full.conviction != 3:
@@ -2231,6 +2401,7 @@ def self_test() -> int:
     print("  IN:/OUT: reads                 : pinned to the fill they explain")
     print("  Factor checklist               : fixed tags, fixed order")
     print("  A mistyped tag                 : reported, never read as prose")
+    print("  Capture sheet                  : built from FACTORS, fits the page")
 
     if failures:
         print("\nFAILED:")
@@ -2259,6 +2430,9 @@ def main() -> int:
                              ".csv. Repeat it once per account -- each "
                              "file is paired into round trips on its own "
                              "(default: trades.xlsx, then trades.csv)")
+    parser.add_argument("--sheet", nargs="?", const="", metavar="FILE",
+                        help="Write the printable read-capture sheet "
+                             "and exit. No network, no data needed.")
     parser.add_argument("--self-test", action="store_true",
                         help="Check the notes layer offline")
     parser.add_argument("--no-open", action="store_true", help="Write it, do not open it")
@@ -2269,6 +2443,14 @@ def main() -> int:
            else trading_days(date.today() - timedelta(days=1), 1)[0])
     if args.self_test:
         return self_test()
+
+    if args.sheet is not None:
+        path = args.sheet or f"{symbol}_capture_sheet.pdf"
+        capture_sheet(path, symbol)
+        print(f"Capture sheet written to {path}")
+        print(f"  {SHEET_ROWS} rows, {len(FACTORS)} factors, "
+              f"legend on the same page. Print it landscape.")
+        return 0
 
     start, end = parse_clock(args.start), parse_clock(args.end)
 
