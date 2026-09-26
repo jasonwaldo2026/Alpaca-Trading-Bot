@@ -437,6 +437,8 @@ class Note:
     who: str
     text: str
     kind: str = ""            # "" an observation, "in"/"out" a read
+    conviction: Optional[int] = None       # 1-3, if it was given
+    factors: Dict[str, str] = field(default_factory=dict)
 
     @property
     def mine(self) -> bool:
@@ -460,22 +462,124 @@ class Note:
             head = "IN"
         elif self.kind == "out":
             head = "OUT"
-        body = "\n".join(textwrap.wrap(self.text, NOTE_WRAP))
-        return f"{self.at:%H:%M}  {head}\n{body}"
+        if self.conviction:
+            head += f"  c{self.conviction}"
+        lines = [f"{self.at:%H:%M}  {head}"]
+        if self.text:
+            lines += textwrap.wrap(self.text, NOTE_WRAP)
+        # The factors in the order FACTORS declares them, not the order
+        # they were typed: reading one debrief against another only works
+        # if the same reading sits in the same place on both.
+        if self.factors:
+            row = " ".join(f"{tag}{self.factors[tag]}"
+                           for tag in FACTORS if tag in self.factors)
+            lines += textwrap.wrap(row, NOTE_WRAP)
+        return "\n".join(lines)
+
+
+#: What gets checked before acting, as Jason described it. A fixed
+#: vocabulary rather than free text, because the question this exists to
+#: answer is WHICH of these is worth reading -- and "sellers exhausted"
+#: records the conclusion while throwing away the evidence.
+#:
+#: Seven factors can be ranked one at a time with 60-80 trades. Their
+#: COMBINATIONS cannot: three states each is 2,187 cells and no amount
+#: of trading fills that. Anything found here nominates; the next batch
+#: of days decides.
+FACTORS = {
+    "of":   ("order flow", "buyers lifting offers", "sellers hitting bids"),
+    "poc":  ("volume profile POC", "rising / above VWAP", "falling / below"),
+    "vw":   ("price vs VWAP", "above", "below"),
+    "form": ("the candle forming", "building to its high", "bleeding to its low"),
+    "wick": ("the run of lower wicks", "lows lining up", "lows stepping down"),
+    "macd": ("MACD", "rising, diverging up", "falling"),
+    "big":  ("the longer timeframe", "agrees", "disagrees"),
+}
+
+#: "+" and "-" are readings. "0" means LOOKED AND COULD NOT TELL, which
+#: is not the same as a tag left out entirely -- that one means it was
+#: never checked. Collapsing the two would quietly turn "I don't know"
+#: into "I didn't look" and make the sample say something it does not.
+FACTOR_VALUES = ("+", "-", "0")
+
+_FACTOR_TOKEN = re.compile(r"^([A-Za-z]+)([+\-0])$")
+_CONVICTION = re.compile(r"^c([1-3])$", re.I)
+
+
+@dataclass
+class ParsedNote:
+    """A note's text, taken apart into what can be counted."""
+    kind: str = ""                         # "", "in" or "out"
+    conviction: Optional[int] = None       # 1-3, if given
+    factors: Dict[str, str] = field(default_factory=dict)
+    text: str = ""
+    unknown: List[str] = field(default_factory=list)
+
+
+def parse_note(text: str) -> ParsedNote:
+    """Pull the structure out of a note typed one-handed.
+
+    Understands:  IN c3: of+ poc+ vw- form+ wick+ macd+ big-
+                  OUT: of- form-
+                  IN: sellers exhausted        (a read, no factors)
+                  alarm fired late again       (a plain observation)
+
+    Factors and prose can be mixed -- the tokens that parse as factors
+    are taken, and whatever is left stays as the note's words.
+
+    A token SHAPED like a factor whose tag is not in FACTORS is returned
+    in `unknown` rather than quietly becoming prose. A typo that turns
+    into a sentence is a reading lost without anyone noticing, which is
+    the same failure the broker-header sniffer reports by name.
+    """
+    head, sep, rest = text.partition(":")
+    parsed = ParsedNote(text=text.strip())
+    if not sep:
+        return parsed
+
+    words = head.strip().split()
+    # A leading clock is tolerated. The time is its own field in the
+    # file, so it should not be here -- but these are transcribed from a
+    # phone where "11:03 IN c3: ..." is exactly what got typed, and
+    # silently demoting that whole line to prose would lose the reading.
+    if words and re.fullmatch(r"\d{1,2}", words[0]) and rest[:2].isdigit():
+        head, _, rest = rest.partition(":")
+        words = head.strip().split()
+        while words and words[0].isdigit():
+            words.pop(0)      # the minutes, now stranded at the front
+    if not words or words[0].lower() not in ("in", "out"):
+        return parsed
+    parsed.kind = words[0].lower()
+    parsed.text = rest.strip()
+    for word in words[1:]:
+        found = _CONVICTION.match(word)
+        if found:
+            parsed.conviction = int(found.group(1))
+
+    keep: List[str] = []
+    for word in rest.split():
+        found = _CONVICTION.match(word)
+        if found:
+            parsed.conviction = int(found.group(1))
+            continue
+        token = _FACTOR_TOKEN.match(word)
+        if not token:
+            keep.append(word)
+            continue
+        tag, value = token.group(1).lower(), token.group(2)
+        if tag in FACTORS:
+            parsed.factors[tag] = value
+        else:
+            parsed.unknown.append(word)
+    parsed.text = " ".join(keep)
+    return parsed
 
 
 def split_read(text: str) -> Tuple[str, str]:
-    """An "IN:"/"OUT:" prefix off the front of a note.
-
-    The prefix exists because the note has to be writable on a phone
-    with a position open. Typing {"kind": "in"} at 11:03 is not going to
-    happen; typing "IN: sellers exhausted" might. An explicit "kind" in
-    the file still wins, so the JSON stays the source of truth.
-    """
-    head, sep, rest = text.partition(":")
-    if sep and head.strip().lower() in ("in", "out"):
-        return head.strip().lower(), rest.strip()
-    return "", text
+    """The kind and the remaining words. Kept for the callers that only
+    want those two; everything else goes through parse_note."""
+    got = parse_note(text)
+    return got.kind, got.text
 
 
 def load_notes(path: str, symbol: str, day: date) -> List[Note]:
@@ -493,17 +597,33 @@ def load_notes(path: str, symbol: str, day: date) -> List[Note]:
         return []
 
     notes: List[Note] = []
+    unknown: set = set()
     for entry in entries:
         try:
             if entry["date"] != f"{day:%Y-%m-%d}":
                 continue
             hh, mm = (int(part) for part in entry["time"].split(":"))
-            kind, text = split_read(str(entry["note"]))
-            notes.append(Note(at=time(hh, mm), who=str(entry.get("who", "")),
-                              text=text,
-                              kind=str(entry.get("kind", kind)).strip().lower()))
+            got = parse_note(str(entry["note"]))
+            if got.unknown:
+                unknown.update(got.unknown)
+            factors = {k: v for k, v in
+                       dict(got.factors, **(entry.get("factors") or {})).items()
+                       if k in FACTORS and v in FACTOR_VALUES}
+            notes.append(Note(
+                at=time(hh, mm), who=str(entry.get("who", "")), text=got.text,
+                kind=str(entry.get("kind", got.kind)).strip().lower(),
+                conviction=entry.get("conviction", got.conviction),
+                factors=factors))
         except (KeyError, TypeError, ValueError):
             continue          # one bad entry is not the whole file
+    if unknown:
+        # Reported rather than swallowed: a mistyped tag that
+        # silently becomes prose is a reading lost with nothing
+        # to show for it, and these are only worth keeping if
+        # every one of them lands in the count.
+        print(f"  notes: unrecognised factor(s) "
+              f"{', '.join(sorted(unknown))} -- known tags are "
+              f"{', '.join(FACTORS)}")
     return sorted(notes, key=lambda note: note.at)
 
 
@@ -1884,6 +2004,49 @@ def self_test() -> int:
     print("  Bad date / time / missing key  : skipped, rest still read")
     print("  Malformed or absent file       : no notes, no exception")
     print("  Author                         : jason -> You, else Me")
+    # --- factors: the checklist, not the conclusion ------------------------
+    full = parse_note("11:03 IN c3: of+ poc+ vw- form+ wick+ macd+ big-")
+    if full.kind != "in" or full.conviction != 3:
+        failures.append(f"IN c3 with a leading clock: {full.kind!r}, "
+                        f"c={full.conviction}")
+    if len(full.factors) != len(FACTORS):
+        failures.append(f"all seven factors should parse: {full.factors}")
+    if full.factors.get("vw") != "-" or full.factors.get("of") != "+":
+        failures.append(f"factor signs read wrong: {full.factors}")
+    if full.text:
+        failures.append(f"factor tokens are not prose: {full.text!r}")
+
+    # Prose and factors mix; an unknown tag is REPORTED, never demoted to
+    # prose, because a typo that becomes a sentence is a reading lost.
+    mixed = parse_note("IN c2: of+ xyz+ tape was thin")
+    if mixed.factors != {"of": "+"} or mixed.unknown != ["xyz+"]:
+        failures.append(f"unknown tag should be flagged: {mixed.factors}, "
+                        f"{mixed.unknown}")
+    if mixed.text != "tape was thin":
+        failures.append(f"prose should survive alongside factors: "
+                        f"{mixed.text!r}")
+
+    # "0" is looked-and-unclear. A tag left out was never checked. The
+    # two must not collapse into each other.
+    unsure = parse_note("IN: of0 poc+")
+    if unsure.factors != {"of": "0", "poc": "+"}:
+        failures.append(f"0 is a reading, not an absence: {unsure.factors}")
+    if "vw" in unsure.factors:
+        failures.append("a tag never typed must not appear as a reading")
+
+    if parse_note("Ratio 3:1 on the tape").kind:
+        failures.append("a colon in prose does not make it a read")
+    if parse_note("alarm fired late again").kind:
+        failures.append("an observation is not a read")
+
+    # The label lists factors in FACTORS order, not typed order, so two
+    # debriefs can be read against each other.
+    shuffled = Note(time(11, 3), "jason", "", "in",
+                    factors={"big": "-", "of": "+", "vw": "+"})
+    line = [l for l in shuffled.label.splitlines() if "of+" in l]
+    if not line or line[0].strip() != "of+ vw+ big-":
+        failures.append(f"factors should print in a fixed order: {line}")
+
     # --- reads: what was seen before acting --------------------------------
     for text, want in (("IN: sellers exhausted", ("in", "sellers exhausted")),
                        ("out: buyers gone", ("out", "buyers gone")),
@@ -2066,6 +2229,8 @@ def self_test() -> int:
     print("  Two accounts                   : never paired with each other")
     print("  A date with no time            : dropped, never mispaired")
     print("  IN:/OUT: reads                 : pinned to the fill they explain")
+    print("  Factor checklist               : fixed tags, fixed order")
+    print("  A mistyped tag                 : reported, never read as prose")
 
     if failures:
         print("\nFAILED:")
