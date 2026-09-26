@@ -429,6 +429,83 @@ def below_zero_setups(session: pd.DataFrame,
     return setups
 
 
+#: Where the opening range ends. The first fifteen minutes is the stretch
+#: that bounces hardest and the stretch Jason says should not be traded.
+OPENING_RANGE_END = time(9, 45)
+
+#: Where price is read after the open. The last is the regular close.
+OPEN_HORIZONS = (time(10, 0), time(10, 30), time(11, 0), time(12, 0),
+                 time(16, 0))
+
+
+def price_at(session: pd.DataFrame, when: time) -> Optional[float]:
+    """Close of the last bar at or before `when`.
+
+    At or BEFORE, rather than the bar exactly on it: Alpaca builds bars
+    from trades, so a minute nobody traded in has no bar at all, and a
+    lookup that insisted on 10:00:00 would silently drop the quiet days
+    -- which are not a random subset of days.
+    """
+    upto = session[session.index.time <= when]
+    return float(upto["close"].iloc[-1]) if len(upto) else None
+
+
+def opening_rows(sessions: Dict[date, pd.DataFrame]) -> pd.DataFrame:
+    """One row per day: how it opened, and what happened afterwards.
+
+    Two definitions of "how it opened", because they are different
+    events and a claim about one is not a claim about the other:
+
+      gap    yesterday's 16:00 close -> today's 09:30 open. Nothing
+             trades in between; this is the overnight repricing.
+      range  09:30 open -> 09:45. This is the bouncing Jason describes,
+             and it is a thing that happened during the session.
+
+    What follows is measured from the END of whichever window defined
+    the direction -- from the open for the gap, from 09:45 for the
+    range. Overlap would make part of the "reversal" arithmetic: a
+    window that contains its own definition must move against it
+    sometimes for no reason other than mean reversion within the bar.
+
+    The first day is dropped, since it has no previous close.
+    """
+    days = sorted(sessions)
+    rows: List[dict] = []
+    for previous, day in zip(days, days[1:]):
+        session, before = sessions[day], sessions[previous]
+        prior = price_at(before, time(16, 0))
+        regular = session[session.index.time >= SESSION_OPEN]
+        if not prior or regular.empty:
+            continue
+        opened = float(regular["open"].iloc[0])
+        quarter = price_at(session, OPENING_RANGE_END)
+        if not opened or quarter is None:
+            continue
+        row = {"day": day,
+               "gap": 100.0 * (opened - prior) / prior,
+               "range": 100.0 * (quarter - opened) / opened}
+        for horizon in OPEN_HORIZONS:
+            later = price_at(session, horizon)
+            tag = f"{horizon:%H%M}"
+            row[f"gap_{tag}"] = (None if later is None
+                                 else 100.0 * (later - opened) / opened)
+            row[f"range_{tag}"] = (
+                None if later is None or horizon <= OPENING_RANGE_END
+                else 100.0 * (later - quarter) / quarter)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def noise_floor(n: int) -> float:
+    """One standard error on a coin flip, in percentage points.
+
+    Printed beside every rate in section 14 because the whole section is
+    a set of proportions on thin buckets, and 55% of 45 days is not a
+    finding -- it is a coin landing the way coins land.
+    """
+    return 100.0 * (0.25 / n) ** 0.5 if n else 0.0
+
+
 def slot_volume(sessions: Dict[date, pd.DataFrame]) -> Dict[time, float]:
     """The usual volume for each clock minute, across these sessions.
 
@@ -1373,6 +1450,84 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
         print("   independent. A good number here means pre-register it and")
         print("   watch it forward, exactly as everywhere else in this file.")
 
+    # ---- 14. the open, and whether it reverses -------------------------
+    print(f"\n{rule}")
+    print("14. THE OPEN, AND WHETHER IT REVERSES\n")
+    print("   The claim being tested: the stock reverses from whichever")
+    print("   way it opens. Measured two ways, because \"the open\" means")
+    print("   two different things -- the overnight gap, and the first")
+    print("   fifteen minutes of trading -- and they can disagree.")
+    print("\n   Long-only, so only half of this is actionable. A positive")
+    print("   open that reverses DOWN is a reason to stay out, not a trade.")
+    print("   The row that could become a hot button is the negative one.")
+
+    opens = opening_rows(sessions)
+    if len(opens) < MIN_TRADES:
+        print(f"\n   Only {len(opens)} usable sessions -- too few. Each needs "
+              f"a previous\n   close to measure the gap against.")
+    else:
+        for name, anchor, label in (
+                ("gap", "gap", "GAP  (yesterday's close -> 09:30 open), "
+                                "measured from the open"),
+                ("range", "range", "OPENING RANGE  (09:30 -> 09:45), "
+                                   "measured from 09:45")):
+            print(f"\n   {label}")
+            columns = [(h, f"{name}_{h:%H%M}") for h in OPEN_HORIZONS
+                       if f"{name}_{h:%H%M}" in opens
+                       and opens[f"{name}_{h:%H%M}"].notna().any()]
+            head = "".join(f"{h:%H:%M}".rjust(10) for h, _ in columns)
+            print(f"\n   {'':<18}{'Days':>6}{head}")
+
+            buckets = (("opened down", opens[opens[anchor] < 0]),
+                       ("opened up", opens[opens[anchor] > 0]),
+                       ("ALL DAYS", opens))
+            for title, frame in buckets:
+                if frame.empty:
+                    continue
+                cells = ""
+                for _, column in columns:
+                    values = frame[column].dropna()
+                    cells += ("       --" if len(values) < MIN_TRADES
+                              else f"{100.0 * (values > 0).mean():9.0f}%")
+                mark = "  <- baseline" if title == "ALL DAYS" else ""
+                print(f"   {title:<18}{len(frame):>6}{cells}{mark}")
+
+            thin = [t for t, f in buckets if 0 < len(f) < MIN_TRADES]
+            if thin:
+                print(f"\n   '--' means under {MIN_TRADES} days in that cell. "
+                      f"Too thin: {', '.join(thin)}")
+            print(f"\n   Read DOWN the column, not across. A bucket only says")
+            print(f"   something if it differs from ALL DAYS by more than the")
+            print(f"   noise floor -- +/-{noise_floor(len(opens)):.0f} points "
+                  f"at {len(opens)} days, wider for a")
+            print(f"   smaller bucket. Equal to the baseline means the open "
+                  f"told you nothing.")
+
+        # The actionable half, with the numbers a bracket needs. Percent
+        # up is a direction; a stop needs to know how far it goes wrong
+        # first, and a target needs to know how far it goes right.
+        down = opens[opens["range"] < 0]
+        column = f"range_{time(12, 0):%H%M}"
+        if len(down) >= MIN_TRADES and column in down:
+            values = down[column].dropna()
+            if len(values) >= MIN_TRADES:
+                print(f"\n   Buying 09:45 on a negative opening range, held to "
+                      f"noon, {len(values)} days:")
+                print(f"   {'median move':<24}{pct(values, 0.5):>8.2f}%")
+                print(f"   {'lower quarter':<24}{pct(values, 0.25):>8.2f}%")
+                print(f"   {'upper quarter':<24}{pct(values, 0.75):>8.2f}%")
+                print("\n   That is the move to the horizon, not the excursion")
+                print("   on the way. A stop needs section 6's numbers, and a")
+                print("   median near zero with quarters either side of it is")
+                print("   a coin flip whatever the percentage above says.")
+
+        print("\n   Three of the four things measured in this file came back")
+        print("   negative, including the MACD crossover twice. If this one")
+        print("   matches its baseline, the finding is that the open is not")
+        print("   tradeable -- which is worth having as a number rather than")
+        print("   as a feeling, and is an argument for not being at the")
+        print("   screen at 09:31 rather than for more willpower at 09:31.")
+
     return outcomes
 
 
@@ -1596,6 +1751,53 @@ def self_test() -> int:
     print("  Same cross above zero          : not a set-up")
     print("  Set-up that rolls over         : dead at the re-cross")
     print("  Early entry on failed set-ups  : present (no look-ahead)")
+    print("  Gap vs opening range           : measured from separate anchors")
+    print("  A minute with no trades        : read at-or-before, day kept")
+    print("  Noise floor                    : 7.5 points on 45 days")
+
+
+    # --- section 14: the open ---------------------------------------------
+    # Two sessions so the second has a previous close to gap against.
+    thursday = _session([150.0] * 30 + [151.0] * 360)          # closes 151.00
+    # Opens at 149.00 (a -1.32% gap), sags to 148.50 by 09:45, then climbs
+    # all afternoon: a down open that reverses, which is the shape claimed.
+    friday = _session([149.0] * 15 + [148.5] * 15 + [152.0] * 360,
+                      first=SESSION_OPEN)
+    table = opening_rows({date(2026, 9, 17): thursday, date(2026, 9, 18): friday})
+    if len(table) != 1:
+        failures.append(f"the first day has no previous close and is dropped; "
+                        f"got {len(table)} rows")
+    else:
+        row = table.iloc[0]
+        if round(row["gap"], 2) != round(100 * (149.0 - 151.0) / 151.0, 2):
+            failures.append(f"gap should be prev close -> open: {row['gap']}")
+        if round(row["range"], 2) != round(100 * (148.5 - 149.0) / 149.0, 2):
+            failures.append(f"range should be open -> 09:45: {row['range']}")
+        # The range is measured FROM 09:45, so a rise after it is positive
+        # even though the day is still below its open. That distinction is
+        # the whole reason the two anchors are separate.
+        if not row["range_1200"] > 0:
+            failures.append("a climb after 09:45 is a positive range move")
+        if not row["gap_1200"] > 0:
+            failures.append("152.00 against a 149.00 open is a positive gap move")
+        # No horizon inside the defining window, or the reversal is partly
+        # arithmetic rather than a fact about the stock.
+        if row.get("range_1000") is None:
+            failures.append("10:00 is after 09:45 and should be measured")
+
+    # A missing minute must not drop the day: price_at reads at-or-before.
+    gappy = _session([100.0] * 60)
+    gappy = gappy.drop(gappy.index[30])
+    if price_at(gappy, time(10, 0)) is None:
+        failures.append("a minute with no trades should not lose the reading")
+    if price_at(_session([100.0] * 5), time(8, 0)) is not None:
+        failures.append("nothing before 08:00 should read as nothing, not 0")
+
+    if round(noise_floor(45), 1) != 7.5:
+        failures.append(f"one standard error on 45 coin flips is 7.5 points, "
+                        f"got {noise_floor(45):.2f}")
+    if noise_floor(0) != 0.0:
+        failures.append("no days is no noise floor, not a division by zero")
 
     if failures:
         print("\nFAILED:")
