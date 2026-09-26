@@ -38,3 +38,11 @@ floats.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Trade records — personal financial data, never committed.
+# daily_report.py reads these if present and draws nothing if not, so a
+# checkout without them still builds every chart.
+tools/trades*.csv
+tools/trades*.json
+tools/*_trades.csv
+tools/*_fills.csv

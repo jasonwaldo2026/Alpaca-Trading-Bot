@@ -24,6 +24,7 @@ READ-ONLY. Market-data client only. No trading client, no order object.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sqlite3
@@ -165,6 +166,7 @@ class Session:
     signals: pd.DataFrame
     macd: pd.DataFrame        # 1-minute, the bars the alerts read
     notes: List[Note] = field(default_factory=list)
+    trades: List[Trade] = field(default_factory=list)
     start: time = WINDOW_START      # the window the page is drawn for,
     end: time = WINDOW_END          # not the part of it that has printed
     benchmark: Optional[Tuple[str, float]] = None   # (symbol, % over the window)
@@ -222,6 +224,103 @@ NOTE_WRAP = 30
 #: many dollars tall a line of text is, so measuring in price is
 #: circular and the boxes grow as fast as the room made for them.
 NOTE_LINE, NOTE_PAD = 0.046, 0.020
+
+
+#: Where the day's fills live. NEVER committed -- .gitignore carries a
+#: rule for it, because these are account records rather than research.
+#: Absent, the chart draws without them, so a fresh checkout still works.
+TRADES_PATH = "trades.csv"
+
+#: Column names the two brokers might use for the same thing. Robinhood
+#: and DAS disagree with each other and with themselves across export
+#: versions, so the reader sniffs rather than insisting. A header this
+#: does not recognise is reported by name rather than silently dropped:
+#: a trade log that quietly reads zero rows is worse than one that fails.
+TRADE_COLUMNS = {
+    "at": ("time", "datetime", "date/time", "filled at", "exec time",
+           "execution time", "timestamp", "trade time", "date"),
+    "side": ("side", "b/s", "action", "buy/sell", "type", "direction"),
+    "quantity": ("qty", "quantity", "shares", "filled qty", "size", "exec qty"),
+    "price": ("price", "fill price", "exec price", "avg price",
+              "average price", "trade price"),
+    "symbol": ("symbol", "ticker", "instrument", "stock"),
+}
+
+
+@dataclass
+class Fill:
+    """One execution. Long-only, so a buy opens and a sell closes."""
+    at: datetime
+    side: str                 # "buy" or "sell"
+    quantity: float
+    price: float
+
+
+@dataclass
+class Trade:
+    """A round trip: shares bought, then sold.
+
+    Brokers export fills, not trades. A position opened in two lots and
+    closed in one is three rows that describe one decision, so the fills
+    are paired oldest-first into round trips before anything is drawn.
+    """
+    opened: datetime
+    closed: Optional[datetime]
+    quantity: float
+    entry: float
+    exit: Optional[float]
+
+    @property
+    def profit(self) -> Optional[float]:
+        if self.exit is None:
+            return None
+        return (self.exit - self.entry) * self.quantity
+
+    @property
+    def won(self) -> bool:
+        return (self.profit or 0.0) > 0
+
+    def label(self) -> str:
+        shares = f"{self.quantity:,.0f}"
+        if self.profit is None:
+            return f"{shares} sh · open"
+        return f"{shares} sh · {'+' if self.profit >= 0 else '-'}$" \
+               f"{abs(self.profit):,.0f}"
+
+
+def pair_fills(fills: Sequence[Fill]) -> List[Trade]:
+    """Fills into round trips, oldest lot closed first.
+
+    FIFO because that is what a broker reports and what the tax year
+    assumes; matching some other way would make the chart disagree with
+    the statement it came from.
+
+    A buy left unmatched at the end of the day is an open position, not
+    an error -- it is drawn with an entry and no exit.
+    """
+    open_lots: List[List[float]] = []          # [quantity, price, opened]
+    trades: List[Trade] = []
+    for fill in sorted(fills, key=lambda f: f.at):
+        if fill.side == "buy":
+            open_lots.append([fill.quantity, fill.price, fill.at])
+            continue
+        remaining = fill.quantity
+        while remaining > 1e-9 and open_lots:
+            lot = open_lots[0]
+            took = min(lot[0], remaining)
+            trades.append(Trade(opened=lot[2], closed=fill.at, quantity=took,
+                                entry=lot[1], exit=fill.price))
+            lot[0] -= took
+            remaining -= took
+            if lot[0] <= 1e-9:
+                open_lots.pop(0)
+        # A sell with nothing open is a short, and this is a long-only
+        # book -- so it is someone else's row, and it is left alone.
+
+    for quantity, price, opened in open_lots:
+        trades.append(Trade(opened=opened, closed=None, quantity=quantity,
+                            entry=price, exit=None))
+    return sorted(trades, key=lambda t: t.opened)
 
 
 def stack_notes(heights: Sequence[float], xs: Sequence[float],
@@ -296,6 +395,100 @@ def load_notes(path: str, symbol: str, day: date) -> List[Note]:
         except (KeyError, TypeError, ValueError):
             continue          # one bad entry is not the whole file
     return sorted(notes, key=lambda note: note.at)
+
+
+def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
+    """The day's round trips for one symbol, or nothing at all.
+
+    Unlike the notes, a problem here is worth saying out loud on the
+    terminal: a chart drawn without trades looks exactly like a day you
+    did not trade, and that is a difference worth knowing about. The
+    chart is still built either way.
+    """
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as handle:
+            rows = list(csv.DictReader(handle))
+    except OSError:
+        return []
+    if not rows:
+        return []
+
+    found = {}
+    headers = {(name or "").strip().lower(): name for name in rows[0]}
+    for field, names in TRADE_COLUMNS.items():
+        for candidate in names:
+            if candidate in headers:
+                found[field] = headers[candidate]
+                break
+    missing = [f for f in ("at", "side", "quantity", "price") if f not in found]
+    if missing:
+        print(f"  trades: {path} has no column for {', '.join(missing)} "
+              f"— found {list(headers)}")
+        return []
+
+    fills: List[Fill] = []
+    for row in rows:
+        try:
+            if "symbol" in found:
+                got = str(row[found["symbol"]]).strip().upper()
+                if got and got != symbol.upper():
+                    continue
+            at = pd.to_datetime(row[found["at"]])
+            at = (at.tz_localize(ET) if at.tzinfo is None
+                  else at.tz_convert(ET))
+            if at.date() != day:
+                continue
+            side = str(row[found["side"]]).strip().lower()
+            side = "buy" if side.startswith("b") else "sell"
+            fills.append(Fill(at=at.to_pydatetime(), side=side,
+                              quantity=abs(float(str(row[found["quantity"]])
+                                                 .replace(",", ""))),
+                              price=float(str(row[found["price"]])
+                                          .replace("$", "").replace(",", ""))))
+        except (KeyError, TypeError, ValueError):
+            continue          # one unreadable row is not the whole file
+    return pair_fills(fills)
+
+
+def draw_trades(price, trades: List[Trade], slot_of: Dict, candles) -> None:
+    """Each round trip as a span from entry to exit.
+
+    Drawn in ink rather than green and red: the candles already own
+    those two hues, and a coloured horizontal bar among them reads as
+    part of the price action rather than as something laid over it.
+    Won or lost is carried by the marker at the exit -- a filled square
+    for a winner, hollow for a loser -- and by the sign in the label, so
+    it survives being printed in black and white.
+    """
+    if not trades:
+        return
+
+    def slot_x(when: datetime) -> Optional[float]:
+        slot = when.replace(minute=when.minute - (when.minute % BAR_MINUTES),
+                            second=0, microsecond=0)
+        return slot_of.get(slot)
+
+    for trade in trades:
+        x0 = slot_x(trade.opened)
+        if x0 is None:
+            continue
+        x1 = slot_x(trade.closed) if trade.closed else max(slot_of.values())
+
+        price.plot([x0, x1], [trade.entry, trade.entry], color=INK,
+                   linewidth=1.5, alpha=0.55, zorder=4,
+                   solid_capstyle="butt")
+        price.scatter([x0], [trade.entry], marker="o", s=34, color=INK,
+                      zorder=6, edgecolors=SURFACE, linewidths=0.7)
+        if trade.exit is not None and x1 is not None:
+            price.plot([x1, x1], [trade.entry, trade.exit], color=INK,
+                       linewidth=1.0, alpha=0.45, zorder=4)
+            price.scatter([x1], [trade.exit], marker="s", s=38,
+                          facecolors=INK if trade.won else SURFACE,
+                          edgecolors=INK, linewidths=1.1, zorder=6)
+        price.annotate(trade.label(), xy=((x0 + (x1 or x0)) / 2.0, trade.entry),
+                       xytext=(0, -11), textcoords="offset points",
+                       ha="center", va="top", fontsize=5.8, color=INK_2,
+                       zorder=6)
 
 
 def draw_notes(price, notes: List[Note], slot_of: Dict, candles) -> None:
@@ -477,6 +670,7 @@ def gather(symbol: str, day: date, start: time, end: time, db_path: str,
         baseline=slot_baseline(symbol, day, start, end, force_sip=force_sip),
         signals=logged_signals(db_path, symbol, day),
         notes=load_notes(NOTES_PATH, symbol, day),
+        trades=load_trades(TRADES_PATH, symbol, day),
         macd=macd,
         start=start, end=end,
         benchmark=market_move(benchmark, day, start, end, force_sip),
@@ -665,6 +859,7 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
     price.plot(x, vwap_at.values, color=VWAP_HUE, linewidth=1.6,
                linestyle=(0, (5, 2)), label="VWAP", zorder=3)
 
+    draw_trades(price, session.trades, slot_of, candles)
     draw_notes(price, session.notes, slot_of, candles)
 
     signal_x = []
@@ -945,7 +1140,7 @@ def self_test() -> int:
     """Check the notes layer offline. No network, no credentials."""
     import tempfile
 
-    print("Self-test: checking the notes layer...\n")
+    print("Self-test: checking the notes and trades layers...\n")
     failures = []
 
     # --- the stacker ------------------------------------------------------
@@ -1028,6 +1223,80 @@ def self_test() -> int:
         if load_notes(os.path.join(folder, "absent.json"), "SPCX", day) != []:
             failures.append("a missing file should cost the notes, not raise")
 
+    # --- pairing fills into round trips -----------------------------------
+    def at(hh, mm):
+        return datetime.combine(day, time(hh, mm), tzinfo=ET)
+
+    # One in, one out.
+    trips = pair_fills([Fill(at(10, 0), "buy", 100, 150.0),
+                        Fill(at(10, 30), "sell", 100, 151.0)])
+    if len(trips) != 1 or abs((trips[0].profit or 0) - 100.0) > 1e-9:
+        failures.append(f"a simple round trip should make $100: "
+                        f"{[t.profit for t in trips]}")
+    if trips and not trips[0].won:
+        failures.append("a profitable trip should read as won")
+
+    # Two lots in, one sale out: the OLDEST lot closes first, so the
+    # profit is not the same as pairing against the cheaper one.
+    trips = pair_fills([Fill(at(10, 0), "buy", 100, 150.0),
+                        Fill(at(10, 5), "buy", 100, 148.0),
+                        Fill(at(11, 0), "sell", 150, 151.0)])
+    if len(trips) != 3:
+        failures.append(f"100 + 100 in, 150 out is 3 trips (100, 50, 50 open), "
+                        f"got {len(trips)}")
+    else:
+        first, second, still_open = trips
+        if first.entry != 150.0 or first.quantity != 100:
+            failures.append("the oldest lot should close first (FIFO)")
+        if second.entry != 148.0 or second.quantity != 50:
+            failures.append("the remainder should come off the next lot")
+        if still_open.exit is not None or still_open.quantity != 50:
+            failures.append("50 shares should be left open, not dropped")
+        if still_open.profit is not None:
+            failures.append("an open position has no profit yet")
+        if "open" not in still_open.label():
+            failures.append(f"an open position should say so: "
+                            f"{still_open.label()}")
+
+    # A sell with nothing open is a short. This is a long-only book, so
+    # it belongs to someone else and must not invent a trade.
+    if pair_fills([Fill(at(10, 0), "sell", 100, 150.0)]):
+        failures.append("a sell with no position open should make no trade")
+    if pair_fills([]):
+        failures.append("no fills should make no trades")
+
+    # --- reading a broker file --------------------------------------------
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "trades.csv")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "Exec Time,B/S,Filled Qty,Fill Price,Ticker\n"
+                '2026-09-25 10:12:00,B,"1,000",$152.40,SPCX\n'
+                "2026-09-25 10:58:00,S,1000,151.62,SPCX\n"
+                "2026-09-25 11:00:00,B,50,10.00,NVDA\n"
+                "2026-09-24 10:00:00,B,50,99.00,SPCX\n"
+                "not a time,B,50,99.00,SPCX\n")
+        got = load_trades(path, "SPCX", day)
+        if len(got) != 1:
+            failures.append(f"one SPCX round trip on this day, got {len(got)}")
+        elif got[0].quantity != 1000:
+            failures.append("a thousands separator should not become 1 share")
+        elif abs((got[0].profit or 0) + 780.0) > 1e-6:
+            failures.append(f"1000 sh from 152.40 to 151.62 loses $780, "
+                            f"got {got[0].profit}")
+        if load_trades(os.path.join(folder, "none.csv"), "SPCX", day) != []:
+            failures.append("a missing trades file should cost the trades only")
+
+        # A file whose headers mean nothing is reported, not silently read
+        # as a day with no trading.
+        odd = os.path.join(folder, "odd.csv")
+        with open(odd, "w", encoding="utf-8") as handle:
+            handle.write("alpha,beta\n1,2\n")
+        print("  Headers it cannot read, on purpose:")
+        if load_trades(odd, "SPCX", day) != []:
+            failures.append("unrecognised headers should yield no trades")
+        print("    ^ that complaint is the expected outcome, not a failure\n")
+
     # The wrap keeps a label narrow enough to sit beside its candle.
     long_note = Note(at=time(10, 0), who="jason", text="word " * 40)
     if max(len(line) for line in long_note.label.splitlines()) > NOTE_WRAP + 2:
@@ -1039,6 +1308,10 @@ def self_test() -> int:
     print("  Bad date / time / missing key  : skipped, rest still read")
     print("  Malformed or absent file       : no notes, no exception")
     print("  Author                         : jason -> You, else Me")
+    print("  Fills -> round trips           : FIFO, oldest lot closes first")
+    print("  Unmatched buy                  : an open position, not an error")
+    print("  Unmatched sell                 : a short, left alone")
+    print("  Broker headers                 : sniffed; unknown ones reported")
 
     if failures:
         print("\nFAILED:")
