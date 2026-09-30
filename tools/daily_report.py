@@ -41,10 +41,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import matplotlib
 matplotlib.use("Agg")
 
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Rectangle
+from matplotlib.ticker import FuncFormatter
 
 try:
     import lockups
@@ -2162,9 +2164,315 @@ def page_signals(pdf: PdfPages, session: Session) -> None:
 
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The performance page
+# ---------------------------------------------------------------------------
+
+def closed_trades(trades: Sequence[Trade]) -> List[Trade]:
+    """Round trips with both ends, oldest exit first.
+
+    A position still open has no result yet, and counting it as zero
+    would flatter a day that is holding a loser. Every Trade has an
+    entry: a sell with nothing open closes shares carried in from an
+    earlier session, and pair_fills drops it rather than inventing a
+    basis for it, so it never reaches here at all.
+    """
+    return sorted((t for t in trades if t.profit is not None),
+                  key=lambda t: t.closed)
+
+
+def running_total(trades: Sequence[Trade]) -> List[Tuple[datetime, float]]:
+    """Realised P&L after each exit, in order. Starts at the first entry, at 0.
+
+    Plotted against the EXIT, because that is the moment the money became
+    real. Plotted against the entry it would show profit arriving before
+    the position was closed.
+    """
+    done = closed_trades(trades)
+    if not done:
+        return []
+    points = [(min(t.opened for t in done), 0.0)]
+    total = 0.0
+    for trade in done:
+        total += trade.profit
+        points.append((trade.closed, total))
+    return points
+
+
+#: Half-hour buckets, labelled by the half hour an entry fell in. Half an
+#: hour rather than an hour because 09:30-10:00 and 10:00-11:00 are the two
+#: that differ most, and an hourly bucket would average them together.
+def by_half_hour(trades: Sequence[Trade]) -> List[Tuple[str, float, int]]:
+    """(label, net, count) per half hour of ENTRY, chronological."""
+    buckets: Dict[int, List[float]] = {}
+    for trade in closed_trades(trades):
+        half = trade.opened.hour * 2 + (1 if trade.opened.minute >= 30 else 0)
+        buckets.setdefault(half, []).append(trade.profit)
+    out = []
+    for half in sorted(buckets):
+        hour, minute = divmod(half * 30, 60)
+        out.append((f"{hour:02d}:{minute:02d}", sum(buckets[half]),
+                    len(buckets[half])))
+    return out
+
+
+def tidy(ax, *, zero: bool = False) -> None:
+    """Recessive chrome: hairline axes, no box, a solid neutral grid.
+
+    Dashed gridlines read as a threshold or a projection when they are
+    only a grid, so these are solid and one shade off the surface.
+    """
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(AXIS)
+        ax.spines[side].set_linewidth(0.8)
+    ax.tick_params(colors=MUTED, labelsize=7.5, length=2.5, width=0.8)
+    ax.grid(True, axis="y", color=GRID, linewidth=0.7, linestyle="-")
+    ax.set_axisbelow(True)
+    if zero:
+        # The neutral midpoint of a two-pole scale: it has to read as
+        # nothing, so it takes the axis grey rather than either pole.
+        ax.axhline(0, color=AXIS, linewidth=1.0)
+
+
+def money_label(value: float) -> str:
+    return f"{'+' if value >= 0 else '-'}${abs(value):,.0f}"
+
+
+def draw_running(ax, trades: Sequence[Trade]) -> None:
+    """Realised P&L through the day, as one stepped line.
+
+    One series, so no legend -- the title names it. Stepped rather than
+    smoothed because nothing happens between two exits: a sloping line
+    between them would draw profit that was not being made.
+    """
+    points = running_total(trades)
+    ax.set_title("Realised P&L through the day, after each exit",
+                 loc="left", color=INK_2, fontsize=8.5, pad=6)
+    if not points:
+        return
+    xs = [mdates.date2num(when) for when, _ in points]
+    ys = [value for _, value in points]
+    ax.step(xs, ys, where="post", color=INK, linewidth=1.6, zorder=3)
+    # Shaded to the zero line rather than coloured by slope: what matters
+    # is whether the day is ahead or behind, not which way the last trade
+    # went. step() again for the fill so the shading has the same corners
+    # as the line -- interpolated, it would cut them off.
+    ax.fill_between(xs, ys, 0, step="post", where=[y >= 0 for y in ys],
+                    color=UP, alpha=0.13, linewidth=0)
+    ax.fill_between(xs, ys, 0, step="post", where=[y < 0 for y in ys],
+                    color=DOWN, alpha=0.13, linewidth=0)
+    tidy(ax, zero=True)
+    # Fills carry Eastern tzinfo and matplotlib renders a tz-aware value
+    # in ITS timezone, which is UTC -- so a 09:33 entry drew at 13:33 and
+    # the whole day sat four hours to the right, on an axis that still
+    # looked entirely plausible.
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=ET))
+    ax.xaxis.set_major_locator(mdates.HourLocator(tz=ET))
+    ax.yaxis.set_major_formatter(
+        FuncFormatter(lambda v, _: f"{'-' if v < 0 else ''}${abs(v):,.0f}"))
+
+    # Two labels, not one per step: where it ended, and the worst it got.
+    # A number on every point is unreadable and goes unread.
+    end_x, end_y = xs[-1], ys[-1]
+    ax.annotate(money_label(end_y), (end_x, end_y),
+                xytext=(6, 0), textcoords="offset points",
+                color=UP if end_y >= 0 else DOWN, fontsize=9,
+                fontweight="bold", va="center", clip_on=False)
+    low = min(range(len(ys)), key=lambda i: ys[i])
+    if ys[low] < 0 and low not in (len(ys) - 1,):
+        # Above the step, not below it: the drawdown sits near zero and
+        # the room under the line belongs to the hour labels.
+        ax.annotate(f"worst {money_label(ys[low])}", (xs[low], ys[low]),
+                    xytext=(0, 9), textcoords="offset points", va="bottom",
+                    color=DOWN, fontsize=7.5, ha="center", clip_on=False)
+
+
+def draw_each_trade(ax, trades: Sequence[Trade]) -> None:
+    """Every round trip as one bar, in the order they closed."""
+    done = closed_trades(trades)
+    ax.set_title("Every round trip, in the order it closed",
+                 loc="left", color=INK_2, fontsize=8.5, pad=6)
+    if not done:
+        return
+    values = [t.profit for t in done]
+    # 0.72 leaves a surface gap between neighbours; a drawn border to
+    # separate them would add a line the chart does not need.
+    ax.bar(range(len(values)), values, width=0.72,
+           color=[UP if v >= 0 else DOWN for v in values], linewidth=0)
+    tidy(ax, zero=True)
+    ax.set_xticks([])
+    ax.yaxis.set_major_formatter(
+        FuncFormatter(lambda v, _: f"{'-' if v < 0 else ''}${abs(v):,.0f}"))
+    ax.set_xlim(-0.8, len(values) - 0.2)
+    # The extremes only. Which two trades made and cost the most is the
+    # question this panel exists to answer; the rest is shape.
+    for index in {max(range(len(values)), key=lambda i: values[i]),
+                  min(range(len(values)), key=lambda i: values[i])}:
+        trade = done[index]
+        above = values[index] >= 0
+        ax.annotate(f"{money_label(values[index])}\n{trade.opened:%H:%M}"
+                    f" · {(trade.closed - trade.opened).total_seconds() / 60:.0f}m",
+                    (index, values[index]),
+                    xytext=(0, 5 if above else -5), textcoords="offset points",
+                    ha="center", va="bottom" if above else "top",
+                    fontsize=7, color=UP if above else DOWN, linespacing=1.35)
+
+
+def draw_half_hours(ax, trades: Sequence[Trade]) -> None:
+    """Net by the half hour the trade was ENTERED in."""
+    rows = by_half_hour(trades)
+    ax.set_title("Net by the half hour you entered  ·  round trips in brackets",
+                 loc="left", color=INK_2, fontsize=8.5, pad=6)
+    if not rows:
+        return
+    labels = [f"{label}  ({count})" for label, _, count in rows]
+    values = [net for _, net, _ in rows]
+    spots = list(range(len(rows)))[::-1]          # earliest at the top
+    ax.barh(spots, values, height=0.66,
+            color=[UP if v >= 0 else DOWN for v in values], linewidth=0)
+    for side in ("top", "right", "bottom"):
+        ax.spines[side].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.axvline(0, color=AXIS, linewidth=1.0)
+    ax.set_yticks(spots)
+    ax.set_yticklabels(labels, fontsize=7.5, color=INK_2)
+    ax.tick_params(length=0, colors=MUTED)
+    ax.set_xticks([])
+    ax.grid(False)
+    # Room for the value beside each bar, on the sides that have bars --
+    # a symmetric range around zero leaves half the panel empty on a day
+    # that was mostly one way.
+    low, high = min(0.0, min(values)), max(0.0, max(values))
+    reach = (high - low) or 1.0
+    ax.set_xlim(low - reach * (0.30 if low < 0 else 0.02),
+                high + reach * (0.30 if high > 0 else 0.02))
+    # Labelled at the bar end and the axis dropped: with the value beside
+    # every bar an x-axis would encode the same number twice.
+    for spot, value in zip(spots, values):
+        ax.annotate(money_label(value), (value, spot),
+                    xytext=(5 if value >= 0 else -5, 0),
+                    textcoords="offset points", va="center",
+                    ha="left" if value >= 0 else "right",
+                    fontsize=7.5, color=UP if value >= 0 else DOWN)
+
+
+
+def draw_hold_vs_result(ax, trades: Sequence[Trade]) -> None:
+    """How long it was held against what it made, per share.
+
+    Cents per share rather than dollars, because a 146-share trade and a
+    2,300-share one are not comparable in dollars and the scatter would
+    only show position size.
+    """
+    done = closed_trades(trades)
+    ax.set_title("Minutes held against result, cents per share",
+                 loc="left", color=INK_2, fontsize=8.5, pad=6)
+    if not done:
+        return
+    held = [(t.closed - t.opened).total_seconds() / 60 for t in done]
+    cents = [100 * (t.exit - t.entry) for t in done]
+    # A surface ring rather than a dark edge, so overlapping points
+    # separate without a border being drawn around every mark.
+    ax.scatter(held, cents, s=46,
+               c=[UP if t.profit >= 0 else DOWN for t in done],
+               edgecolors=SURFACE, linewidths=1.3, zorder=3, alpha=0.95)
+    tidy(ax, zero=True)
+    ax.set_xlabel("minutes held", fontsize=7, color=MUTED, labelpad=2)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}c"))
+    if max(held) > 0:
+        ax.set_xlim(-max(held) * 0.06, max(held) * 1.1)
+    longest = max(range(len(held)), key=lambda i: held[i])
+    ax.annotate(f"{held[longest]:.0f} min", (held[longest], cents[longest]),
+                xytext=(-7, 0), textcoords="offset points", ha="right",
+                va="center", fontsize=7.5,
+                color=UP if cents[longest] >= 0 else DOWN)
+
+
+#: How many stats the performance header has room for. See the comment in
+#: performance_stats, and the self-test that asserts the layout budget.
+HEADER_STATS = 8
+
+
+def performance_stats(trades: Sequence[Trade]) -> List[Tuple[str, str, str]]:
+    """The numbers you would say out loud, as (label, value, tone)."""
+    done = closed_trades(trades)
+    if not done:
+        return []
+    net = sum(t.profit for t in done)
+    wins = [t for t in done if t.profit > 0]
+    best, worst = max(done, key=lambda t: t.profit), min(done, key=lambda t: t.profit)
+    stats = [("Net", money_label(net), UP if net >= 0 else DOWN),
+             ("Round trips", f"{len(done)}", INK),
+             ("Won", f"{len(wins)} of {len(done)}"
+                     f"  ({100 * len(wins) / len(done):.0f}%)", INK),
+             # Coloured by SIGN, never by which role it fills. On a day
+             # where everything lost, the best trade is still a loss, and
+             # a green -$58 says the opposite of what happened.
+             ("Best", money_label(best.profit),
+              UP if best.profit >= 0 else DOWN),
+             ("Worst", money_label(worst.profit),
+              UP if worst.profit >= 0 else DOWN)]
+    # Per account, because two books running the same trade at once is
+    # double the position and the totals are where that shows up.
+    books: Dict[str, float] = {}
+    for trade in done:
+        books[trade.account or "TRADES"] = books.get(trade.account or "TRADES",
+                                                     0.0) + trade.profit
+    if len(books) > 1:
+        for account, value in sorted(books.items()):
+            stats.append((account[:12], money_label(value),
+                          UP if value >= 0 else DOWN))
+    # The header divides 0.90 of the page between these, so past eight a
+    # value runs into the next label along. Two books is the case this is
+    # built for; a third and a fourth still fit, and beyond that the
+    # per-account split belongs in a table rather than a header.
+    return stats[:HEADER_STATS]
+
+
+def page_performance(pdf: PdfPages, session: Session) -> None:
+    """The day's trading, on its own page and on its own terms.
+
+    Deliberately free of market data: everything here comes from the
+    fills, so the page renders from a trades file alone and can be
+    checked without a network or a chart to compare against.
+    """
+    done = closed_trades(session.trades)
+    if not done:
+        return                       # no trades: no page, rather than a blank one
+
+    fig = plt.figure(figsize=(11.7, 8.3))
+    fig.text(0.045, 0.962, f"{session.symbol}", size=15, weight="bold", color=INK)
+    fig.text(0.108, 0.9625, f"{session.day:%A %d %B %Y}  ·  performance",
+             size=9.5, color=INK_2)
+    # Label ABOVE value rather than beside it. Side by side, each stat has
+    # to fit its label and its number in one slot, and "WON 20 of 27 (74%)"
+    # does not -- it printed straight through the next label along.
+    stats = performance_stats(session.trades)
+    span = 0.90 / max(1, len(stats))
+    for i, (label, value, tone) in enumerate(stats):
+        x = 0.045 + i * span
+        fig.text(x, 0.9385, label.upper(), size=7, color=MUTED)
+        fig.text(x, 0.9225, value, size=10.5, color=tone)
+    fig.add_artist(plt.Line2D([0.045, 0.965], [0.9105, 0.9105], color=AXIS,
+                              linewidth=0.8, transform=fig.transFigure))
+
+    grid = fig.add_gridspec(3, 2, height_ratios=[1.25, 1.0, 1.15],
+                            width_ratios=[1.0, 1.0], hspace=0.42, wspace=0.16,
+                            left=0.062, right=0.965, top=0.866, bottom=0.075)
+    draw_running(fig.add_subplot(grid[0, :]), session.trades)
+    draw_each_trade(fig.add_subplot(grid[1, :]), session.trades)
+    draw_half_hours(fig.add_subplot(grid[2, 0]), session.trades)
+    draw_hold_vs_result(fig.add_subplot(grid[2, 1]), session.trades)
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
 def build(session: Session, path: str) -> str:
     with PdfPages(path) as pdf:
         page_overview(pdf, session)
+        page_performance(pdf, session)
         page_signals(pdf, session)
         info = pdf.infodict()
         info["Title"] = f"{session.symbol} Daily Debrief {session.day:%Y-%m-%d}"
@@ -2868,6 +3176,86 @@ def self_test() -> int:
             failures.append(f"a time column holding spreadsheet values must "
                             f"be named and refused, printed {note.strip()!r}")
 
+    # --- the performance page ---------------------------------------------
+    def trade(open_at, close_at, entry, exit_, qty=100, account="A"):
+        return Trade(opened=datetime(2026, 9, 25, *open_at, tzinfo=ET),
+                     closed=datetime(2026, 9, 25, *close_at, tzinfo=ET),
+                     quantity=qty, entry=entry, exit=exit_, account=account)
+
+    sample = [trade((9, 36), (9, 49), 100.0, 99.0),
+              trade((10, 5), (10, 30), 100.0, 102.0),
+              trade((10, 40), (11, 30), 100.0, 101.0, account="B"),
+              Trade(opened=datetime(2026, 9, 25, 11, 0, tzinfo=ET), closed=None,
+                    quantity=50, entry=100.0, exit=None)]      # still open
+
+    done = closed_trades(sample)
+    if len(done) != 3:
+        failures.append(f"an open position has no result yet and cannot be "
+                        f"scored; expected 3 closed, got {len(done)}")
+
+    points = running_total(sample)
+    # Starts at zero at the first ENTRY, steps at each exit, ends at the sum.
+    if not points or points[0][1] != 0.0:
+        failures.append("the running total must start at zero")
+    elif points[0][0] != min(t.opened for t in done):
+        failures.append("the running total must start at the first entry, "
+                        "not at the first exit")
+    elif round(points[-1][1], 2) != round(sum(t.profit for t in done), 2):
+        failures.append(f"the running total must end at the day's net; got "
+                        f"{points[-1][1]} against {sum(t.profit for t in done)}")
+    if [when for when, _ in points] != sorted(when for when, _ in points):
+        failures.append("the running total must be in time order")
+
+    hours = by_half_hour(sample)
+    # 09:36 and 10:05 are the two buckets that differ most, so they must
+    # not land in the same one -- an hourly bucket would merge them.
+    if [label for label, _, _ in hours] != ["09:30", "10:00", "10:30"]:
+        failures.append(f"half-hour buckets, by entry: got "
+                        f"{[h[0] for h in hours]}")
+    elif round(hours[0][1], 2) != -100.0:
+        failures.append(f"09:30 holds one 100-share dollar loser; got "
+                        f"{hours[0][1]}")
+
+    if len(performance_stats(sample)) > HEADER_STATS:
+        failures.append("more header stats than the header budgets")
+    # A losing day's BEST trade is still a loss, and must not be green.
+    all_losers = [trade((10, 0), (10, 5), 100.0, 99.5),
+                  trade((11, 0), (11, 5), 100.0, 99.0)]
+    tones = {label: tone for label, _, tone in performance_stats(all_losers)}
+    if tones.get("Best") != DOWN:
+        failures.append("on a day where every trade lost, BEST is a loss and "
+                        "has to read as one")
+    many = [trade((10, 0), (10, 5), 100.0, 101.0, account=f"BOOK{n}")
+            for n in range(9)]
+    if len(performance_stats(many)) > HEADER_STATS:
+        failures.append(f"nine accounts must not overflow the header; got "
+                        f"{len(performance_stats(many))} stats")
+
+    # It renders, and a day with nothing closed gets no page rather than a
+    # blank one. The page reads only fills, so this needs no market data.
+    drawn = []
+
+    class Collect:
+        def savefig(self, figure, **kw):
+            drawn.append(figure)
+
+    blank = pd.DataFrame()
+    def session_of(items):
+        return Session(symbol="SPCX", day=date(2026, 9, 25), minutes=blank,
+                       candles=blank, vwap=pd.Series(dtype=float), baseline={},
+                       signals=blank, macd=blank, trades=items)
+
+    page_performance(Collect(), session_of(sample))
+    if len(drawn) != 1:
+        failures.append(f"the performance page should draw once, drew "
+                        f"{len(drawn)}")
+    plt.close("all")
+    drawn.clear()
+    page_performance(Collect(), session_of([]))
+    if drawn:
+        failures.append("a day with no closed trades must get no page")
+    plt.close("all")
+
     for name, tag in (("/x/y/9-25-26_Robinhood.csv", "ROBINHOOD"),
                       ("9-25-26_IBKR.xlsx", "IBKR"),
                       ("RH.csv", "RH"),
@@ -2901,6 +3289,10 @@ def self_test() -> int:
     print("  Factor checklist               : fixed tags, fixed order")
     print("  A mistyped tag                 : reported, never read as prose")
     print("  Capture sheet                  : built from FACTORS, fits the page")
+    print("  Running total                  : starts at the first entry, at zero")
+    print("  Half-hour buckets              : by entry; 09:30 apart from 10:00")
+    print("  Performance header             : never more stats than it budgets")
+    print("  A day with no trades           : no page, rather than a blank one")
 
     if failures:
         print("\nFAILED:")
