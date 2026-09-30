@@ -1582,6 +1582,20 @@ def gather(symbol: str, day: date, start: time, end: time, db_path: str,
 # Drawing
 # ---------------------------------------------------------------------------
 
+def literal(text: str) -> str:
+    """Money that stays money.
+
+    matplotlib reads a matched pair of $ as mathematics. One dollar sign
+    on its own is safe, so every stat in the header was fine -- but the
+    per-account line joins TWO money values into one string, which makes
+    a pair, and everything between them rendered italic with both dollar
+    signs eaten: "ROBINHOOD +$9,395 · THRU +$12,079" came out as
+    "ROBINHOOD +9,395·THRU +12,079". Only visible with two accounts AND
+    trades that loaded, which is why it survived this long.
+    """
+    return text.replace("$", r"\$")
+
+
 def band(fig, session: Session) -> None:
     """The header: what this day did, in the numbers you would say aloud."""
     candles = session.candles
@@ -1621,13 +1635,18 @@ def band(fig, session: Session) -> None:
                                  f"{abs(total):,.0f}",
                       UP if total >= 0 else DOWN))
 
+    # Label ABOVE value, not beside it. Side by side, each stat had to fit
+    # its label and its number in one slot and did not: the page printed
+    # "CHANGE+2.16 (+1.47%)HIGH" -- the value over the label, then over the
+    # NEXT label along. Eight stats on a letter-width page is 1.24in each,
+    # and "CHANGE" alone is most of the room a value needs.
     span = min(0.152, 0.90 / max(1, len(stats)))
     for i, (label, value, tone) in enumerate(stats):
         x = 0.045 + i * span
-        fig.text(x, 0.9355, label.upper(), size=7, color=MUTED)
-        fig.text(x + span * 0.29, 0.934, value, size=10, color=tone)
+        fig.text(x, 0.9385, label.upper(), size=7, color=MUTED)
+        fig.text(x, 0.9225, value, size=10.5, color=tone)
 
-    fig.add_artist(plt.Line2D([0.045, 0.965], [0.920, 0.920],
+    fig.add_artist(plt.Line2D([0.045, 0.965], [0.9105, 0.9105],
                               color=AXIS, linewidth=0.8, transform=fig.transFigure))
 
     notes = []
@@ -1653,7 +1672,9 @@ def band(fig, session: Session) -> None:
     if flight:
         notes.append(flight)
     if notes:
-        fig.text(0.045, 0.9035, "  ·  ".join(notes), size=8, color=INK_2)
+        # Below the rule, which moved down when the stats were stacked.
+        fig.text(0.045, 0.894, literal("  ·  ".join(notes)), size=8,
+                 color=INK_2)
 
 
 def label_every(slots) -> int:
@@ -1886,7 +1907,7 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
     slot_of = {stamp: i for i, stamp in enumerate(slots)}
     x = [slot_of.get(stamp, float("nan")) for stamp in stamps]
 
-    fig = plt.figure(figsize=(11.7, 8.3))
+    fig = plt.figure(figsize=(11.0, 8.5))     # letter, landscape
     band(fig, session)
     # Price, then volume beneath it, then MACD in its own pane -- the order
     # every charting platform uses, so the page reads the way the screen
@@ -1895,7 +1916,7 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
     grid = fig.add_gridspec(6, 1,
                             height_ratios=[3.0, 0.20, 1.05, 1.30, 1.00, 0.72],
                             hspace=0.23, left=0.062, right=0.965,
-                            top=0.879, bottom=0.052)
+                            top=0.870, bottom=0.052)
     price = fig.add_subplot(grid[0])
     strip_ax = fig.add_subplot(grid[1], sharex=price)
     vol_ax = fig.add_subplot(grid[2], sharex=price)
@@ -2091,7 +2112,7 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
 
 def page_signals(pdf: PdfPages, session: Session) -> None:
     """Every signal of the day, and what price did afterwards."""
-    fig = plt.figure(figsize=(11.7, 8.3))
+    fig = plt.figure(figsize=(11.0, 8.5))     # letter, landscape
     fig.text(0.045, 0.955, "Signals", size=18, weight="bold", color=INK)
 
     if session.signals.empty:
@@ -2273,6 +2294,12 @@ def draw_running(ax, trades: Sequence[Trade]) -> None:
     ax.yaxis.set_major_formatter(
         FuncFormatter(lambda v, _: f"{'-' if v < 0 else ''}${abs(v):,.0f}"))
 
+    # Room on the right for the closing figure, so it sits INSIDE the plot.
+    # Hanging off the end it reached the paper's edge, which is under the
+    # printer's unprintable margin -- fine on screen, clipped on paper.
+    reach = (xs[-1] - xs[0]) or 1.0
+    ax.set_xlim(xs[0] - reach * 0.02, xs[-1] + reach * 0.14)
+
     # Two labels, not one per step: where it ended, and the worst it got.
     # A number on every point is unreadable and goes unread.
     end_x, end_y = xs[-1], ys[-1]
@@ -2442,7 +2469,7 @@ def page_performance(pdf: PdfPages, session: Session) -> None:
     if not done:
         return                       # no trades: no page, rather than a blank one
 
-    fig = plt.figure(figsize=(11.7, 8.3))
+    fig = plt.figure(figsize=(11.0, 8.5))     # letter, landscape
     fig.text(0.045, 0.962, f"{session.symbol}", size=15, weight="bold", color=INK)
     fig.text(0.108, 0.9625, f"{session.day:%A %d %B %Y}  ·  performance",
              size=9.5, color=INK_2)
@@ -3215,6 +3242,15 @@ def self_test() -> int:
     elif round(hours[0][1], 2) != -100.0:
         failures.append(f"09:30 holds one 100-share dollar loser; got "
                         f"{hours[0][1]}")
+
+    # Two accounts in one string is a matched pair of $, which matplotlib
+    # renders as maths -- italic, and the dollar signs gone.
+    money = literal("ROBINHOOD +$9,395  ·  IBKR +$12,079")
+    if "$" in money.replace(r"\$", ""):
+        failures.append(f"every $ in drawn text has to be escaped or "
+                        f"matplotlib eats it as maths: {money!r}")
+    if money.count(r"\$") != 2:
+        failures.append(f"both money values must survive escaping: {money!r}")
 
     if len(performance_stats(sample)) > HEADER_STATS:
         failures.append("more header stats than the header budgets")
