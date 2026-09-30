@@ -672,8 +672,169 @@ def read_xlsx(path: str) -> List[Dict[str, str]]:
 IBKR_COLUMNS = dict(symbol="B", at="E", exchange="I", side="J",
                     quantity="L", price="N", commission="Q")
 
+#: The stamp IBKR puts at the top of a Trade Confirmation, and the merged
+#: header cell further down. Either one identifies the report -- which is
+#: what has to be identified, because the FORMAT identifies nothing: the
+#: same report saved as .csv is the same report, and a Robinhood export
+#: saved as .xlsx is still a Robinhood export. Routing on the extension is
+#: how a Robinhood spreadsheet came to be read against IBKR's column
+#: positions and produced nothing at all.
+IBKR_SIGNATURES = ("trade confirmation report", "acct id")
 
-def read_ibkr(path: str, symbol: str, day: date) -> List[Fill]:
+#: IBKR's Proceeds column, which is quantity times price. Carried here
+#: because it is not needed to read a fill -- it is needed to CHECK that
+#: the columns are where this reader believes they are.
+IBKR_PROCEEDS = "P"
+
+
+def column_letter(index: int) -> str:
+    """0 -> A, 25 -> Z, 26 -> AA. Spreadsheet column names."""
+    name = ""
+    while True:
+        index, remainder = divmod(index, 26)
+        name = chr(ord("A") + remainder) + name
+        if index == 0:
+            break
+        index -= 1
+    return name
+
+
+def read_rows(path: str) -> List[Dict[str, str]]:
+    """Every cell as text, keyed by column LETTER, from .csv or .xlsx.
+
+    One representation for both formats, so the question "which report is
+    this" can be asked before the question "how do I read it". A csv's
+    first field becomes A, its second B, matching how a spreadsheet would
+    show the same file.
+    """
+    if path.lower().endswith((".xlsx", ".xlsm")):
+        return read_xlsx(path)
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            with open(path, newline="", encoding=encoding) as handle:
+                return [{column_letter(i): (cell or "").strip()
+                         for i, cell in enumerate(row)}
+                        for row in csv.reader(handle)]
+        except UnicodeDecodeError:
+            continue
+    return []
+
+
+#: IBKR's own timestamp format, in the column it keeps it in.
+IBKR_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}, \d{2}:\d{2}:\d{2}$")
+
+
+def looks_like_ibkr(rows: Sequence[Dict[str, str]]) -> bool:
+    """Is this an IBKR Trade Confirmation, whatever it is saved as?
+
+    Two answers, and the second one matters more. The first is the stamp
+    IBKR prints at the top, which identifies the report it ships. The
+    second is the report's SHAPE -- a rollup row, meaning an exchange of
+    exactly "-" beside a timestamp in IBKR's format -- which identifies
+    the report after someone has trimmed the preamble off it, which is the
+    normal state of a file that has been looked after.
+
+    Written with only the stamp, this reader sent a trimmed confirmation
+    down the generic path, where there is no commission column: every
+    order read with a commission of zero and the day came out $401 too
+    profitable. Nothing about that looks wrong on the page.
+    """
+    for row in rows[:40]:                  # the stamp is near the top
+        joined = " ".join(str(v) for v in row.values()).lower()
+        if any(mark in joined for mark in IBKR_SIGNATURES):
+            return True
+    for row in rows:
+        if str(row.get(IBKR_COLUMNS["exchange"], "")).strip() != "-":
+            continue
+        if IBKR_STAMP.match(str(row.get(IBKR_COLUMNS["at"], "")).strip()):
+            return True
+    return False
+
+
+def spreadsheet_times(rows: Sequence[Dict[str, str]],
+                      headers: Dict[str, str]) -> Optional[str]:
+    """The name of a time column a spreadsheet has converted to a number.
+
+    Excel stores a time as a fraction of a day, so "4:04" typed into a
+    cell becomes 0.16944 -- and in becoming that it has been RESOLVED:
+    the spreadsheet decided 4:04 meant 04:04 and there is no longer
+    anything in the file that says otherwise. For a Robinhood export,
+    whose times are typed by hand off a phone with no meridiem, that
+    turns an after-hours sell into a pre-market one permanently.
+
+    So this is reported rather than parsed. Reading the number back would
+    place the trade at 04:04 and draw it, which is worse than refusing.
+    """
+    for label in ROBINHOOD_TIME_COLUMNS + ("time",):
+        column = headers.get(label)
+        if not column:
+            continue
+        numeric = 0
+        for row in rows[:60]:
+            text = str(row.get(column, "")).strip()
+            if not text:
+                continue
+            try:
+                if 0 <= float(text) < 1:
+                    numeric += 1
+            except ValueError:
+                return None            # real clock text: nothing to report
+        if numeric >= 3:
+            return column
+    return None
+
+
+def check_ibkr_layout(path: str, rows: Sequence[Dict[str, str]]) -> bool:
+    """Are IBKR's columns where this reader believes they are?
+
+    IBKR's header is a single MERGED cell holding all twelve labels at
+    once -- "Acct ID  Symbol  Trade Date/Time ... Comm  Fee  Order" -- so
+    there are no per-column headings to match a name against, and the
+    columns can only be read by position. That is an assumption, and an
+    unchecked assumption about column position is how a price ends up
+    parsed as a quantity.
+
+    So it is checked against the data instead of trusted: the timestamp
+    column has to parse as one, the side column has to say BUY or SELL,
+    and -- the one that pins the numbers to each other -- Proceeds has to
+    equal Quantity times Price. Three numeric columns cannot all be in
+    the wrong place and still satisfy that.
+    """
+    checked = 0
+    for row in rows:
+        got = {name: str(row.get(col, "")).strip()
+               for name, col in IBKR_COLUMNS.items()}
+        if got["exchange"] != "-":
+            continue
+        try:
+            datetime.strptime(got["at"], "%Y-%m-%d, %H:%M:%S")
+        except ValueError:
+            continue
+        if not got["side"].upper().startswith(("B", "S")):
+            print(f"  trades: {os.path.basename(path)} — column "
+                  f"{IBKR_COLUMNS['side']} should hold BUY or SELL and holds "
+                  f"{got['side']!r}; the sheet's columns have moved")
+            return False
+        try:
+            quantity = abs(float(got["quantity"].replace(",", "")))
+            price = float(got["price"])
+            proceeds = abs(float(str(row.get(IBKR_PROCEEDS, "")).strip()
+                                 .replace(",", "") or 0))
+        except ValueError:
+            continue
+        if proceeds and abs(quantity * price - proceeds) > max(1.0, proceeds * 0.01):
+            print(f"  trades: {os.path.basename(path)} — {quantity:,.0f} x "
+                  f"${price:,.4f} is not the ${proceeds:,.2f} in column "
+                  f"{IBKR_PROCEEDS}; the sheet's columns have moved")
+            return False
+        checked += 1
+        if checked >= 5:
+            break
+    return True
+
+
+def read_ibkr(path: str, symbol: str, day: date,
+              rows: Optional[Sequence[Dict[str, str]]] = None) -> List[Fill]:
     """Orders from an IBKR Trade Confirmation spreadsheet.
 
     The sheet lists every order TWICE: once as a rollup with the exchange
@@ -694,8 +855,8 @@ def read_ibkr(path: str, symbol: str, day: date) -> List[Fill]:
     arrives negative for the same reason and is stored as a positive cost.
     """
     fills: List[Fill] = []
-    for row in read_xlsx(path):
-        got = {name: row.get(column, "") for name, column in IBKR_COLUMNS.items()}
+    for row in (read_xlsx(path) if rows is None else rows):
+        got = {name: str(row.get(column, "")) for name, column in IBKR_COLUMNS.items()}
         if got["symbol"].strip().upper() != symbol.upper():
             continue
         if got["exchange"].strip() != "-":
@@ -918,6 +1079,80 @@ def account_of(path: str) -> str:
     return max(words, key=len).upper()[:12] if words else "TRADES"
 
 
+def named_rows(rows: Sequence[Dict[str, str]]) -> Optional[List[Dict[str, str]]]:
+    """Rows keyed by their own header labels, wherever the header row sits.
+
+    A broker export does not always start with its header -- Robinhood
+    leaves a blank row under it -- and a spreadsheet and a csv of the same
+    export should read the same way. So the header is found by looking for
+    a row holding several labels this reader already knows.
+    """
+    known = {n for names in TRADE_COLUMNS.values() for n in names}
+    known |= set(ROBINHOOD_COLUMNS.values()) | set(ROBINHOOD_TIME_COLUMNS)
+    for index, row in enumerate(rows):
+        labels = {col: str(value).strip()
+                  for col, value in row.items() if str(value).strip()}
+        if sum(1 for v in labels.values() if v.lower() in known) < 3:
+            continue
+        return [{labels[col]: str(later.get(col, "")).strip() for col in labels}
+                for later in rows[index + 1:]]
+    return None
+
+
+def double_counted(rows: Sequence[Dict[str, str]], headers: Dict[str, str],
+                   symbol: str) -> Tuple[int, int]:
+    """Groups of same-instant rows where one row is the SUM of the others.
+
+    That is the shape of an IBKR order sitting beside its own venue fills,
+    and it is what is left after the Exchange column -- the only thing
+    separating the two -- has been dropped from the export. Reading such a
+    file counts every share twice, and nothing else about it looks wrong.
+
+    A genuine Robinhood export splits an order into many fills and no one
+    of them is the sum of the rest: zero of 43 groups across two real
+    exports, against 32 of 47 in a flattened IBKR one. So this separates
+    cleanly, and it is reported rather than silently corrected -- halving
+    a doubled file would be a guess about which row was the order.
+    """
+    def pick(*names: str) -> Optional[str]:
+        return next((headers[n] for n in names if n in headers), None)
+
+    side = pick("trans code", "side", "b/s", "action", "buy/sell", "type")
+    quantity = pick("quantity", "qty", "shares", "filled qty", "size")
+    stamp = [headers[n] for n in ("activity date", "date", "exec time", "time",
+                                 "datetime", "date/time", "process date",
+                                 "trade time") if n in headers]
+    if not (side and quantity and stamp):
+        return 0, 0
+    wanted = pick("instrument", "symbol", "ticker", "stock")
+
+    groups: Dict[Tuple[str, ...], List[float]] = {}
+    for row in rows:
+        if wanted:
+            got = str(row.get(wanted, "")).strip().upper()
+            if got and got != symbol.upper():
+                continue
+        try:
+            size = abs(float(str(row.get(quantity, "")).replace(",", "")
+                             .replace("$", "")))
+        except ValueError:
+            continue
+        if not size:
+            continue
+        key = tuple(str(row.get(c, "")).strip() for c in stamp)
+        groups.setdefault(key + (str(row.get(side, "")).strip().lower(),),
+                          []).append(size)
+
+    suspect = 0
+    for sizes in groups.values():
+        if len(sizes) < 2:
+            continue
+        largest = max(sizes)
+        if abs(largest - (sum(sizes) - largest)) < 0.5:
+            suspect += 1
+    return suspect, len(groups)
+
+
 def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
     """The day's round trips for one symbol, from ONE account's file.
 
@@ -930,37 +1165,62 @@ def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
     paired separately -- see pair_fills.
     """
     account = account_of(path)
-    if path.lower().endswith((".xlsx", ".xlsm")):
-        try:
-            fills = read_ibkr(path, symbol, day)
-        except FileNotFoundError:
-            print(f"  trades: {path} — no such file")
-            return []
-        except (OSError, KeyError, zipfile.BadZipFile) as exc:
-            print(f"  trades: could not read {path} — {type(exc).__name__}")
-            return []
-        return report_and_pair(path, fills, account, symbol, day)
-
+    name = os.path.basename(path)
     try:
-        with open(path, newline="", encoding="utf-8-sig") as handle:
-            rows = list(csv.DictReader(handle))
+        table = read_rows(path)
     except FileNotFoundError:
         # The failure that used to be silent, and the expensive one: a name
         # typed wrong or a file left in another folder returned an empty
         # list and printed nothing, which on the page is indistinguishable
-        # from a day spent flat. The .xlsx branch above always complained;
-        # this one did not, so whichever account kept its trades in a .csv
-        # was the account that could vanish without saying so.
+        # from a day spent flat.
         print(f"  trades: {path} — no such file")
         return []
-    except OSError as exc:
+    except (OSError, KeyError, zipfile.BadZipFile) as exc:
         print(f"  trades: could not read {path} — {type(exc).__name__}")
         return []
-    if not rows:
-        print(f"  trades: {os.path.basename(path)} — no rows at all")
+    if not table:
+        print(f"  trades: {name} — no rows at all")
         return []
 
-    headers = {(name or "").strip().lower(): name for name in rows[0]}
+    # WHICH REPORT, not which file extension. The same IBKR confirmation is
+    # the same report saved as .csv, and a Robinhood export saved as .xlsx
+    # is still a Robinhood export -- routing on the extension read that one
+    # against IBKR's column positions and found nothing at all.
+    if looks_like_ibkr(table):
+        if not check_ibkr_layout(path, table):
+            return []
+        return report_and_pair(path, read_ibkr(path, symbol, day, table),
+                               account, symbol, day)
+
+    rows = named_rows(table)
+    if rows is None:
+        print(f"  trades: {name} — no header row this recognises; first row "
+              f"holds {[v for v in table[0].values() if v][:8]}")
+        return []
+
+    headers = {(label or "").strip().lower(): label for label in rows[0]}
+
+    # An IBKR report with its Exchange column removed: the orders and their
+    # venue fills are now indistinguishable and every share is in the file
+    # twice. Loudly, because the totals would simply be double and nothing
+    # on the page would look wrong.
+    serial = spreadsheet_times(rows, headers)
+    if serial:
+        print(f"  trades: {name} — the {serial!r} column holds spreadsheet "
+              f"time VALUES, not text. A 12-hour time with no AM/PM was "
+              f"resolved by the spreadsheet when it converted, so 4:04 is "
+              f"now 04:04 and an after-hours fill cannot be told from a "
+              f"pre-market one. Keep this export as .csv text.")
+        return []
+
+    suspect, total = double_counted(rows, headers, symbol)
+    if suspect >= 3 and total and suspect >= 0.2 * total:
+        print(f"  trades: {name} — {suspect} of {total} groups of rows at the "
+              f"same instant hold one row equal to the SUM of the others. "
+              f"That is an order beside its own venue fills, so reading this "
+              f"would count every share twice. Keep the broker's Exchange "
+              f"column, which is the only thing that tells them apart.")
+        return []
     if ROBINHOOD_COLUMNS["side"] in headers and ROBINHOOD_COLUMNS["symbol"] in headers:
         fills = read_robinhood(path, rows, symbol, day)
         if fills is None:
@@ -2520,6 +2780,94 @@ def self_test() -> int:
             failures.append("a second day in the file must not cost the "
                             "first day its after-hours row")
 
+    # --- an IBKR confirmation saved as .csv -------------------------------
+    # The same report is the same report. Routed on the file EXTENSION, a
+    # Robinhood export saved as .xlsx was read against IBKR's column
+    # positions and found nothing, and a trimmed IBKR sheet fell through to
+    # the generic path, where there is no commission column -- every order
+    # read at zero commission and the day came out $401 too profitable.
+    def ibkr_row(stamp, exchange, side, qty, price, comm=""):
+        cells = [""] * 17
+        cells[0], cells[1], cells[4] = "U1", "SPCX", stamp
+        cells[8], cells[9], cells[11] = exchange, side, str(qty)
+        cells[13] = f"{price}"
+        cells[15] = f"{abs(qty) * price:.2f}"
+        cells[16] = str(comm)
+        return cells
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "confirm.csv")
+        with open(path, "w", newline="") as handle:
+            w = csv.writer(handle)
+            w.writerow(["Acct ID  Symbol  Trade Date/Time  Exchange  Quantity"])
+            w.writerow(ibkr_row("2026-09-25, 09:36:52", "-", "BUY", 1000, 148.66, -5.00))
+            w.writerow(ibkr_row("2026-09-25, 09:36:52", "DARK", "BUY", 600, 148.66, -3.00))
+            w.writerow(ibkr_row("2026-09-25, 09:36:52", "IEX", "BUY", 400, 148.66, -2.00))
+            w.writerow(ibkr_row("2026-09-25, 09:49:34", "-", "SELL", -1000, 147.73, -5.00))
+            w.writerow(ibkr_row("2026-09-25, 09:49:34", "DARK", "SELL", -1000, 147.73, -5.00))
+        got = load_trades(path, "SPCX", day)
+        if len(got) != 1 or round(got[0].quantity) != 1000:
+            failures.append(f"an IBKR confirmation saved as .csv should give "
+                            f"ONE 1000-share round trip from the rollups, got "
+                            f"{[round(t.quantity) for t in got]}")
+        elif round(got[0].commission, 2) != 10.00:
+            failures.append(f"commission must survive the .csv route; got "
+                            f"{got[0].commission}")
+
+    # --- the same sheet with its columns moved ----------------------------
+    # IBKR's header is one merged cell holding all twelve labels, so the
+    # columns can only be read by position. Proceeds = Quantity x Price is
+    # what checks that assumption instead of trusting it.
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "moved.csv")
+        with open(path, "w", newline="") as handle:
+            w = csv.writer(handle)
+            w.writerow(["Acct ID  Symbol  Trade Date/Time  Exchange"])
+            bad = ibkr_row("2026-09-25, 09:36:52", "-", "BUY", 1000, 148.66, -5.00)
+            bad[15] = "999999.00"                 # Proceeds no longer q x p
+            w.writerow(bad)
+        note = said(lambda: load_trades(path, "SPCX", day))
+        if "columns have moved" not in note:
+            failures.append(f"a sheet whose Proceeds is not Quantity x Price "
+                            f"must say the columns have moved, printed "
+                            f"{note.strip()!r}")
+
+    # --- an IBKR report with its Exchange column dropped ------------------
+    # Flattened into one row per fill AND one per order, the two are
+    # indistinguishable and every share is in the file twice. The totals
+    # simply double and nothing on the page looks wrong.
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "flat.csv")
+        with open(path, "w", newline="") as handle:
+            w = csv.writer(handle)
+            w.writerow(["Date", "Time", "Symbol", "Side", "Quantity", "Price"])
+            for minute, side in (("09:36:52", "BUY"), ("09:49:34", "SELL"),
+                                 ("10:05:11", "BUY"), ("10:43:57", "SELL")):
+                for qty in (1000, 600, 400):      # the order, then its fills
+                    w.writerow(["2026-09-25", minute, "SPCX", side, qty, 148.66])
+        note = said(lambda: load_trades(path, "SPCX", day))
+        if "twice" not in note:
+            failures.append(f"an order beside its own venue fills must be "
+                            f"refused as double counting, printed "
+                            f"{note.strip()!r}")
+
+    # --- times a spreadsheet has turned into numbers ----------------------
+    # Excel stores 4:04 as 0.16944, and in doing so has already decided it
+    # meant 04:04. Reading the number back would draw an after-hours sell
+    # in the pre-market, so it is refused rather than guessed at.
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "values.csv")
+        with open(path, "w", newline="") as handle:
+            w = csv.writer(handle)
+            w.writerow(["Activity Date", "Time", "Instrument", "Trans Code",
+                        "Quantity", "Amount"])
+            for fraction in ("0.169444", "0.402777", "0.658333"):
+                w.writerow(["9/25/2026", fraction, "SPCX", "Buy", 100, "1000.00"])
+        note = said(lambda: load_trades(path, "SPCX", day))
+        if "spreadsheet time" not in note.lower():
+            failures.append(f"a time column holding spreadsheet values must "
+                            f"be named and refused, printed {note.strip()!r}")
+
     for name, tag in (("/x/y/9-25-26_Robinhood.csv", "ROBINHOOD"),
                       ("9-25-26_IBKR.xlsx", "IBKR"),
                       ("RH.csv", "RH"),
@@ -2545,6 +2893,10 @@ def self_test() -> int:
     print("  Right file, wrong day          : names the symbol and the date")
     print("  A renamed column               : named, not blamed on the date")
     print("  4:04 in a multi-day file       : still 16:04, resolved per day")
+    print("  Which report, not which format : IBKR or Robinhood, .csv or .xlsx")
+    print("  IBKR columns read by position  : checked, Proceeds = qty x price")
+    print("  Exchange column dropped        : refused, not counted twice")
+    print("  Times as spreadsheet numbers   : refused, the meridiem is gone")
     print("  IN:/OUT: reads                 : pinned to the fill they explain")
     print("  Factor checklist               : fixed tags, fixed order")
     print("  A mistyped tag                 : reported, never read as prose")
