@@ -807,7 +807,7 @@ def resolve_clock(clocks: Sequence[str]) -> List[Optional[int]]:
 
 
 def read_robinhood(path: str, rows: Sequence[Dict[str, str]],
-                   symbol: str, day: date) -> List[Fill]:
+                   symbol: str, day: date) -> Optional[List[Fill]]:
     """Orders from a Robinhood activity export.
 
     Robinhood reports one row per venue fill and no order id, but every
@@ -827,7 +827,16 @@ def read_robinhood(path: str, rows: Sequence[Dict[str, str]],
     clock = next((headers[name] for name in ROBINHOOD_TIME_COLUMNS
                   if name in headers), None)
     if clock is None or any(v is None for v in column.values()):
-        return []
+        # Without this the caller would report "no orders on <day>", which
+        # sends you looking at the wrong thing: the rows are all there and
+        # a column is named something else.
+        absent = [name for field, name in ROBINHOOD_COLUMNS.items()
+                  if column[field] is None]
+        if clock is None:
+            absent.append(" or ".join(ROBINHOOD_TIME_COLUMNS))
+        print(f"  trades: {os.path.basename(path)} — no column for "
+              f"{', '.join(absent)} — found {list(headers)}")
+        return None          # said its piece; not "nothing happened today"
 
     minutes = resolve_clock([row.get(clock, "") for row in rows])
     orders: Dict[Tuple[datetime, str], List[float]] = {}
@@ -899,23 +908,39 @@ def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
     if path.lower().endswith((".xlsx", ".xlsm")):
         try:
             fills = read_ibkr(path, symbol, day)
+        except FileNotFoundError:
+            print(f"  trades: {path} — no such file")
+            return []
         except (OSError, KeyError, zipfile.BadZipFile) as exc:
             print(f"  trades: could not read {path} — {type(exc).__name__}")
             return []
-        return report_and_pair(path, fills, account)
+        return report_and_pair(path, fills, account, symbol, day)
 
     try:
         with open(path, newline="", encoding="utf-8-sig") as handle:
             rows = list(csv.DictReader(handle))
-    except OSError:
+    except FileNotFoundError:
+        # The failure that used to be silent, and the expensive one: a name
+        # typed wrong or a file left in another folder returned an empty
+        # list and printed nothing, which on the page is indistinguishable
+        # from a day spent flat. The .xlsx branch above always complained;
+        # this one did not, so whichever account kept its trades in a .csv
+        # was the account that could vanish without saying so.
+        print(f"  trades: {path} — no such file")
+        return []
+    except OSError as exc:
+        print(f"  trades: could not read {path} — {type(exc).__name__}")
         return []
     if not rows:
+        print(f"  trades: {os.path.basename(path)} — no rows at all")
         return []
 
     headers = {(name or "").strip().lower(): name for name in rows[0]}
     if ROBINHOOD_COLUMNS["side"] in headers and ROBINHOOD_COLUMNS["symbol"] in headers:
-        return report_and_pair(path, read_robinhood(path, rows, symbol, day),
-                               account)
+        fills = read_robinhood(path, rows, symbol, day)
+        if fills is None:
+            return []        # it already named the column it could not find
+        return report_and_pair(path, fills, account, symbol, day)
 
     found = {}
     for field, names in TRADE_COLUMNS.items():
@@ -965,12 +990,21 @@ def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
         print(f"  trades: {os.path.basename(path)} — {undated} row(s) carry a "
               f"date but no time of day; dropped, because a fill with no "
               f"time cannot be placed on a candle")
-    return report_and_pair(path, fills, account)
+    return report_and_pair(path, fills, account, symbol, day)
 
 
-def report_and_pair(path: str, fills: Sequence[Fill],
-                    account: str) -> List[Trade]:
+def report_and_pair(path: str, fills: Sequence[Fill], account: str,
+                    symbol: str, day: date) -> List[Trade]:
     """Pair one account's orders, and say what could not be paired."""
+    if not fills:
+        # A file that opened and parsed cleanly but holds nothing for this
+        # day is almost always last week's export under this week's name.
+        # "0 order(s), net $0.00" is true and useless: it reads as a flat
+        # day. Naming the symbol and the date asks the question that
+        # actually finds it.
+        print(f"  trades: {os.path.basename(path)} — no {symbol} orders on "
+              f"{day}. Wrong file, or wrong day?")
+        return []
     before = carried_in(fills)
     if before:
         print(f"  trades: {os.path.basename(path)} — {before:,.0f} share(s) "
@@ -1880,7 +1914,18 @@ def reveal(path: str) -> None:
 
 def self_test() -> int:
     """Check the notes layer offline. No network, no credentials."""
+    import contextlib
+    import io
     import tempfile
+
+    def said(call) -> str:
+        """What load_trades printed. Here the MESSAGE is the feature: the
+        return value was already correct in the cases below, and correct
+        plus silent is what made them expensive."""
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            call()
+        return buffer.getvalue()
 
     print("Self-test: checking the notes and trades layers...\n")
     failures = []
@@ -2377,6 +2422,56 @@ def self_test() -> int:
             failures.append(f"the midnight row became the oldest open lot and "
                             f"stole the exit: entry {got[0].entry}")
 
+    # --- a trades file that is not there ----------------------------------
+    # Asked for by name and absent: a typo, or the file in another folder.
+    # Both branches must name it. The CSV branch did not, and a debrief
+    # drawn without trades looks exactly like a day spent flat.
+    with tempfile.TemporaryDirectory() as folder:
+        for name in ("absent.csv", "absent.xlsx"):
+            gone = os.path.join(folder, name)
+            back: List[Trade] = []
+            note = said(lambda: back.extend(load_trades(gone, "SPCX", day)))
+            if back:
+                failures.append(f"{name}: a missing file yielded trades")
+            if "no such file" not in note:
+                failures.append(f"{name}: a missing file has to say so, "
+                                f"printed {note.strip()!r}")
+
+    # --- the right file for the wrong day ---------------------------------
+    # Last week's export under this week's name: it opens, it parses, and
+    # it holds nothing for today. The old message was "0 order(s), net
+    # $0.00", which reads as a flat day rather than as a wrong file.
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "lastweek.csv")
+        with open(path, "w", newline="") as handle:
+            handle.write("Exec Time,B/S,Filled Qty,Fill Price,Ticker\n"
+                         "2026-09-18 09:36:00,B,500,148.53,SPCX\n"
+                         "2026-09-18 09:49:00,S,500,147.73,SPCX\n")
+        back = []
+        note = said(lambda: back.extend(load_trades(path, "SPCX", day)))
+        if back:
+            failures.append("last week's export should yield nothing today")
+        if "SPCX" not in note or str(day) not in note:
+            failures.append(f"an empty day must name the symbol and the date, "
+                            f"printed {note.strip()!r}")
+
+    # --- a Robinhood export with a column renamed -------------------------
+    # Stock for Instrument, say. The rows are all present, so "no orders on
+    # <day>" would send you looking for the wrong problem entirely.
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "renamed.csv")
+        with open(path, "w", newline="") as handle:
+            handle.write("Activity Date,Instrument,Trans Code,Quantity,Amount\n"
+                         "9/25/2026,SPCX,Buy,500,\"($74,265.00)\"\n")
+        back = []
+        note = said(lambda: back.extend(load_trades(path, "SPCX", day)))
+        if "no column for" not in note:
+            failures.append(f"a Robinhood export with no time column must "
+                            f"name the column, printed {note.strip()!r}")
+        if "wrong day" in note.lower():
+            failures.append("a missing column must not be reported as a "
+                            "wrong day -- that is the wrong thing to go fix")
+
     for name, tag in (("/x/y/9-25-26_Robinhood.csv", "ROBINHOOD"),
                       ("9-25-26_IBKR.xlsx", "IBKR"),
                       ("RH.csv", "RH"),
@@ -2398,6 +2493,9 @@ def self_test() -> int:
     print("  Robinhood export               : fills grouped into orders")
     print("  Two accounts                   : never paired with each other")
     print("  A date with no time            : dropped, never mispaired")
+    print("  A missing trades file          : named out loud, never silent")
+    print("  Right file, wrong day          : names the symbol and the date")
+    print("  A renamed column               : named, not blamed on the date")
     print("  IN:/OUT: reads                 : pinned to the fill they explain")
     print("  Factor checklist               : fixed tags, fixed order")
     print("  A mistyped tag                 : reported, never read as prose")
