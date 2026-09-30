@@ -838,7 +838,32 @@ def read_robinhood(path: str, rows: Sequence[Dict[str, str]],
               f"{', '.join(absent)} — found {list(headers)}")
         return None          # said its piece; not "nothing happened today"
 
-    minutes = resolve_clock([row.get(clock, "") for row in rows])
+    # Per calendar day, never across the whole file. resolve_clock settles
+    # an ambiguous hour -- 4 through 8, where 4:04 is either 04:04
+    # pre-market or 16:04 after-hours -- by reading the file's own time
+    # ordering, and a file holding more than one day has no single ordering
+    # to read: the clock resets at midnight, so one day's last row sits
+    # above the next day's first and the direction comes out mixed. Resolved
+    # together, EVERY ambiguous row in a multi-day export is dropped, and
+    # dropped is a fill that silently is not there. Resolved per day, each
+    # day reads exactly as it would in a file of its own -- which is what
+    # makes "keep appending days to one file" safe to recommend.
+    def day_key(row: Dict[str, str]) -> str:
+        raw = str(row.get(column["day"], "")).strip()
+        try:                     # so 9/29/2026 and 2026-09-29 group together
+            return pd.to_datetime(raw).date().isoformat()
+        except (TypeError, ValueError):
+            return raw
+
+    minutes: List[Optional[int]] = [None] * len(rows)
+    by_day: Dict[str, List[int]] = {}
+    for index, row in enumerate(rows):
+        by_day.setdefault(day_key(row), []).append(index)
+    for indices in by_day.values():
+        settled = resolve_clock([rows[j].get(clock, "") for j in indices])
+        for j, value in zip(indices, settled):
+            minutes[j] = value
+
     orders: Dict[Tuple[datetime, str], List[float]] = {}
     dropped = 0
     for row, since_midnight in zip(rows, minutes):
@@ -2472,6 +2497,29 @@ def self_test() -> int:
             failures.append("a missing column must not be reported as a "
                             "wrong day -- that is the wrong thing to go fix")
 
+    # --- an after-hours fill in a file that holds more than one day -------
+    # 4:04 is 04:04 or 16:04 and only the file's ordering can say which. A
+    # multi-day file has no single ordering, so resolving them all together
+    # dropped the row -- and a dropped fill is one that is simply not on the
+    # page. Each day has to be settled on its own rows.
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "twoday.csv")
+        with open(path, "w", newline="") as handle:
+            handle.write(
+                "Activity Date,Time,Instrument,Trans Code,Quantity,Amount\n"
+                "9/25/2026,4:04,SPCX,Sell,100,\"$14,900.00\"\n"
+                "9/25/2026,3:58,SPCX,Buy,100,\"($14,947.00)\"\n"
+                "9/25/2026,10:35,SPCX,Buy,100,\"($14,721.00)\"\n"
+                "9/24/2026,2:37,SPCX,Buy,100,\"($14,760.00)\"\n")
+        note = said(lambda: load_trades(path, "SPCX", day))
+        if "16:04" not in note:
+            failures.append(f"4:04 above a 3:58 is 16:04 even when a second "
+                            f"day follows it in the file; printed "
+                            f"{note.strip()!r}")
+        if "could not be placed" in note:
+            failures.append("a second day in the file must not cost the "
+                            "first day its after-hours row")
+
     for name, tag in (("/x/y/9-25-26_Robinhood.csv", "ROBINHOOD"),
                       ("9-25-26_IBKR.xlsx", "IBKR"),
                       ("RH.csv", "RH"),
@@ -2496,6 +2544,7 @@ def self_test() -> int:
     print("  A missing trades file          : named out loud, never silent")
     print("  Right file, wrong day          : names the symbol and the date")
     print("  A renamed column               : named, not blamed on the date")
+    print("  4:04 in a multi-day file       : still 16:04, resolved per day")
     print("  IN:/OUT: reads                 : pinned to the fill they explain")
     print("  Factor checklist               : fixed tags, fixed order")
     print("  A mistyped tag                 : reported, never read as prose")
