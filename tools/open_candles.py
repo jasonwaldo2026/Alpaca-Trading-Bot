@@ -290,23 +290,35 @@ def volume_baselines(symbol: str, day: date,
 # Which way the volume is leaning
 # --------------------------------------------------------------------------
 
-#: What earns a noise. The band edges -- "sellers pressing" and "buyers
-#: pressing" -- rather than the extremes, and the reason is a measurement
-#: rather than a preference. Scored against 23 Sep 2026, a session that
-#: fell 3.53%, the extremes (<=18 / >=82) fired on NONE of that day's five
-#: volume alarms: the phone would have stayed silent through the whole
-#: decline. The edges fire once, at 13:50, sellers pressing at 26 on 2.7x
-#: volume and $1.60 before the low. One interruption in a session is what
-#: a working day can carry.
-#:
-#: Calibrated on a single day, which is exactly the kind of fit that
-#: flatters itself in hindsight. If it turns out noisy or silent in
-#: practice, these two numbers are where to look.
-PRESSING_LOW, PRESSING_HIGH = 0.30, 0.70
+#: The lean bands that used to earn a noise -- 30 and 70 -- are gone,
+#: along with the 23 Sep calibration behind them. They were chosen
+#: against a session that fell 3.53%, where they fired usefully once; on
+#: an ordinary afternoon a one-sided tape is the normal state and they
+#: fired constantly. The lean still appears in every message, as the word
+#: and the slider. It no longer decides whether the phone makes a sound.
+#: See MOVE_PERCENT.
 
 #: An alarm needs participation as well as direction. Same multiple as
 #: the spike alarm, so the loudest word and the noise mean one thing.
 ALARM_VOLUME = VOLUME_ALERT_MULTIPLE
+
+#: A noise means PRICE IS MOVING, not that the tape is one-sided.
+#:
+#: The lean measures which side is hitting the tape. It says nothing
+#: about where price goes, and on a busy afternoon that goes nowhere it
+#: is one-sided almost continuously. 25 Sep 2026 is the case: the phone
+#: rang six times between 12:20 and 15:43 -- including "sellers pressing
+#: on 5.1x volume" at 14:14, which accompanied a move of 0.14% over
+#: twelve minutes -- while the whole afternoon's range was 0.89%.
+#: Eleven interruptions, counting the other two programs, on a day when
+#: nothing happened.
+#:
+#: So the trigger is the move itself, measured against the oldest price
+#: still inside the window. Direction comes from its sign, which is also
+#: the first buy alarm this has ever had: every one of those six was a
+#: sell, because a rising tape rarely presses hard enough to cross the
+#: band.
+MOVE_PERCENT, MOVE_MINUTES = 0.50, 5
 
 #: One event, one ring. Without this, a state that stays true rings every
 #: minute it stays true. Time-based rather than reset-on-lapse: a reading
@@ -666,22 +678,30 @@ def previous_close(symbol: str, before: date) -> Optional[float]:
 class Alarms:
     """Decides which readings are worth a noise, and how often.
 
-    Two triggers, mirrored. A lean at or past a pressing band with real
-    volume behind it, and a VWAP cross with the same volume behind it --
-    above VWAP the average buyer today is in profit, below it they are
-    underwater, so crossing is the moment the day's balance changes
-    hands. Either one fires; the direction picks the sound.
+    One trigger: price has travelled far enough, fast enough, with
+    volume behind it. Direction is the sign of the move.
+
+    It used to be the lean crossing a pressing band, or a VWAP cross, on
+    the same volume. Both are readings about the tape rather than about
+    price, and a one-sided tape that moves nothing is what most busy
+    afternoons look like -- see MOVE_PERCENT for the day that settled
+    it. The VWAP side is still tracked, because which side of it price
+    sits on is worth knowing and cheap to keep, but a crossing with no
+    movement behind it is not what anyone wants a phone to shout about.
 
     None of this claims an edge. Nothing measured here beats a coin
     flip, and a sound that meant "buy" would be asserting otherwise.
-    What it says is: something is happening now, with participation
-    behind it, in a direction you care about. Go and look.
+    What it says is: price is moving now, with participation behind it.
+    Go and look.
     """
 
     cooldown: int = SOUND_COOLDOWN_MINUTES
     volume: float = ALARM_VOLUME
+    percent: float = MOVE_PERCENT
+    minutes: int = MOVE_MINUTES
     fired: Dict[str, datetime] = field(default_factory=dict)
     above_vwap: Optional[bool] = None
+    recent: List[Tuple[datetime, float]] = field(default_factory=list)
 
     def _cross(self, day: Optional[Day]) -> Optional[str]:
         """Which way price just crossed VWAP, if it did. Updates state."""
@@ -694,27 +714,47 @@ class Alarms:
             return None
         return "buy" if now_above else "sell"
 
+    def _move(self, candle: Candle) -> Optional[Tuple[str, float, float]]:
+        """(direction, percent, minutes) once price has travelled far enough.
+
+        Measured against the OLDEST price still inside the window, so a
+        slide that arrives in five one-minute steps counts as the slide
+        it is. Bar to bar it would never trigger: on 25 Sep the largest
+        single step all afternoon was 0.24%.
+        """
+        self.recent.append((candle.at, candle.close))
+        oldest = candle.at - timedelta(minutes=self.minutes)
+        self.recent = [(at, price) for at, price in self.recent if at >= oldest]
+        if len(self.recent) < 2:
+            return None
+        then_at, then = self.recent[0]
+        if not then:
+            return None
+        percent = 100.0 * (candle.close - then) / then
+        if abs(percent) < self.percent:
+            return None
+        return ("buy" if percent > 0 else "sell", percent,
+                (candle.at - then_at).total_seconds() / 60)
+
     def reason(self, candle: Candle, lean: Optional[Lean],
                day: Optional[Day]) -> Optional[Tuple[str, str]]:
         """(direction, why) for a reading that earns a noise, or None.
 
-        The VWAP side is updated on every reading, fired or not -- a
-        cross has to be measured against the last bar, not the last
-        alarm, or a quiet stretch would swallow the crossing.
+        Both sides are updated on every reading, fired or not. The VWAP
+        side has to be measured against the last bar rather than the
+        last alarm or a quiet stretch would swallow a crossing, and the
+        price window has to see every bar or the move it measures would
+        be the move since the last thing that happened to be interesting.
         """
-        crossed = self._cross(day)
+        self._cross(day)
+        moved = self._move(candle)
         loud = candle.vol_ratio is not None and candle.vol_ratio >= self.volume
-        if not loud:
+        if not (moved and loud):
             return None
-        if lean is not None:
-            if lean.score >= PRESSING_HIGH:
-                return "buy", f"{lean.word} on {candle.vol_ratio:.1f}x volume"
-            if lean.score <= PRESSING_LOW:
-                return "sell", f"{lean.word} on {candle.vol_ratio:.1f}x volume"
-        if crossed:
-            side = "above" if crossed == "buy" else "below"
-            return crossed, f"crossed {side} VWAP on {candle.vol_ratio:.1f}x volume"
-        return None
+        direction, percent, over = moved
+        return direction, (f"{'up' if percent > 0 else 'down'} "
+                           f"{abs(percent):.2f}% in {over:.0f} min on "
+                           f"{candle.vol_ratio:.1f}x volume")
 
     def should_sound(self, direction: str, at: datetime) -> bool:
         last = self.fired.get(direction)
@@ -1229,7 +1269,9 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
              db_path: str = DB_PATH,
              detail_until: time = DETAIL_UNTIL,
              buy_sound: str = SOUND_BUY,
-             sell_sound: str = SOUND_SELL) -> int:
+             sell_sound: str = SOUND_SELL,
+             move_percent: float = MOVE_PERCENT,
+             move_minutes: int = MOVE_MINUTES) -> int:
     """Follow the session: full detail early, then only the unusual."""
     today = datetime.now(ET).date()
     window_start = datetime.combine(today, start, tzinfo=ET)
@@ -1270,9 +1312,8 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
           f"update (priority {PRIORITY_UPDATE})")
     print(f"  {detail_until:%H:%M}-{end:%H:%M}  volume spikes only, still "
           f"silent; the rest is recorded")
-    print(f"  all session      a lean past {PRESSING_LOW * 100:.0f}/"
-          f"{PRESSING_HIGH * 100:.0f} or a VWAP cross, on "
-          f"{ALARM_VOLUME:.1f}x volume,")
+    print(f"  all session      price moving {move_percent:.2f}% within "
+          f"{move_minutes} min on {ALARM_VOLUME:.1f}x volume,")
     print(f"{'':19}sounds at priority {PRIORITY_SUMMARY} — {buy_sound} to buy, "
           f"{sell_sound} to sell,")
     print(f"{'':19}at most one a direction every "
@@ -1286,7 +1327,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
     # Once a session, not once an alert. It only moves overnight, and a
     # per-message fetch would put a network call between a spike and the
     # phone. None is survivable: the day's move is the line that goes.
-    alarms = Alarms()
+    alarms = Alarms(percent=move_percent, minutes=move_minutes)
     prev_close = previous_close(symbol, today)
     # The benchmark's own yesterday, fetched once. If either half is
     # missing the market line is simply absent -- it is context, and no
@@ -1355,7 +1396,11 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 else:
                     title = f"{symbol} {stamp:%H:%M}"
                 chart = None
-                if spiked and pdf_every:
+                # The page rides the NOISE, not the volume. Attached to
+                # every spike it went out 70 times in a session of 75
+                # messages -- a chart nobody opens, on a phone, for a
+                # reading that did not even ring.
+                if ringing and pdf_every:
                     chart = rebuild_report(symbol, today, start, end,
                                            db_path, pdf_path)
                     last_pdf = datetime.now(ET)
@@ -1735,33 +1780,72 @@ def self_test() -> int:
         failures.append("the routine stream must be quieter than the alarm")
 
     # --- what earns a noise ------------------------------------------------
-    def reading(score, ratio, vwap_gap=1.0, at_minute=35):
+    def reading(score, ratio, price=150.5, vwap_gap=1.0, at_minute=35):
         """A candle, its lean and its day, at one clock minute."""
         when = datetime.combine(date(2026, 9, 18), time(10, at_minute), tzinfo=ET)
-        bar = Candle(at=when, open=150.0, high=151.0, low=149.5, close=150.5,
-                     volume=ratio * 40_000, usual_volume=40_000)
+        bar = Candle(at=when, open=price, high=price + 0.5, low=price - 0.5,
+                     close=price, volume=ratio * 40_000, usual_volume=40_000)
         return (bar, Lean(score, 5, 5, 5, volume_ratio=ratio),
-                Day(last=150.5, high=151.0, low=149.0,
-                    prev_close=149.0, vwap=150.5 - vwap_gap), when)
+                Day(last=price, high=151.0, low=149.0,
+                    prev_close=149.0, vwap=price - vwap_gap), when)
 
+    # The case this rule exists for: a one-sided tape, heavy volume, and
+    # price going nowhere. Under the old rule this was the noise.
     quiet = Alarms()
-    bar, lean, dctx, when = reading(0.90, 1.0)          # direction, no volume
-    if quiet.reason(bar, lean, dctx) is not None:
-        failures.append("a pressing lean on ordinary volume must stay silent")
-    bar, lean, dctx, when = reading(0.50, 3.0)          # volume, no direction
-    if quiet.reason(bar, lean, dctx) is not None:
-        failures.append("a volume spike with no direction must stay silent")
+    for minute, price in enumerate((150.50, 150.48, 150.52, 150.49, 150.51,
+                                    150.50, 150.47)):
+        bar, lean, dctx, when = reading(0.10, 5.1, price=price,
+                                        at_minute=30 + minute)
+        if quiet.reason(bar, lean, dctx) is not None:
+            failures.append(f"sellers pressing on 5.1x volume with price "
+                            f"flat must stay silent (minute {minute})")
+
+    # Movement without participation, and participation without movement.
+    for ratio, prices, why in (
+            (1.0, (150.0, 151.0), "a move on ordinary volume"),
+            (3.0, (150.0, 150.0), "a volume spike with price unchanged")):
+        alone = Alarms()
+        for minute, price in enumerate(prices):
+            bar, lean, dctx, when = reading(0.50, ratio, price=price,
+                                            at_minute=30 + minute)
+            if alone.reason(bar, lean, dctx) is not None:
+                failures.append(f"{why} must stay silent")
+
+    # A real move, either way, and the reason has to say what it was.
+    for target, direction in ((151.45, "buy"), (149.55, "sell")):
+        moved = Alarms()
+        bar, lean, dctx, when = reading(0.50, 2.0, price=150.5, at_minute=30)
+        moved.reason(bar, lean, dctx)
+        bar, lean, dctx, when = reading(0.50, 2.0, price=target, at_minute=33)
+        call = moved.reason(bar, lean, dctx)
+        if not call or call[0] != direction:
+            failures.append(f"150.50 -> {target} in 3 min on 2x volume should "
+                            f"ring {direction}: {call}")
+        elif "%" not in call[1] or "min" not in call[1]:
+            failures.append(f"the reason should name the move: {call[1]}")
+
+    # Against the OLDEST price in the window, not the previous bar. Five
+    # steps of 0.15% is a 0.75% slide and has to ring; bar to bar it would
+    # never trigger, which is how 25 Sep stayed loud and said nothing.
+    creep = Alarms()
+    rang = None
+    for minute in range(6):
+        bar, lean, dctx, when = reading(0.50, 2.0, price=150.5 * (1 - 0.0015 * minute),
+                                        at_minute=30 + minute)
+        rang = rang or creep.reason(bar, lean, dctx)
+    if not rang or rang[0] != "sell":
+        failures.append(f"a slide arriving in small steps still has to ring: {rang}")
+
+    # ...but only while it is inside the window.
+    stale = Alarms()
+    bar, lean, dctx, when = reading(0.50, 2.0, price=150.5, at_minute=0)
+    stale.reason(bar, lean, dctx)
+    bar, lean, dctx, when = reading(0.50, 2.0, price=149.0,
+                                    at_minute=MOVE_MINUTES + 2)
+    if stale.reason(bar, lean, dctx) is not None:
+        failures.append("a move older than the window is not news now")
 
     ring = Alarms()
-    bar, lean, dctx, when = reading(0.72, 2.0)
-    call = ring.reason(bar, lean, dctx)
-    if not call or call[0] != "buy":
-        failures.append(f"72 on 2x volume should ring the buy side: {call}")
-    bar, lean, dctx, when = reading(0.28, 2.0, at_minute=36)
-    call = ring.reason(bar, lean, dctx)
-    if not call or call[0] != "sell":
-        failures.append(f"28 on 2x volume should ring the sell side: {call}")
-
     if ring.sound_for("buy") == ring.sound_for("sell"):
         failures.append("the two directions must not share a sound")
     if ring.sound_for("buy") != SOUND_BUY or ring.sound_for("sell") != SOUND_SELL:
@@ -1781,34 +1865,63 @@ def self_test() -> int:
     if not cool.should_sound("buy", base + timedelta(minutes=SOUND_COOLDOWN_MINUTES)):
         failures.append("the cooldown should expire")
 
-    # A VWAP cross needs a previous side to cross from, and the side must
-    # be tracked on every reading -- not only on the ones that ring.
+    # The VWAP side is still tracked on every reading -- worth knowing, and
+    # the state has to be right if it is ever wanted again -- but crossing
+    # it with no movement behind it no longer rings.
     cross = Alarms()
-    bar, lean, dctx, when = reading(0.50, 2.0, vwap_gap=-1.0)   # below
+    bar, lean, dctx, when = reading(0.50, 2.0, vwap_gap=-1.0, at_minute=30)
     cross.reason(bar, lean, dctx)
-    bar, lean, dctx, when = reading(0.50, 2.0, vwap_gap=1.0)    # now above
-    call = cross.reason(bar, lean, dctx)
-    if not call or call[0] != "buy" or "VWAP" not in call[1]:
-        failures.append(f"crossing above VWAP on volume rings buy: {call}")
-    quiet_cross = Alarms()
-    bar, lean, dctx, when = reading(0.50, 1.0, vwap_gap=-1.0)
-    quiet_cross.reason(bar, lean, dctx)
-    bar, lean, dctx, when = reading(0.50, 1.0, vwap_gap=1.0)
-    if quiet_cross.reason(bar, lean, dctx) is not None:
-        failures.append("a VWAP cross with no volume behind it is not news")
+    if cross.above_vwap is not False:
+        failures.append("below VWAP should be recorded as below")
+    bar, lean, dctx, when = reading(0.50, 2.0, vwap_gap=1.0, at_minute=31)
+    if cross.reason(bar, lean, dctx) is not None:
+        failures.append("a VWAP cross with price unmoved no longer rings")
+    if cross.above_vwap is not True:
+        failures.append("the crossing should still have been recorded")
 
-    # 23 Sep 2026, the session this threshold was chosen against: five
-    # volume alarms, and only the 13:50 one carried a direction. If this
-    # ever reads differently the thresholds moved without anyone saying so.
-    observed = ((0.48, 2.7), (0.26, 2.7), (0.45, 1.8), (0.60, 1.5), (0.60, 1.5))
-    rings = []
-    for i, (score, ratio) in enumerate(observed):
-        bar, lean, dctx, when = reading(score, ratio, at_minute=i)
-        got = Alarms().reason(bar, lean, dctx)
-        if got:
-            rings.append((score, got[0]))
-    if rings != [(0.26, "sell")]:
-        failures.append(f"23 Sep should ring once, sell at 26: {rings}")
+    # 25 Sep 2026, read back out of the Pushover export: 70 real readings
+    # between 12:04 and 15:51, of which SIX rang under the old rule --
+    # while the afternoon's entire range was 0.89% and the largest step
+    # between any two readings was 0.24%. Nothing happened, and the phone
+    # said so six times. It now says nothing.
+    #
+    # This replaces the 23 Sep fixture, which pinned the lean bands. Those
+    # bands no longer decide anything, so that test could only pass by
+    # accident. Deliberate change: the alarm means price is moving.
+    friday = (
+        (0, 148.69, 3.2), (0, 148.59, 2.6), (1, 148.59, 2.0), (1, 148.78, 1.8),
+        (2, 148.71, 2.0), (3, 148.76, 1.9), (4, 148.97, 4.5), (5, 148.96, 7.0),
+        (6, 148.96, 3.2), (6, 149.06, 8.9), (7, 149.42, 5.8), (8, 149.27, 2.5),
+        (9, 149.12, 1.7), (10, 149.24, 1.8), (11, 149.24, 3.7), (11, 149.38, 2.4),
+        (12, 149.38, 2.4), (13, 149.23, 2.4), (14, 149.29, 1.5), (15, 149.19, 2.1),
+        (16, 148.94, 2.3), (17, 148.80, 1.5), (20, 149.09, 2.5), (21, 149.09, 1.7),
+        (21, 149.20, 1.6), (22, 149.23, 2.0), (23, 149.18, 1.7), (24, 148.91, 2.8),
+        (25, 149.01, 2.2), (26, 149.01, 1.8), (28, 148.95, 2.5), (29, 148.89, 1.7),
+        (31, 148.72, 2.6), (32, 148.88, 1.8), (32, 148.90, 3.1), (33, 148.88, 1.7),
+        (34, 148.64, 4.2), (35, 148.74, 4.0), (36, 148.74, 2.2), (36, 148.47, 3.2),
+        (37, 148.47, 4.2), (38, 148.50, 4.0), (39, 148.55, 3.1), (40, 148.53, 2.8),
+        (41, 148.48, 2.8), (44, 148.42, 1.7), (45, 148.29, 1.7), (46, 148.29, 1.7),
+        (47, 148.55, 1.5), (52, 148.66, 2.4), (53, 148.53, 1.8), (54, 148.45, 3.1),
+        (55, 148.46, 2.3), (56, 148.46, 1.7), (62, 148.55, 2.5), (71, 148.58, 1.6),
+        (89, 148.53, 2.2), (118, 148.46, 1.6), (129, 148.25, 5.1), (132, 148.18, 1.9),
+        (142, 148.15, 2.5), (185, 148.19, 1.8), (215, 148.93, 1.9), (218, 148.94, 2.3),
+        (219, 149.17, 1.5), (220, 148.97, 1.7), (221, 148.90, 1.9), (222, 148.80, 1.7),
+        (225, 148.94, 1.6), (226, 148.84, 1.8))
+    noon = datetime.combine(date(2026, 9, 25), time(12, 4), tzinfo=ET)
+    afternoon = Alarms()
+    rang = []
+    for offset, price, ratio in friday:
+        at = noon + timedelta(minutes=offset)
+        bar = Candle(at=at, open=price, high=price, low=price, close=price,
+                     volume=ratio * 40_000, usual_volume=40_000)
+        call = afternoon.reason(bar, Lean(0.5, 5, 5, 5, volume_ratio=ratio),
+                                Day(last=price, high=149.65, low=146.03,
+                                    prev_close=147.79, vwap=price - 0.5))
+        if call and afternoon.should_sound(call[0], at):
+            rang.append((at.strftime("%H:%M"), call[1]))
+    if rang:
+        failures.append(f"25 Sep afternoon moved 0.89% in four hours and must "
+                        f"not ring at all; it rang {len(rang)}x: {rang}")
 
     # --- the volume alarm --------------------------------------------------
     busy = Candle(at=at, open=1.0, high=1.1, low=0.9, close=1.05,
@@ -1877,12 +1990,12 @@ def self_test() -> int:
     print(f"  Priorities, update vs alarm    : {PRIORITY_UPDATE} vs {PRIORITY_SUMMARY}")
     print(f"  Phone quiet after              : {DETAIL_UNTIL:%H:%M} "
           f"(spikes still arrive, silently)")
-    print(f"  Rings at                       : lean past "
-          f"{PRESSING_LOW * 100:.0f}/{PRESSING_HIGH * 100:.0f} or a VWAP "
-          f"cross, on {ALARM_VOLUME:.1f}x volume")
+    print(f"  Rings at                       : price moving "
+          f"{MOVE_PERCENT:.2f}% within {MOVE_MINUTES} min, on "
+          f"{ALARM_VOLUME:.1f}x volume")
     print(f"  Sounds, buy / sell             : {SOUND_BUY} / {SOUND_SELL}, "
           f"one per direction per {SOUND_COOLDOWN_MINUTES} min")
-    print("  23 Sep replayed                : 1 ring of 5 volume spikes")
+    print("  25 Sep afternoon replayed      : 0 rings of 70 readings (was 6)")
     print("  Test push                      : devices and sound names "
           "checked first")
     print("  Half-updated folder            : refused at startup, not at "
@@ -1920,6 +2033,16 @@ def main() -> int:
                         help=f"Rebuild the session PDF every N minutes, and send "
                              f"the chart with a volume alarm (default "
                              f"{PDF_EVERY_MINUTES}; 0 turns it off)")
+    parser.add_argument("--move-percent", type=float, default=MOVE_PERCENT,
+                        metavar="PCT",
+                        help=f"How far price must travel to earn a noise "
+                             f"(default {MOVE_PERCENT}%%). Tune it with "
+                             f"--replay against a past session rather than "
+                             f"by ear")
+    parser.add_argument("--move-minutes", type=int, default=MOVE_MINUTES,
+                        metavar="MIN",
+                        help=f"The window that move has to happen inside "
+                             f"(default {MOVE_MINUTES})")
     parser.add_argument("--buy-sound", default=SOUND_BUY, metavar="NAME",
                         help=f"Pushover sound for a buy-side alarm "
                              f"(default {SOUND_BUY}; a custom sound uploaded "
@@ -1973,7 +2096,8 @@ def main() -> int:
                           args.volume_alert)
     return run_live(symbol, start, end, args.dry_run, db, args.push_empty,
                     args.volume_alert, args.pdf_every, args.db, detail,
-                    args.buy_sound, args.sell_sound)
+                    args.buy_sound, args.sell_sound,
+                    args.move_percent, args.move_minutes)
 
 
 if __name__ == "__main__":
