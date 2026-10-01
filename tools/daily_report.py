@@ -484,8 +484,8 @@ class Note:
 #: answer is WHICH of these is worth reading -- and "sellers exhausted"
 #: records the conclusion while throwing away the evidence.
 #:
-#: Seven factors can be ranked one at a time with 60-80 trades. Their
-#: COMBINATIONS cannot: three states each is 2,187 cells and no amount
+#: Eight factors can be ranked one at a time with 60-80 trades. Their
+#: COMBINATIONS cannot: three states each is 6,561 cells and no amount
 #: of trading fills that. Anything found here nominates; the next batch
 #: of days decides.
 FACTORS = {
@@ -496,6 +496,18 @@ FACTORS = {
     "wick": ("the run of lower wicks", "lows lining up", "lows stepping down"),
     "macd": ("MACD", "rising, diverging up", "falling"),
     "big":  ("the longer timeframe", "agrees", "disagrees"),
+    # The only one that is about the READER rather than the chart, and
+    # the reason it is here: on 30 September the morning was called a
+    # hole by three days of arithmetic -- 1 winner in 7, -$9,651 -- and
+    # read as solid by eye. The read won, three entries for +$10,319,
+    # and the arithmetic turned out to be seven trades of noise.
+    #
+    # It can go circular, which is the thing to watch. Feeling in tune
+    # BECAUSE the position is green records the scoreboard twice and
+    # proves nothing. Only a reading written at the entry, before the
+    # outcome exists, is worth having -- which is what IN: is for.
+    "tune": ("whether you are in sync with the stock",
+             "reading the turns, it feels legible", "out of sync, forcing it"),
 }
 
 #: "+" and "-" are readings. "0" means LOOKED AND COULD NOT TELL, which
@@ -2846,14 +2858,22 @@ def self_test() -> int:
             failures.append("the capture sheet should write a real PDF")
 
     # --- factors: the checklist, not the conclusion ------------------------
-    full = parse_note("11:03 IN c3: of+ poc+ vw- form+ wick+ macd+ big-")
+    # Built FROM the dict rather than typed beside it, for the same reason
+    # the printed sheet is: a fixture listing the tags by hand asserts a
+    # vocabulary that stopped being the vocabulary the moment one was added.
+    every = " ".join(f"{tag}{'+' if i % 2 == 0 else '-'}"
+                     for i, tag in enumerate(FACTORS))
+    full = parse_note(f"11:03 IN c3: {every}")
     if full.kind != "in" or full.conviction != 3:
         failures.append(f"IN c3 with a leading clock: {full.kind!r}, "
                         f"c={full.conviction}")
     if len(full.factors) != len(FACTORS):
-        failures.append(f"all seven factors should parse: {full.factors}")
-    if full.factors.get("vw") != "-" or full.factors.get("of") != "+":
-        failures.append(f"factor signs read wrong: {full.factors}")
+        failures.append(f"every tag in FACTORS should parse: {full.factors}")
+    wanted = {tag: ("+" if i % 2 == 0 else "-")
+              for i, tag in enumerate(FACTORS)}
+    if full.factors != wanted:
+        failures.append(f"factor signs read wrong: {full.factors} "
+                        f"against {wanted}")
     if full.text:
         failures.append(f"factor tokens are not prose: {full.text!r}")
 

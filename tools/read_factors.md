@@ -26,6 +26,21 @@ tags live in `daily_report.py:FACTORS` and have to be changed there too.
 | `wick` | The run of recent lower wicks | lows lining up — a floor | lows stepping down |
 | `macd` | MACD | rising, diverging up | falling |
 | `big` | The longer-timeframe chart | agrees with the entry | disagrees |
+| `tune` | Whether you're in sync with the stock | reading the turns, it feels legible | out of sync, forcing it |
+
+### A note on `tune`
+
+It is the only tag about **you** rather than the chart, and it earned its
+place on 30 September: three days of arithmetic called the morning a hole
+— one winner in seven, −$9,651 — and you read it as solid. The read won,
+three entries for +$10,319, and the arithmetic turned out to be seven
+trades of noise.
+
+**It can go circular, and that is the thing to watch.** Feeling in tune
+*because* the position is green records the scoreboard twice and proves
+nothing. Only a reading written at the entry, before the outcome exists,
+is worth having. That is what `IN:` is for, and it is why a `tune`
+written in the evening is worse than no `tune` at all.
 
 ## How to write one
 
@@ -58,11 +73,11 @@ during the day.
 `poc−`?" needs roughly 30–40 entries per state, so about 60–80 trades.
 One to two weeks at your volume.
 
-**Cannot — find the winning combination.** Seven factors at three states
-is 2,187 cells. You will never fill that, and anyone claiming to have
+**Cannot — find the winning combination.** Eight factors at three states
+is 6,561 cells. You will never fill that, and anyone claiming to have
 found the magic confluence on a few hundred trades is fitting noise.
 
-**The multiple-comparisons trap.** Testing seven factors means roughly a
+**The multiple-comparisons trap.** Testing eight factors means roughly a
 1-in-3 chance that at least one looks good by luck alone. So: whatever
 wins in the first batch gets written down and tested on the *next* batch.
 The first batch nominates. The second decides. Same rule as everything
