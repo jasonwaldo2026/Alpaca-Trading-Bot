@@ -496,6 +496,115 @@ def opening_rows(sessions: Dict[date, pd.DataFrame]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+#: Section 15. ONE setting, fixed before it sees the data. A grid over
+#: cut and step would return the best of however many pairs were tried,
+#: which is the thing this file exists to avoid.
+#:
+#: 0.50% is the same distance the phone alarm now rings at, and close to
+#: the typical loss actually taken: the five worst round trips of 25-30
+#: September ran -2,420 to -3,149 on roughly 2,400 shares near $150,
+#: which is 0.67% to 0.87%.
+RECOVERY_CUT, RECOVERY_STEP = 0.50, 0.25
+
+#: Entries every quarter hour rather than where a signal fired, for the
+#: same reason the control enters every fifth bar: the question is what
+#: the EXIT RULE does, and picking entries by a rule would measure the
+#: entries instead. Stopping at 15:00 leaves an hour for the path to play
+#: out, so the comparison is not mostly "ran out of day".
+RECOVERY_EVERY = 15
+RECOVERY_FROM, RECOVERY_UNTIL = time(9, 45), time(15, 0)
+
+#: The four ways out, in the order they are reported.
+RECOVERY_PATHS = ("hold to the close", "hold for break-even",
+                  "cut and stay out", "cut and get back in")
+
+
+def recovery_paths(closes: Sequence[float], start: int,
+                   cut: float = RECOVERY_CUT,
+                   step: float = RECOVERY_STEP) -> Dict[str, float]:
+    """Four ways out of ONE entry, each as a percent of the entry price.
+
+    The question: when a position goes against you, is it better to hold
+    until it comes back, or to take the loss, get back in lower, and be
+    ahead by the difference when it returns?
+
+    The arithmetic of the second one is not in doubt. Cut at C, re-enter
+    at R below it, and when price reaches the original entry E again you
+    have realised (C - E) and gained (E - R), for a net (C - R) -- which
+    is positive, always, by construction. What is in doubt is how often
+    you GET that: price has to fall the extra step to let you back in,
+    and then come back. When it cuts you out and recovers without ever
+    offering the re-entry, you have taken the loss and missed the
+    recovery, and that is the case this measures.
+
+    Both "break-even" paths exit at the ORIGINAL entry price, because
+    that is what waiting to get out flat means. Nothing looks past the
+    bar it is standing on.
+    """
+    if start >= len(closes) - 1:
+        return {}
+    entry = closes[start]
+    if entry <= 0:
+        return {}
+    later = list(closes[start + 1:])
+    close_out = 100.0 * (later[-1] - entry) / entry
+    # Waiting to get out flat only means anything once you are DOWN. An
+    # entry that never went against you was never waiting for anything,
+    # and scoring it as a break-even exit would park every winner at 0.00%
+    # and quietly drag this path's average toward zero.
+    under = next((i for i, p in enumerate(later) if p < entry), None)
+    out = {"hold to the close": close_out}
+    out["hold for break-even"] = (
+        close_out if under is None
+        else (0.0 if any(p >= entry for p in later[under + 1:]) else close_out))
+
+    floor = entry * (1.0 - cut / 100.0)
+    cut_at = next((i for i, p in enumerate(later) if p <= floor), None)
+    if cut_at is None:                       # never went against you that far
+        out["cut and stay out"] = out["cut and get back in"] = close_out
+        return out
+    taken = 100.0 * (later[cut_at] - entry) / entry
+    out["cut and stay out"] = taken
+
+    rest = later[cut_at + 1:]
+    back = entry * (1.0 - (cut + step) / 100.0)
+    again = next((i for i, p in enumerate(rest) if p <= back), None)
+    if again is None or again >= len(rest) - 1:
+        out["cut and get back in"] = taken     # never offered the re-entry
+        return out
+    second = rest[again]
+    after = rest[again + 1:]
+    regained = (entry if any(p >= entry for p in after) else after[-1])
+    out["cut and get back in"] = taken + 100.0 * (regained - second) / entry
+    return out
+
+
+def recovery_rows(sessions: Dict[date, pd.DataFrame],
+                  cut: float = RECOVERY_CUT,
+                  step: float = RECOVERY_STEP) -> pd.DataFrame:
+    """Every quarter-hourly entry, scored four ways."""
+    rows = []
+    for day, session in sorted(sessions.items()):
+        window = session[(session.index.time >= RECOVERY_FROM)
+                         & (session.index.time <= RECOVERY_UNTIL)]
+        if window.empty:
+            continue
+        closes = [float(v) for v in session["close"]]
+        stamps = list(session.index)
+        last = None
+        for i, stamp in enumerate(stamps):
+            if not (RECOVERY_FROM <= stamp.time() <= RECOVERY_UNTIL):
+                continue
+            if last is not None and (stamp - last).total_seconds() / 60 < RECOVERY_EVERY:
+                continue
+            paths = recovery_paths(closes, i, cut, step)
+            if not paths:
+                continue
+            last = stamp
+            rows.append({"day": day, "at": stamp, **paths})
+    return pd.DataFrame(rows)
+
+
 def noise_floor(n: int) -> float:
     """One standard error on a coin flip, in percentage points.
 
@@ -1521,6 +1630,70 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
                 print("   median near zero with quarters either side of it is")
                 print("   a coin flip whatever the percentage above says.")
 
+    # ---- 15. holding a loser, against cutting and getting back in -----
+    print(f"\n{rule}")
+    print("15. WAITING FOR IT TO COME BACK, AGAINST CUTTING AND RE-ENTERING\n")
+    print("   The claim being tested: when a position goes against you it")
+    print("   is better to take the loss, get back in lower, and be ahead")
+    print("   by the difference when price returns -- rather than sitting")
+    print("   there waiting to get out flat.")
+    print("\n   The arithmetic of that is not in question. Cut at C,")
+    print("   re-enter at R below it, and reaching the original entry E")
+    print("   again leaves you (C - R) ahead, always. The question is how")
+    print("   OFTEN you get it: price has to fall the extra step to let")
+    print("   you back in, and then come back. When it cuts you out and")
+    print("   recovers without ever offering the re-entry, you took the")
+    print("   loss AND missed the recovery. That is what this counts.")
+    print(f"\n   Cut at {RECOVERY_CUT:.2f}%, back in {RECOVERY_STEP:.2f}% lower "
+          f"again. One setting,")
+    print("   fixed before it saw the data -- a grid over both would return")
+    print("   the best of however many pairs were tried.")
+    print(f"\n   Entries every {RECOVERY_EVERY} minutes between "
+          f"{RECOVERY_FROM:%H:%M} and {RECOVERY_UNTIL:%H:%M}, regardless of")
+    print("   what the chart was doing, because the question is what the")
+    print("   EXIT rule does. Picking entries by a rule measures entries.")
+
+    moves = recovery_rows(sessions)
+    if len(moves) < MIN_TRADES:
+        print(f"\n   Only {len(moves)} usable entries -- too few to say anything.")
+    else:
+        print(f"\n   {len(moves):,} entries across {moves['day'].nunique()} days\n")
+        print(f"   {'':<24}{'median':>9}{'mean':>9}{'ended up':>10}")
+        for path in RECOVERY_PATHS:
+            values = moves[path].dropna()
+            if values.empty:
+                continue
+            print(f"   {path:<24}{values.median():>8.3f}%{values.mean():>8.3f}%"
+                  f"{100.0 * (values > 0).mean():>9.0f}%")
+
+        # How often the rule even engages, and how often it pays. Without
+        # these the table above is four numbers with no mechanism behind
+        # them -- and the mechanism is the whole question.
+        cut_fired = moves["cut and stay out"] < moves["hold to the close"] - 1e-9
+        offered = cut_fired & (moves["cut and get back in"]
+                               > moves["cut and stay out"] + 1e-9)
+        better = moves["cut and get back in"] > moves["hold for break-even"] + 1e-9
+        print(f"\n   The cut triggered on {100.0 * cut_fired.mean():.0f}% of entries "
+              f"({int(cut_fired.sum()):,} of {len(moves):,}).")
+        if cut_fired.any():
+            print(f"   Of those, the lower re-entry was offered "
+                  f"{100.0 * offered.sum() / cut_fired.sum():.0f}% of the time.")
+            hurt = moves.loc[cut_fired & ~offered, "cut and stay out"]
+            if not hurt.empty:
+                print(f"   When it was not, the median outcome was "
+                      f"{hurt.median():.3f}% -- the loss taken, the recovery")
+                print("   missed. That is the cost of the rule, and it is the")
+                print("   case worth looking at before adopting it.")
+        print(f"\n   Cutting and getting back in beat waiting it out on "
+              f"{100.0 * better.mean():.0f}% of entries.")
+        floor = noise_floor(len(moves))
+        print(f"   Noise floor at {len(moves):,} entries is +/-{floor:.1f} points, "
+              f"so anything")
+        print(f"   between {50 - floor:.0f}% and {50 + floor:.0f}% is a coin flip.")
+        print("\n   Long-only, and none of this is an edge: every path starts")
+        print("   from an entry chosen by the clock. It compares EXITS from")
+        print("   the same entry, which is the only thing it can claim.")
+
         print("\n   Three of the four things measured in this file came back")
         print("   negative, including the MACD crossover twice. If this one")
         print("   matches its baseline, the finding is that the open is not")
@@ -1754,6 +1927,10 @@ def self_test() -> int:
     print("  Gap vs opening range           : measured from separate anchors")
     print("  A minute with no trades        : read at-or-before, day kept")
     print("  Noise floor                    : 7.5 points on 45 days")
+    print("  Cut and re-enter, by hand      : -0.60 then +0.80 is +0.20")
+    print("  Cut that misses the recovery   : reads worse than having waited")
+    print("  An entry never underwater      : one outcome, not four")
+    print(f"  Entries spaced by the clock    : no closer than {RECOVERY_EVERY} min")
 
 
     # --- section 14: the open ---------------------------------------------
@@ -1784,6 +1961,49 @@ def self_test() -> int:
         # arithmetic rather than a fact about the stock.
         if row.get("range_1000") is None:
             failures.append("10:00 is after 09:45 and should be measured")
+
+    # --- section 15: holding a loser against cutting and re-entering ------
+    # Worked by hand. Entry 100, cut floor 99.50, re-entry 99.25.
+    #   dips to 99.40  -> cut, -0.60%
+    #   dips to 99.20  -> back in below 99.25
+    #   recovers to 100.50 -> out at the original 100.00, +0.80%
+    #   net +0.20%, against 0.00% for waiting it out and -0.60% for
+    #   cutting and staying away.
+    worked = recovery_paths([100.0, 99.4, 99.2, 100.5], 0)
+    for path, want in (("hold to the close", 0.500), ("hold for break-even", 0.0),
+                       ("cut and stay out", -0.600), ("cut and get back in", 0.200)):
+        if round(worked.get(path, 99), 3) != want:
+            failures.append(f"recovery path {path!r}: {worked.get(path)} "
+                            f"against {want}")
+
+    # The case that decides whether the rule is worth having: it cuts you
+    # out, never falls the extra step, and then recovers without you.
+    missed = recovery_paths([100.0, 99.45, 99.6, 101.0], 0)
+    if round(missed["cut and get back in"], 3) != round(missed["cut and stay out"], 3):
+        failures.append("with no re-entry offered, getting back in cannot "
+                        "differ from staying out")
+    if not missed["cut and get back in"] < missed["hold for break-even"]:
+        failures.append("a cut that misses the recovery must read as worse "
+                        "than having waited -- that is the cost of the rule")
+
+    # Never goes against you: every path is the same, and none of them
+    # invents a trade that did not happen.
+    calm = recovery_paths([100.0, 100.2, 100.4], 0)
+    if len({round(v, 6) for v in calm.values()}) != 1:
+        failures.append(f"an entry that never went against you has one "
+                        f"outcome, not four: {calm}")
+
+    # Nothing looks past the last bar, and an entry on it has no future.
+    if recovery_paths([100.0, 99.0], 1) != {}:
+        failures.append("an entry on the final bar cannot be scored")
+
+    # Entries are spaced by the clock, not taken on every bar.
+    spaced = recovery_rows({date(2026, 9, 18): _session([150.0] * 400)})
+    if not spaced.empty:
+        gaps = spaced["at"].diff().dropna().dt.total_seconds() / 60
+        if (gaps < RECOVERY_EVERY).any():
+            failures.append(f"entries closer together than "
+                            f"{RECOVERY_EVERY} min: {sorted(gaps)[:3]}")
 
     # A missing minute must not drop the day: price_at reads at-or-before.
     gappy = _session([100.0] * 60)
