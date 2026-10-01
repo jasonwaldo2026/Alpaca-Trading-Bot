@@ -2333,6 +2333,12 @@ def draw_each_trade(ax, trades: Sequence[Trade]) -> None:
     ax.yaxis.set_major_formatter(
         FuncFormatter(lambda v, _: f"{'-' if v < 0 else ''}${abs(v):,.0f}"))
     ax.set_xlim(-0.8, len(values) - 0.2)
+    # Headroom for the two labels. Without it the best trade's label lands
+    # on the panel title whenever that trade is also the first to close,
+    # which is exactly what a morning runner looks like.
+    high, low = max(values + [0.0]), min(values + [0.0])
+    reach = (high - low) or 1.0
+    ax.set_ylim(low - reach * 0.22, high + reach * 0.24)
     # The extremes only. Which two trades made and cost the most is the
     # question this panel exists to answer; the rest is shape.
     for index in {max(range(len(values)), key=lambda i: values[i]),
