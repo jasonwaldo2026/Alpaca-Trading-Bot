@@ -1621,7 +1621,18 @@ def band(fig, session: Session) -> None:
     fig.text(0.045, 0.963, f"{session.symbol}", size=15, weight="bold", color=INK)
     fig.text(0.108, 0.9625, f"{session.day:%A %d %B %Y}", size=9.5, color=INK_2)
 
+    # The day's money FIRST. It is the number this page exists to put in
+    # front of you, and at the end of a row of eight -- in the same size
+    # and weight as VOLUME -- it is a number you cannot trust yourself to
+    # have seen. It is also always present: omitted when no trades load,
+    # an empty run looks exactly like a flat day.
+    closed = [t for t in session.trades if t.profit is not None]
+    total = sum(t.profit for t in closed) if closed else None
     stats = [
+        ("Net P&L",
+         f"{'+' if total >= 0 else '-'}${abs(total):,.0f}" if closed
+         else "no trades file",
+         (UP if total >= 0 else DOWN) if closed else MUTED),
         ("Open", f"${first['open']:,.2f}", INK),
         ("Close", f"${last['close']:,.2f}", INK),
         ("Change", f"{move:+.2f} ({pct:+.2f}%)", colour),
@@ -1636,17 +1647,6 @@ def band(fig, session: Session) -> None:
         relative = pct - market_pct
         stats.append((f"vs {market}", f"{relative:+.2f}%",
                       UP if relative >= 0 else DOWN))
-    # The day's own P&L, across every account, net of commission. The
-    # point of this page is comparing what was read against what price
-    # did next; what it actually came to belongs at the top with the rest
-    # of the numbers you would say out loud.
-    closed = [t for t in session.trades if t.profit is not None]
-    if closed:
-        total = sum(t.profit for t in closed)
-        stats.append(("Net P&L", f"{'+' if total >= 0 else '-'}$"
-                                 f"{abs(total):,.0f}",
-                      UP if total >= 0 else DOWN))
-
     # Label ABOVE value, not beside it. Side by side, each stat had to fit
     # its label and its number in one slot and did not: the page printed
     # "CHANGE+2.16 (+1.47%)HIGH" -- the value over the label, then over the
@@ -3280,6 +3280,31 @@ def self_test() -> int:
 
     if len(performance_stats(sample)) > HEADER_STATS:
         failures.append("more header stats than the header budgets")
+
+    # The day's money leads the header and is never absent. Omitted when
+    # no trades loaded, an empty run reads as a flat day -- which is what
+    # sent a debrief out with no total on it and nobody able to tell why.
+    blank = pd.DataFrame()
+    bars = pd.DataFrame({"open": [150.0], "high": [151.0], "low": [149.0],
+                         "close": [150.5], "volume": [1000.0]},
+                        index=pd.DatetimeIndex([datetime(2026, 9, 25, 10, 0,
+                                                         tzinfo=ET)]))
+    for label, items, want in (("with trades", sample, "+$"),
+                               ("with none", [], "no trades file")):
+        drawn = plt.figure(figsize=(11.0, 8.5))
+        band(drawn, Session(symbol="SPCX", day=date(2026, 9, 25), minutes=bars,
+                            candles=bars, vwap=pd.Series(dtype=float),
+                            baseline={}, signals=blank, macd=blank, trades=items))
+        texts = [t.get_text() for t in drawn.texts]
+        plt.close(drawn)
+        if "NET P&L" not in texts:
+            failures.append(f"{label}: the header must always carry NET P&L")
+        elif texts.index("NET P&L") > min((texts.index(x) for x in
+                                           ("OPEN", "CLOSE", "VOLUME")
+                                           if x in texts), default=99):
+            failures.append(f"{label}: NET P&L should lead the header")
+        elif not any(want in t for t in texts):
+            failures.append(f"{label}: expected {want!r} in {texts}")
     # A losing day's BEST trade is still a loss, and must not be green.
     all_losers = [trade((10, 0), (10, 5), 100.0, 99.5),
                   trade((11, 0), (11, 5), 100.0, 99.0)]
