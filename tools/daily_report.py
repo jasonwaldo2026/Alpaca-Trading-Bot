@@ -1621,18 +1621,32 @@ def band(fig, session: Session) -> None:
     fig.text(0.045, 0.963, f"{session.symbol}", size=15, weight="bold", color=INK)
     fig.text(0.108, 0.9625, f"{session.day:%A %d %B %Y}", size=9.5, color=INK_2)
 
-    # The day's money FIRST. It is the number this page exists to put in
-    # front of you, and at the end of a row of eight -- in the same size
-    # and weight as VOLUME -- it is a number you cannot trust yourself to
-    # have seen. It is also always present: omitted when no trades load,
-    # an empty run looks exactly like a flat day.
+    # The day's money, in the top-right corner and nowhere else. Two
+    # separate things went wrong with it and only one was position:
+    #
+    #   It was OMITTED when no trades loaded, so a failed read drew a
+    #   header one stat shorter and a page that looked like a flat day.
+    #   Hence the grey "no trades file" -- absence has to be visible.
+    #
+    #   And as the eighth of eight stats it was the same size and weight
+    #   as VOLUME, at the end of a crowded row, which is how nobody
+    #   noticed it had gone. Out of the row it is the largest number in
+    #   the header, right-aligned to where the rule ends, and no stat
+    #   that comes and goes -- "vs SPY" needs market data -- can shift
+    #   it, the way anything in a left-to-right row shifts everything
+    #   after it.
     closed = [t for t in session.trades if t.profit is not None]
     total = sum(t.profit for t in closed) if closed else None
+    money = (f"{'+' if total >= 0 else '-'}${abs(total):,.0f}" if closed
+             else "no trades file")
+    fig.text(0.965, 0.9755, "NET P&L", size=7, color=MUTED, ha="right")
+    # The fallback is three words where the number is seven characters;
+    # set at 15 it ran back under its own label.
+    fig.text(0.965, 0.9565, money, ha="right",
+             size=15 if closed else 10.5,
+             weight="bold" if closed else "normal",
+             color=(UP if total >= 0 else DOWN) if closed else MUTED)
     stats = [
-        ("Net P&L",
-         f"{'+' if total >= 0 else '-'}${abs(total):,.0f}" if closed
-         else "no trades file",
-         (UP if total >= 0 else DOWN) if closed else MUTED),
         ("Open", f"${first['open']:,.2f}", INK),
         ("Close", f"${last['close']:,.2f}", INK),
         ("Change", f"{move:+.2f} ({pct:+.2f}%)", colour),
@@ -3281,9 +3295,11 @@ def self_test() -> int:
     if len(performance_stats(sample)) > HEADER_STATS:
         failures.append("more header stats than the header budgets")
 
-    # The day's money leads the header and is never absent. Omitted when
-    # no trades loaded, an empty run reads as a flat day -- which is what
-    # sent a debrief out with no total on it and nobody able to tell why.
+    # The day's money sits in the top-right corner, is never absent, and
+    # is never just another stat. Omitted when no trades loaded, an empty
+    # run reads as a flat day -- which is what sent a debrief out with no
+    # total on it and nobody able to tell why. Small and eighth in a row,
+    # it is a number you cannot trust yourself to have seen.
     blank = pd.DataFrame()
     bars = pd.DataFrame({"open": [150.0], "high": [151.0], "low": [149.0],
                          "close": [150.5], "volume": [1000.0]},
@@ -3295,16 +3311,42 @@ def self_test() -> int:
         band(drawn, Session(symbol="SPCX", day=date(2026, 9, 25), minutes=bars,
                             candles=bars, vwap=pd.Series(dtype=float),
                             baseline={}, signals=blank, macd=blank, trades=items))
-        texts = [t.get_text() for t in drawn.texts]
+        drawings = list(drawn.texts)
         plt.close(drawn)
-        if "NET P&L" not in texts:
+        texts = [t.get_text() for t in drawings]
+        tag = next((t for t in drawings if t.get_text() == "NET P&L"), None)
+        value = next((t for t in drawings if want in t.get_text()), None)
+        if tag is None:
             failures.append(f"{label}: the header must always carry NET P&L")
-        elif texts.index("NET P&L") > min((texts.index(x) for x in
-                                           ("OPEN", "CLOSE", "VOLUME")
-                                           if x in texts), default=99):
-            failures.append(f"{label}: NET P&L should lead the header")
-        elif not any(want in t for t in texts):
+            continue
+        if value is None:
             failures.append(f"{label}: expected {want!r} in {texts}")
+            continue
+        # Right-aligned, so a wider number grows leftwards into empty
+        # space instead of off the edge of the page.
+        for part, what in ((tag, "label"), (value, "value")):
+            if part.get_ha() != "right":
+                failures.append(f"{label}: the NET P&L {what} must be "
+                                f"right-aligned, not {part.get_ha()!r}")
+        # Clear of the stat row, which fills from the left.
+        stat_xs = [t.get_position()[0] for t in drawings
+                   if t.get_text() in ("OPEN", "CLOSE", "CHANGE", "HIGH",
+                                       "LOW", "VOLUME")]
+        if stat_xs and tag.get_position()[0] <= max(stat_xs):
+            failures.append(f"{label}: NET P&L belongs right of every stat, "
+                            f"not at x={tag.get_position()[0]}")
+        # Above the row, not in it.
+        if value.get_position()[1] <= 0.95:
+            failures.append(f"{label}: NET P&L sits on the title line, "
+                            f"not at y={value.get_position()[1]}")
+        # The label above the value, never through it.
+        if tag.get_position()[1] - value.get_position()[1] < 0.015:
+            failures.append(f"{label}: NET P&L label and value overlap")
+        others = [t.get_size() for t in drawings
+                  if t.get_text() in ("$150.00", "$150.50", "1.0K")]
+        if items and others and value.get_size() <= max(others):
+            failures.append(f"{label}: the day's money must be bigger than "
+                            f"an ordinary stat, not {value.get_size()}")
     # A losing day's BEST trade is still a loss, and must not be green.
     all_losers = [trade((10, 0), (10, 5), 100.0, 99.5),
                   trade((11, 0), (11, 5), 100.0, 99.0)]
