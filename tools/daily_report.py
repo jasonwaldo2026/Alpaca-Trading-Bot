@@ -174,6 +174,12 @@ class Session:
     start: time = WINDOW_START      # the window the page is drawn for,
     end: time = WINDOW_END          # not the part of it that has printed
     benchmark: Optional[Tuple[str, float]] = None   # (symbol, % over the window)
+    #: The previous session's regular-hours close. A position carried into
+    #: this day is measured FROM here, not from what it cost, because that
+    #: is the day's money: the move before today already belongs to the day
+    #: it happened on. None when it could not be fetched, and then the page
+    #: falls back to cost and says so rather than quietly mixing the two.
+    prior_close: Optional[float] = None
 
 
 def session_vwap(minutes: pd.DataFrame) -> pd.Series:
@@ -1330,6 +1336,46 @@ def trades_on(trades: Sequence[Trade], day: date) -> List[Trade]:
     return out
 
 
+def marked_pnl(trades: Sequence[Trade], day: date,
+               prior_close: Optional[float],
+               last_close: Optional[float]) -> Optional[float]:
+    """The day's money the way a broker reports it.
+
+    Two differences from end-to-end profit, and both are the same idea --
+    only TODAY's move belongs to today:
+
+      A position carried in is measured from the PREVIOUS CLOSE, not from
+      what it cost. On 2 October 2026 the 2,190 Robinhood shares bought
+      the day before at $152.79 and sold at $156.32 are +$7,728 end to
+      end, and +$17,126 against the prior $148.50 close. The difference
+      is the $9,400 the position was already down when 1 October ended,
+      and that loss belongs to 1 October -- which is where this puts it.
+
+      A position still open at the bell is marked to today's close. It
+      has no realised profit and it absolutely moved your account.
+
+    Returns None when a basis is missing, rather than silently falling
+    back to cost: a number half on one convention and half on the other
+    is worse than no number, because nothing about it looks wrong.
+    """
+    total = 0.0
+    for trade in trades:
+        if trade.opened.date() == day:
+            start = trade.entry
+        elif prior_close is None:
+            return None
+        else:
+            start = prior_close
+        if trade.exit is not None:
+            finish = trade.exit
+        elif last_close is None:
+            return None
+        else:
+            finish = last_close
+        total += (finish - start) * trade.quantity - trade.commission
+    return total
+
+
 def report_and_pair(path: str, fills: Sequence[Fill], account: str,
                     symbol: str, day: date) -> List[Trade]:
     """Pair one account's orders, and say what could not be paired.
@@ -1622,6 +1668,35 @@ def market_move(symbol: str, day: date, start: time, end: time,
     return symbol.upper(), 100.0 * (last["close"] - first["open"]) / first["open"]
 
 
+def previous_close(symbol: str, day: date, force_sip: bool) -> Optional[float]:
+    """The last regular-hours price of the session before `day`.
+
+    Reaches back a week rather than one calendar day, so a Monday finds
+    Friday and a day after a holiday finds the session before it. The
+    cut-off is 16:00: an after-hours print is not the close, and on 1
+    October the last fill of the day was a 16:14 buy that would have
+    moved this by six cents if it were allowed to count.
+
+    A failure costs the mark-to-market basis and must never cost the
+    report -- the session is the point.
+    """
+    try:
+        bars = fetch_minutes(symbol,
+                             datetime.combine(day - timedelta(days=7),
+                                              time(9, 30), tzinfo=ET),
+                             datetime.combine(day, time(0, 0), tzinfo=ET),
+                             force_sip=force_sip)
+    except Exception:  # noqa: BLE001
+        return None
+    if bars.empty:
+        return None
+    earlier = bars[(bars.index.date < day)
+                   & (bars.index.time <= time(16, 0))]
+    if earlier.empty:
+        return None
+    return float(earlier.iloc[-1]["close"])
+
+
 def gather(symbol: str, day: date, start: time, end: time, db_path: str,
            force_sip: bool = True, benchmark: str = BENCHMARK,
            trades_paths: Optional[Sequence[str]] = None) -> Optional[Session]:
@@ -1658,6 +1733,7 @@ def gather(symbol: str, day: date, start: time, end: time, db_path: str,
         macd=macd,
         start=start, end=end,
         benchmark=market_move(benchmark, day, start, end, force_sip),
+        prior_close=previous_close(symbol, day, force_sip),
     )
 
 
@@ -1677,6 +1753,46 @@ def literal(text: str) -> str:
     trades that loaded, which is why it survived this long.
     """
     return text.replace("$", r"\$")
+
+
+def note_lines(fig, segments: Sequence[str], size: float,
+               left: float = 0.045, right: float = 0.965) -> List[str]:
+    """Pack " · "-joined segments into lines that FIT, by measuring them.
+
+    A character budget is a guess, and the guess was wrong: the notes line
+    carried two accounts, the mark basis, the end-to-end figure, the
+    benchmark, a share unlock and a launch, and ran 1.6% past the right
+    edge -- losing the last four words of an unlock notice, on exactly the
+    kind of day the line exists for. Measured against the real renderer it
+    cannot be wrong, and a day with less on it still gets one line.
+    """
+    if not segments:
+        return []
+    try:
+        renderer = fig.canvas.get_renderer()
+    except (AttributeError, RuntimeError):
+        renderer = None
+    limit = (right - left) * fig.get_window_extent().x1
+
+    def fits(parts: List[str]) -> bool:
+        if renderer is None:                 # no renderer: fall back to a
+            return len("  ·  ".join(parts)) <= 150      # conservative count
+        probe = fig.text(left, -1.0, literal("  ·  ".join(parts)), size=size)
+        wide = probe.get_window_extent(renderer).width
+        probe.remove()
+        return wide <= limit
+
+    lines: List[List[str]] = []
+    current: List[str] = []
+    for segment in segments:
+        if current and not fits(current + [segment]):
+            lines.append(current)
+            current = [segment]
+        else:
+            current.append(segment)
+    if current:
+        lines.append(current)
+    return ["  ·  ".join(parts) for parts in lines]
 
 
 def band(fig, session: Session) -> None:
@@ -1707,16 +1823,25 @@ def band(fig, session: Session) -> None:
     #   it, the way anything in a left-to-right row shifts everything
     #   after it.
     closed = [t for t in session.trades if t.profit is not None]
-    total = sum(t.profit for t in closed) if closed else None
-    money = (f"{'+' if total >= 0 else '-'}${abs(total):,.0f}" if closed
-             else "no trades file")
-    fig.text(0.965, 0.9755, "NET P&L", size=7, color=MUTED, ha="right")
+    realised = sum(t.profit for t in closed) if closed else None
+    marked = (marked_pnl(session.trades, session.day, session.prior_close,
+                         float(last["close"])) if session.trades else None)
+    total = marked if marked is not None else realised
+    money = (f"{'+' if total >= 0 else '-'}${abs(total):,.0f}"
+             if total is not None else "no trades file")
+    # The label names the basis, because the two answers differ by
+    # thousands on any day that ended holding something and nothing about
+    # either number says which one it is.
+    fig.text(0.965, 0.9755,
+             "NET P&L  END TO END"
+             if (session.trades and marked is None) else "NET P&L",
+             size=7, color=MUTED, ha="right")
     # The fallback is three words where the number is seven characters;
     # set at 15 it ran back under its own label.
     fig.text(0.965, 0.9565, money, ha="right",
-             size=15 if closed else 10.5,
-             weight="bold" if closed else "normal",
-             color=(UP if total >= 0 else DOWN) if closed else MUTED)
+             size=15 if total is not None else 10.5,
+             weight="bold" if total is not None else "normal",
+             color=(UP if total >= 0 else DOWN) if total is not None else MUTED)
     stats = [
         ("Open", f"${first['open']:,.2f}", INK),
         ("Close", f"${last['close']:,.2f}", INK),
@@ -1746,32 +1871,74 @@ def band(fig, session: Session) -> None:
     fig.add_artist(plt.Line2D([0.045, 0.965], [0.9105, 0.9105],
                               color=AXIS, linewidth=0.8, transform=fig.transFigure))
 
-    notes = []
+    # Two lines, split by what they are ABOUT: the money on the first,
+    # the context on the second. Packed into one line they ran off the
+    # right-hand edge of the page -- a share unlock notice losing its last
+    # four words, which is exactly the kind of thing the line exists for.
+    notes: List[str] = []
+    context: List[str] = []
     # Per account, because one number hides the thing worth seeing: two
     # books running the same trade at once is double the position, and
     # the totals are the only place that shows up as arithmetic.
-    if closed:
+    if session.trades:
         books: Dict[str, float] = {}
-        for trade in closed:
+        for trade in session.trades:
+            each = marked_pnl([trade], session.day, session.prior_close,
+                              float(last["close"]))
+            if each is None:
+                each = trade.profit if trade.profit is not None else 0.0
             books[trade.account or "?"] = \
-                books.get(trade.account or "?", 0.0) + trade.profit
+                books.get(trade.account or "?", 0.0) + each
         if len(books) > 1:
             notes.append("  ·  ".join(
                 f"{name} {'+' if net >= 0 else '-'}${abs(net):,.0f}"
                 for name, net in sorted(books.items())))
+    # Both numbers, whenever they differ: the header answers "how did the
+    # account do today" and this answers "what did these trades make, from
+    # the price they were bought at". On a day that opens holding
+    # something they are not the same question and not the same number.
+    if (marked is not None and realised is not None
+            and abs(marked - realised) >= 1.0):
+        # Two reasons the numbers can part: a position carried IN, priced
+        # from the previous close, and a position carried OUT, priced to
+        # today's. A day can do either, both, or neither, and prior_close
+        # is None whenever nothing was carried in -- so it cannot simply
+        # be formatted into the sentence.
+        how = []
+        if session.prior_close is not None and any(
+                t.opened.date() != session.day for t in session.trades):
+            how.append(f"from the ${session.prior_close:,.2f} close")
+        if any(t.exit is None for t in session.trades):
+            how.append("to tonight's")
+        notes.append(f"marked {' '.join(how)}  ·  end to end "
+                     f"{'+' if realised >= 0 else '-'}${abs(realised):,.0f}"
+                     if how else
+                     f"end to end {'+' if realised >= 0 else '-'}"
+                     f"${abs(realised):,.0f}")
     if session.benchmark:
         market, market_pct = session.benchmark
-        notes.append(f"{market} {market_pct:+.2f}% over the same window")
+        context.append(f"{market} {market_pct:+.2f}% over the same window")
     unlock = lockups.headline(session.symbol, session.day) if lockups else None
     if unlock:
-        notes.append(unlock)
+        context.append(unlock)
     flight = launches.headline(session.symbol, session.day) if launches else None
     if flight:
-        notes.append(flight)
-    if notes:
-        # Below the rule, which moved down when the stats were stacked.
-        fig.text(0.045, 0.894, literal("  ·  ".join(notes)), size=8,
-                 color=INK_2)
+        context.append(flight)
+    # Below the rule, which moved down when the stats were stacked. The
+    # second line clears the charts, whose gridspec tops out at 0.870.
+    # Two rows is all there is: the charts top out at 0.870. Try smaller
+    # type before giving up, and say so out loud rather than quietly
+    # printing a page with a fact sliced off it.
+    for size in (8, 7, 6.5):
+        drawn_lines = note_lines(fig, notes, size) + \
+                      note_lines(fig, context, size)
+        if len(drawn_lines) <= 2:
+            break
+    else:
+        print(f"  header: the notes need {len(drawn_lines)} lines and there "
+              f"is room for 2; the last ones are not on the page")
+    for text, height in zip(drawn_lines, (0.8955, 0.8795)):
+        fig.text(0.045, height, literal(text), size=size, color=INK_2)
 
 
 def label_every(slots) -> int:
@@ -2533,7 +2700,11 @@ def performance_stats(trades: Sequence[Trade]) -> List[Tuple[str, str, str]]:
     net = sum(t.profit for t in done)
     wins = [t for t in done if t.profit > 0]
     best, worst = max(done, key=lambda t: t.profit), min(done, key=lambda t: t.profit)
-    stats = [("Net", money_label(net), UP if net >= 0 else DOWN),
+    # "End to end", because page one's NET P&L is marked to market and
+    # these two differ by thousands on any day that opened or closed
+    # holding something. Two unexplained totals on one report is a reader
+    # assuming one of them is a bug.
+    stats = [("Net, end to end", money_label(net), UP if net >= 0 else DOWN),
              ("Round trips", f"{len(done)}", INK),
              ("Won", f"{len(wins)} of {len(done)}"
                      f"  ({100 * len(wins) / len(done):.0f}%)", INK),
@@ -3385,7 +3556,8 @@ def self_test() -> int:
         drawings = list(drawn.texts)
         plt.close(drawn)
         texts = [t.get_text() for t in drawings]
-        tag = next((t for t in drawings if t.get_text() == "NET P&L"), None)
+        tag = next((t for t in drawings
+                    if t.get_text().startswith("NET P&L")), None)
         value = next((t for t in drawings if want in t.get_text()), None)
         if tag is None:
             failures.append(f"{label}: the header must always carry NET P&L")
@@ -3498,6 +3670,76 @@ def self_test() -> int:
             failures.append(f"an overnight round trip must be named out "
                             f"loud, said: {spoke!r}")
 
+    # Marked to market: only TODAY's move belongs to today. These are the
+    # 2 October numbers, scaled down -- 2,190 shares bought the day before
+    # at $152.79 and sold at $156.32 are +$7,728 end to end and +$17,126
+    # against the prior $148.50 close, and the gap is the loss that was
+    # already there when the previous day ended.
+    carried = Trade(opened=datetime(2026, 10, 1, 11, 7, tzinfo=ET),
+                    closed=datetime(2026, 10, 2, 10, 12, tzinfo=ET),
+                    quantity=2190, entry=152.7913, exit=156.32, account="RH")
+    held = Trade(opened=datetime(2026, 10, 2, 15, 0, tzinfo=ET), closed=None,
+                 quantity=100, entry=158.00, exit=None, account="RH")
+    friday = date(2026, 10, 2)
+
+    end_to_end = carried.profit
+    if abs(end_to_end - 7_728.0) > 5:
+        failures.append(f"end-to-end profit should be about $7,728, "
+                        f"got {end_to_end:,.2f}")
+    mark = marked_pnl([carried], friday, 148.50, 157.00)
+    if abs(mark - 17_125.80) > 1:
+        failures.append(f"marked from the $148.50 close it should be "
+                        f"$17,125.80, got {mark:,.2f}")
+
+    # A position still open moved the account and has no realised profit.
+    if marked_pnl([held], friday, 148.50, 160.00) != 200.0:
+        failures.append("an open position must be marked to today's close")
+    if held.profit is not None:
+        failures.append("an open position has no realised profit")
+
+    # Missing basis returns None rather than a number half on one
+    # convention and half on the other -- which would look fine.
+    if marked_pnl([carried], friday, None, 157.00) is not None:
+        failures.append("with no prior close, a carried position cannot be "
+                        "marked and must not silently fall back to cost")
+    if marked_pnl([held], friday, 148.50, None) is not None:
+        failures.append("with no closing price, an open position cannot be "
+                        "marked")
+    # A day that carried nothing in and nothing out needs no basis at all.
+    flat = Trade(opened=datetime(2026, 10, 2, 10, 0, tzinfo=ET),
+                 closed=datetime(2026, 10, 2, 11, 0, tzinfo=ET),
+                 quantity=100, entry=150.0, exit=151.0, account="RH")
+    if marked_pnl([flat], friday, None, None) != 100.0:
+        failures.append("a wholly intraday trade needs no marks")
+
+    # Nothing in the header may run off the page. The notes line is the
+    # one that grows without anyone deciding it should: two accounts, the
+    # mark basis, the end-to-end figure, the benchmark, a share unlock and
+    # a launch all land on it, and the overflow is invisible in code
+    # review because it only shows on a day that happens to have them all.
+    wide = plt.figure(figsize=(11.0, 8.5))
+    band(wide, Session(
+        symbol="SPCX", day=date(2026, 10, 2), minutes=bars, candles=bars,
+        vwap=pd.Series(dtype=float), baseline={}, signals=blank, macd=blank,
+        trades=[Trade(opened=datetime(2026, 10, 1, 11, 7, tzinfo=ET),
+                      closed=datetime(2026, 10, 2, 10, 12, tzinfo=ET),
+                      quantity=2190, entry=152.79, exit=156.32,
+                      account="ROBINHOOD"),
+                Trade(opened=datetime(2026, 10, 2, 9, 11, tzinfo=ET),
+                      closed=datetime(2026, 10, 2, 9, 55, tzinfo=ET),
+                      quantity=1000, entry=150.06, exit=155.91,
+                      account="IBKR")],
+        prior_close=148.50, benchmark=("SPY", 0.42)))
+    wide.canvas.draw()
+    width = wide.get_window_extent().x1
+    spill = [(t.get_text(), t.get_window_extent().x1 / width)
+             for t in wide.texts
+             if t.get_position()[1] > 0.86
+             and t.get_window_extent().x1 > width * 0.972]
+    plt.close(wide)
+    if spill:
+        failures.append(f"header text runs past the right edge: {spill}")
+
     for name, tag in (("/x/y/9-25-26_Robinhood.csv", "ROBINHOOD"),
                       ("9-25-26_IBKR.xlsx", "IBKR"),
                       ("RH.csv", "RH"),
@@ -3512,6 +3754,8 @@ def self_test() -> int:
     print("  Unmatched buy                  : an open position, not an error")
     print("  Unmatched sell                 : carried in, reported not drawn")
     print("  A position held overnight      : counted on the day it closed")
+    print("  The day's money                : marked to market, like a broker")
+    print("  Header notes                   : two lines, inside the page")
     print("  Broker headers                 : sniffed; unknown ones reported")
     print("  Spreadsheet, empty cells       : do not swallow the next columns")
     print("  IBKR rollups                   : kept; the executions dropped")
