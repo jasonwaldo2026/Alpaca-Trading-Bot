@@ -34,7 +34,7 @@ import subprocess
 import sys
 import textwrap
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -847,7 +847,7 @@ def check_ibkr_layout(path: str, rows: Sequence[Dict[str, str]]) -> bool:
     return True
 
 
-def read_ibkr(path: str, symbol: str, day: date,
+def read_ibkr(path: str, symbol: str, day: Optional[date],
               rows: Optional[Sequence[Dict[str, str]]] = None) -> List[Fill]:
     """Orders from an IBKR Trade Confirmation spreadsheet.
 
@@ -879,7 +879,7 @@ def read_ibkr(path: str, symbol: str, day: date,
             at = datetime.strptime(got["at"].strip(), "%Y-%m-%d, %H:%M:%S")
         except ValueError:
             continue
-        if at.date() != day:
+        if day is not None and at.date() != day:
             continue
         try:
             fills.append(Fill(
@@ -982,7 +982,7 @@ def resolve_clock(clocks: Sequence[str]) -> List[Optional[int]]:
 
 
 def read_robinhood(path: str, rows: Sequence[Dict[str, str]],
-                   symbol: str, day: date) -> Optional[List[Fill]]:
+                   symbol: str, day: Optional[date]) -> Optional[List[Fill]]:
     """Orders from a Robinhood activity export.
 
     Robinhood reports one row per venue fill and no order id, but every
@@ -1048,7 +1048,7 @@ def read_robinhood(path: str, rows: Sequence[Dict[str, str]],
             when = pd.to_datetime(str(row[column["day"]]).strip()).date()
         except (TypeError, ValueError):
             continue
-        if when != day:
+        if day is not None and when != day:
             continue
         if since_midnight is None:
             dropped += 1
@@ -1061,8 +1061,12 @@ def read_robinhood(path: str, rows: Sequence[Dict[str, str]],
                                .strip("()")))
         except (TypeError, ValueError):
             continue
-        at = datetime.combine(day, time(since_midnight // 60,
-                                        since_midnight % 60), tzinfo=ET)
+        # The row's OWN date, not the day being asked for. Reading the
+        # whole file at once, these differ -- and stamping every fill with
+        # the requested day would pile six days of fills onto one and pair
+        # them into round trips that never happened.
+        at = datetime.combine(when, time(since_midnight // 60,
+                                         since_midnight % 60), tzinfo=ET)
         key = (at, "buy" if side.startswith("b") else "sell")
         bucket = orders.setdefault(key, [0.0, 0.0])
         bucket[0] += quantity
@@ -1203,7 +1207,9 @@ def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
     if looks_like_ibkr(table):
         if not check_ibkr_layout(path, table):
             return []
-        return report_and_pair(path, read_ibkr(path, symbol, day, table),
+        # None, not day: the fills are paired across the whole file and
+        # the day is applied afterwards, to the round trips. See trades_on.
+        return report_and_pair(path, read_ibkr(path, symbol, None, table),
                                account, symbol, day)
 
     rows = named_rows(table)
@@ -1236,7 +1242,7 @@ def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
               f"column, which is the only thing that tells them apart.")
         return []
     if ROBINHOOD_COLUMNS["side"] in headers and ROBINHOOD_COLUMNS["symbol"] in headers:
-        fills = read_robinhood(path, rows, symbol, day)
+        fills = read_robinhood(path, rows, symbol, None)
         if fills is None:
             return []        # it already named the column it could not find
         return report_and_pair(path, fills, account, symbol, day)
@@ -1292,9 +1298,44 @@ def load_trades(path: str, symbol: str, day: date) -> List[Trade]:
     return report_and_pair(path, fills, account, symbol, day)
 
 
+def trades_on(trades: Sequence[Trade], day: date) -> List[Trade]:
+    """The round trips belonging to one day.
+
+    A round trip belongs to the day it CLOSED, which is where the money
+    was realised and how a broker reports it. Filtering the FILLS to one
+    day instead -- which is what this did -- means a position held
+    overnight has its buy on one day and its sell on the next, pairs with
+    neither, and lands in no day's total at all. On 2 October that was
+    $11,252 on 1,500 shares: larger than the whole rest of the day, and
+    announced only by a one-line note about missing cost basis.
+
+    A position still open is shown on every day it was held, with an
+    entry and no exit, because you were carrying it on each of them.
+    """
+    out: List[Trade] = []
+    for trade in trades:
+        if trade.closed is None:
+            if trade.opened.date() <= day:
+                out.append(trade)
+        elif trade.closed.date() == day:
+            out.append(trade)
+        elif trade.opened.date() <= day < trade.closed.date():
+            # Held through this day and sold later. Shown with its entry
+            # and no exit, which is what was true at this day's bell --
+            # drawing the later exit would put a sale on a page whose
+            # candles stop hours before it. Its commission belongs to the
+            # day it closed, so this copy carries none and cannot
+            # double-count.
+            out.append(replace(trade, closed=None, exit=None, commission=0.0))
+    return out
+
+
 def report_and_pair(path: str, fills: Sequence[Fill], account: str,
                     symbol: str, day: date) -> List[Trade]:
-    """Pair one account's orders, and say what could not be paired."""
+    """Pair one account's orders, and say what could not be paired.
+
+    The fills are the whole file, not one day: see trades_on.
+    """
     if not fills:
         # A file that opened and parsed cleanly but holds nothing for this
         # day is almost always last week's export under this week's name.
@@ -1307,14 +1348,28 @@ def report_and_pair(path: str, fills: Sequence[Fill], account: str,
     before = carried_in(fills)
     if before:
         print(f"  trades: {os.path.basename(path)} — {before:,.0f} share(s) "
-              f"sold today were bought before today; shown as an exit with "
-              f"no entry, because the file holds no cost basis for them")
-    trades = pair_fills(fills, account=account)
+              f"sold were bought before this file begins; shown as an exit "
+              f"with no entry, because it holds no cost basis for them")
+    trades = trades_on(pair_fills(fills, account=account), day)
+    if not trades:
+        print(f"  trades: {os.path.basename(path)} — no {symbol} round trips "
+              f"closing on {day}. Wrong file, or wrong day?")
+        return []
+    orders = len([f for f in fills if f.at.date() == day])
+    overnight = [t for t in trades
+                 if t.closed is not None and t.opened.date() != day]
     net = sum(t.profit for t in trades if t.profit is not None)
     fees = sum(t.commission for t in trades)
-    print(f"  trades: {os.path.basename(path)} — {len(fills)} order(s), "
+    print(f"  trades: {os.path.basename(path)} — {orders} order(s), "
           f"{len(trades)} round trip(s), net ${net:,.2f}"
           + (f" after ${fees:,.2f} commission" if fees else ""))
+    if overnight:
+        # Named out loud: this money was earned on a day other than the one
+        # it is counted on, which is the kind of thing to know before
+        # comparing a page against a broker's daily statement.
+        carried = sum(t.profit for t in overnight if t.profit is not None)
+        print(f"  trades: {os.path.basename(path)} — {len(overnight)} of them "
+              f"opened on an earlier day, worth ${carried:,.2f} of that total")
     return trades
 
 
@@ -1336,17 +1391,33 @@ def draw_trades(price, trades: List[Trade], slot_of: Dict, candles) -> None:
                             second=0, microsecond=0)
         return slot_of.get(slot)
 
+    left = min(slot_of.values())
     for trade in trades:
         x0 = slot_x(trade.opened)
         if x0 is None:
-            continue
+            # Bought on an earlier day. Skipping it drew nothing at all for
+            # a trade whose profit is in the header -- a page that does not
+            # add up. Pinned to the left edge instead, and marked below, so
+            # the entry does not read as having happened at the open.
+            if trade.opened.date() >= candles.index[0].date():
+                continue
+            x0, carried = left, True
+        else:
+            carried = False
         x1 = slot_x(trade.closed) if trade.closed else max(slot_of.values())
 
         price.plot([x0, x1], [trade.entry, trade.entry], color=INK,
                    linewidth=1.5, alpha=0.55, zorder=4,
                    solid_capstyle="butt")
-        price.scatter([x0], [trade.entry], marker="o", s=34, color=INK,
-                      zorder=6, edgecolors=SURFACE, linewidths=0.7)
+        # Hollow and half-size for an entry that is not on this page.
+        price.scatter([x0], [trade.entry], marker="o", s=18 if carried else 34,
+                      color=SURFACE if carried else INK,
+                      zorder=6, edgecolors=INK, linewidths=0.7)
+        if carried:
+            price.annotate("", xy=(x0, trade.entry),
+                           xytext=(x0 - (x1 - x0) * 0.04, trade.entry),
+                           arrowprops=dict(arrowstyle="-", color=INK,
+                                           alpha=0.55, linewidth=1.5))
         if trade.exit is not None and x1 is not None:
             price.plot([x1, x1], [trade.entry, trade.exit], color=INK,
                        linewidth=1.0, alpha=0.45, zorder=4)
@@ -3385,6 +3456,48 @@ def self_test() -> int:
         failures.append("a day with no closed trades must get no page")
     plt.close("all")
 
+    # A position carried overnight lands on the day it CLOSED, and its
+    # money lands SOMEWHERE. Paired day by day, the buy and the sell fell
+    # either side of the filter, matched nothing, and the profit was in
+    # neither day's total -- $11,252 of it on 2 October 2026, announced
+    # only as a one-line note about missing cost basis.
+    overnight_csv = (
+        "Trade Confirmation Report\n"
+        "Acct ID,Symbol,,,Trade Date/Time,,,,Exchange,Buy/Sell,,Quantity,,"
+        "Price,,Proceeds,Commission\n"
+        "U1,SPCX,,,\"2026-09-25, 15:50:00\",,,,-,BUY,,100,,100.00,,-10000.00,-1.00\n"
+        "U1,SPCX,,,\"2026-09-28, 09:40:00\",,,,-,SELL,,-100,,110.00,,11000.00,-1.00\n")
+    with tempfile.TemporaryDirectory() as folder:
+        where = os.path.join(folder, "IBKR.csv")
+        with open(where, "w", encoding="utf-8") as handle:
+            handle.write(overnight_csv)
+
+        monday = load_trades(where, "SPCX", date(2026, 9, 28))
+        closed = [t for t in monday if t.profit is not None]
+        if len(closed) != 1:
+            failures.append(f"the overnight round trip should close on 9/28, "
+                            f"got {len(closed)} closed trades there")
+        elif abs(closed[0].profit - 998.0) > 0.01:
+            failures.append(f"overnight profit should be $998 net of $2 "
+                            f"commission, got {closed[0].profit}")
+        elif closed[0].opened.date() != date(2026, 9, 25):
+            failures.append("the overnight trade should remember it opened "
+                            "on the 25th")
+
+        friday = load_trades(where, "SPCX", date(2026, 9, 25))
+        if any(t.profit is not None for t in friday):
+            failures.append("nothing closed on 9/25; the profit belongs to "
+                            "the day the position was sold")
+        if not any(t.profit is None for t in friday):
+            failures.append("9/25 should still show the position as open")
+
+        # And it must be SAID: money counted on a day it was not earned is
+        # the kind of thing to know before comparing against a statement.
+        spoke = said(lambda: load_trades(where, "SPCX", date(2026, 9, 28)))
+        if "opened on an earlier day" not in spoke:
+            failures.append(f"an overnight round trip must be named out "
+                            f"loud, said: {spoke!r}")
+
     for name, tag in (("/x/y/9-25-26_Robinhood.csv", "ROBINHOOD"),
                       ("9-25-26_IBKR.xlsx", "IBKR"),
                       ("RH.csv", "RH"),
@@ -3398,6 +3511,7 @@ def self_test() -> int:
     print("  Orders -> round trips          : FIFO, oldest lot closes first")
     print("  Unmatched buy                  : an open position, not an error")
     print("  Unmatched sell                 : carried in, reported not drawn")
+    print("  A position held overnight      : counted on the day it closed")
     print("  Broker headers                 : sniffed; unknown ones reported")
     print("  Spreadsheet, empty cells       : do not swallow the next columns")
     print("  IBKR rollups                   : kept; the executions dropped")
