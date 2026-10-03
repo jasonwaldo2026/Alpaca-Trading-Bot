@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import re
 import json
 import os
@@ -1755,6 +1756,29 @@ def literal(text: str) -> str:
     return text.replace("$", r"\$")
 
 
+def build_stamp() -> str:
+    """What is actually running, MEASURED from the file rather than
+    declared inside it.
+
+    An embedded version string is a thing someone has to remember to
+    bump, and the one time it is not bumped it says the wrong thing
+    confidently. Counting the lines and hashing the bytes cannot go
+    stale: the file either is the one that was sent or it is not.
+
+    This exists because three rounds were spent establishing that the
+    file on the machine was not the file that had been sent -- once by
+    reverse-engineering text coordinates out of a printed PDF, and once
+    from the exact wording of a diagnostic. Both were avoidable by
+    printing the answer.
+    """
+    try:
+        raw = open(__file__, "rb").read()
+    except (OSError, NameError):
+        return "build unknown"
+    lines = raw.count(b"\n") + (1 if raw and not raw.endswith(b"\n") else 0)
+    return f"{lines} lines  ·  {hashlib.sha256(raw).hexdigest()[:7]}"
+
+
 def note_lines(fig, segments: Sequence[str], size: float,
                left: float = 0.045, right: float = 0.965) -> List[str]:
     """Pack " · "-joined segments into lines that FIT, by measuring them.
@@ -2173,6 +2197,10 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
 
     fig = plt.figure(figsize=(11.0, 8.5))     # letter, landscape
     band(fig, session)
+    # Which build drew this, on the page itself. A printed debrief
+    # outlives the console it came from, and "is this the current one"
+    # is otherwise unanswerable from the paper in your hand.
+    fig.text(0.965, 0.018, build_stamp(), size=6, color=MUTED, ha="right")
     # Price, then volume beneath it, then MACD in its own pane -- the order
     # every charting platform uses, so the page reads the way the screen
     # does. The mood ribbon stays tucked under the candles: it is a
@@ -3740,6 +3768,23 @@ def self_test() -> int:
     if spill:
         failures.append(f"header text runs past the right edge: {spill}")
 
+    # The build stamp must be MEASURED, not declared: it is worthless if
+    # it can disagree with the file it is printed by.
+    stamp = build_stamp()
+    counted = sum(1 for _ in open(__file__, encoding="utf-8"))
+    if not stamp.startswith(f"{counted} lines"):
+        failures.append(f"the build stamp should lead with this file's own "
+                        f"{counted} lines, said {stamp!r}")
+    if stamp != build_stamp():
+        failures.append("the build stamp must be stable between calls")
+    # And it must reach the page, or it only helps whoever ran the command.
+    stamped = plt.figure(figsize=(11.0, 8.5))
+    stamped.text(0.965, 0.018, build_stamp(), size=6, ha="right")
+    on_page = [t.get_text() for t in stamped.texts]
+    plt.close(stamped)
+    if stamp not in on_page:
+        failures.append("the stamp belongs on the page as well as the console")
+
     for name, tag in (("/x/y/9-25-26_Robinhood.csv", "ROBINHOOD"),
                       ("9-25-26_IBKR.xlsx", "IBKR"),
                       ("RH.csv", "RH"),
@@ -3756,6 +3801,7 @@ def self_test() -> int:
     print("  A position held overnight      : counted on the day it closed")
     print("  The day's money                : marked to market, like a broker")
     print("  Header notes                   : two lines, inside the page")
+    print("  Build stamp                    : measured from the file, on the page")
     print("  Broker headers                 : sniffed; unknown ones reported")
     print("  Spreadsheet, empty cells       : do not swallow the next columns")
     print("  IBKR rollups                   : kept; the executions dropped")
@@ -3832,6 +3878,7 @@ def main() -> int:
 
     start, end = parse_clock(args.start), parse_clock(args.end)
 
+    print(f"daily_report  {build_stamp()}")
     print(f"Building {symbol} report for {day}...")
     session = gather(symbol, day, start, end, args.db,
                      trades_paths=find_trades(args.trades),
