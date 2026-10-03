@@ -1,0 +1,84 @@
+{
+  "_comment": [
+    "What was read at the time, drawn on the day's chart where it happened.",
+    "",
+    "The point is to compare an impression against the bars that produced",
+    "it. An impression that survives is worth building a rule on; one that",
+    "does not is worth knowing about before it costs money.",
+    "",
+    "  date  YYYY-MM-DD, the session the note belongs to",
+    "  time  HH:MM Eastern. Rounded to the drawn candle, so 13:02 and",
+    "        13:04 both ring the 13:00 bar.",
+    "  who   'jason' reads as You on the chart, anything else as Me.",
+    "  note  One sentence. It is wrapped to 30 characters and drawn beside",
+    "        the bar, so a paragraph becomes a wall.",
+    "  kind  Optional. 'in' or 'out' marks the note as a READ -- what was",
+    "        seen just before acting -- rather than an observation about",
+    "        the day. Easier than typing that field: start the note with",
+    "        'IN:' or 'OUT:' and it is set for you.",
+    "",
+    "A read is pinned to the fill it explains, within three minutes, and",
+    "an 'in' will only ever attach to an entry and an 'out' to an exit.",
+    "So the reason and the price paid for it end up as one mark.",
+    "",
+    "Why the two are kept apart: a read precedes an outcome it does not",
+    "know, so it can be scored later -- did the reads before winners say",
+    "something different from the reads before losers? An observation",
+    "written after the close already knows how it turned out. Both are",
+    "worth having. Only one is evidence.",
+    "",
+    "Which means a read written at 21:00 is worse than no read at all,",
+    "because it will feel like evidence. Miss one, leave it blank.",
+    "",
+    "Add one by adding a line. The file is read fresh on every rebuild,",
+    "and a malformed entry is skipped rather than breaking the chart.",
+    "",
+    "Nothing here is a finding. These are observations, including the",
+    "wrong ones -- deleting a note because it did not pan out would",
+    "destroy the only record of what the mistake looked like at the time."
+  ],
+  "SPCX": [
+    {
+      "date": "2026-09-25",
+      "time": "11:03",
+      "who": "jason",
+      "note": "Sell audible, but not a sell scenario - it was the bottom"
+    },
+    {
+      "date": "2026-09-25",
+      "time": "12:48",
+      "who": "claude",
+      "note": "First of 4 R&D setups. The 40-min cooldown rationed these, not the setup rate"
+    },
+    {
+      "date": "2026-09-25",
+      "time": "13:00",
+      "who": "jason",
+      "note": "Alarm 5 min late - 12:55 was the peak, this was the floor it turned from"
+    },
+    {
+      "date": "2026-09-25",
+      "time": "13:00",
+      "who": "claude",
+      "note": "Lean averages 5 min of tape, so it cannot fire at a top. Late by construction"
+    },
+    {
+      "date": "2026-09-25",
+      "time": "14:15",
+      "who": "jason",
+      "note": "Looks like a liquidity pool move to shake out emotional traders"
+    },
+    {
+      "date": "2026-09-25",
+      "time": "14:15",
+      "who": "claude",
+      "note": "5.1x volume, heaviest of the day. Low 148.10 came at 14:24, +0.47% by 15:43"
+    },
+    {
+      "date": "2026-09-25",
+      "time": "15:43",
+      "who": "claude",
+      "note": "All 6 pressure alarms today were sells, none buys. Whole visible range was 0.9%"
+    }
+  ]
+}
