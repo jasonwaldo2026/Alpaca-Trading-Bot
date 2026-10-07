@@ -146,6 +146,61 @@ def add_macd(frame: pd.DataFrame, macd: Macd) -> pd.DataFrame:
     return df
 
 
+#: Wilder's period. 14 is his original and what every platform defaults
+#: to, so a number quoted here matches a number read off the screen.
+RSI_PERIOD = 14
+
+
+def add_rsi(frame: pd.DataFrame, period: int = RSI_PERIOD) -> pd.DataFrame:
+    """Wilder's RSI, on whatever bars are handed in.
+
+    RSI asks what share of recent movement was upward: 100 means every
+    bar in the window rose, 0 means every one fell, 50 is balanced. It is
+    read as "overbought" above 70 and "oversold" below 30 -- though on
+    one-minute bars those labels mean very little, because a minute is
+    not a trend.
+
+    Wilder's smoothing, SEEDED WITH A SIMPLE MEAN of the first `period`
+    changes, then recursive. That seeding is not a detail: an exponential
+    average started from the first bar instead returns 50.66 where Wilder
+    publishes 70.53 on his own worked example -- twenty points out, on
+    an indicator read against thresholds of 30 and 70. Every charting
+    platform seeds his way, so the other form would put a number in a
+    report that disagrees with the number on the screen it describes.
+
+    Like the MACD this carries across the session boundary, so it is
+    computed before any trim and warms on pre-market bars.
+    """
+    df = frame.copy()
+    change = df["close"].diff()
+    gain = change.clip(lower=0.0).to_numpy(dtype=float)
+    loss = (-change).clip(lower=0.0).to_numpy(dtype=float)
+    n = len(df)
+    rsi = [float("nan")] * n
+    if n <= period:
+        df["rsi"] = rsi
+        return df
+
+    avg_gain = float(gain[1:period + 1].mean())
+    avg_loss = float(loss[1:period + 1].mean())
+
+    def value(up: float, down: float) -> float:
+        # No down bars in the window is RSI 100 by definition, not a
+        # divide-by-zero. NaN here would silently drop the strongest bars
+        # from every study that filters on this column.
+        if down == 0.0:
+            return 100.0 if up > 0.0 else 50.0
+        return 100.0 - 100.0 / (1.0 + up / down)
+
+    rsi[period] = value(avg_gain, avg_loss)
+    for i in range(period + 1, n):
+        avg_gain = (avg_gain * (period - 1) + gain[i]) / period
+        avg_loss = (avg_loss * (period - 1) + loss[i]) / period
+        rsi[i] = value(avg_gain, avg_loss)
+    df["rsi"] = rsi
+    return df
+
+
 def add_vwap(session: pd.DataFrame) -> pd.DataFrame:
     """Session-anchored VWAP on a frame that is already one trading day.
 
@@ -184,7 +239,7 @@ def prepare(raw: pd.DataFrame, macd: Macd) -> pd.DataFrame:
     every bar after 09:30 look like unusual volume -- turning "is this bar
     busy" into "is it the open yet".
     """
-    df = add_macd(raw, macd)
+    df = add_rsi(add_macd(raw, macd))
 
     # How many bars the MACD actually got to warm up on.
     premarket_bars = int((df.index.time < SESSION_OPEN).sum())
@@ -592,6 +647,42 @@ def self_test() -> int:
         failures.append("pre-market bars leaked into the session output")
     if not warm.attrs.get("macd_warm_at_open"):
         failures.append("60 pre-market bars should be enough to warm a 9/17/6 MACD")
+
+    # RSI, pinned against Wilder's own worked example. The seeding is the
+    # whole test: an exponential average started from the first bar gives
+    # 50.66 here instead of 70.53 -- twenty points out, on an indicator
+    # read against thresholds of 30 and 70, and it would have shipped
+    # looking perfectly reasonable.
+    wilder = [44.34, 44.09, 44.15, 43.61, 44.33, 44.83, 45.10, 45.42, 45.84,
+              46.08, 45.89, 46.03, 45.61, 46.28, 46.28, 46.00, 46.03, 46.41,
+              46.22, 45.64]
+    rsi = add_rsi(pd.DataFrame({"close": wilder}))["rsi"]
+    for rsi_bar, published in ((14, 70.53), (19, 57.97)):
+        rsi_got = float(rsi.iloc[rsi_bar])
+        if abs(rsi_got - published) > 0.1:
+            failures.append(f"RSI bar {rsi_bar} should match Wilder's "
+                            f"{published}, got {rsi_got:.2f}")
+    if rsi.iloc[:RSI_PERIOD].notna().any():
+        failures.append(f"RSI needs {RSI_PERIOD} changes before it means "
+                        f"anything and must be NaN until then")
+    # A window with no down bars is RSI 100 by definition. Returned as NaN
+    # it would silently drop the strongest bars from any study filtering
+    # on this column -- the signals most worth looking at.
+    # Distinct names: self_test is one long function and `closes` further
+    # down is the fixture every later check is built from. Reusing it here
+    # silently rebuilt those fixtures at the wrong length.
+    for rsi_case, rsi_closes, rsi_want in (
+            ("every bar up", [10.0 + i for i in range(30)], 100.0),
+            ("every bar down", [40.0 - i for i in range(30)], 0.0),
+            ("perfectly flat", [10.0] * 30, 50.0)):
+        rsi_got = float(add_rsi(pd.DataFrame({"close": rsi_closes}))["rsi"].iloc[-1])
+        if abs(rsi_got - rsi_want) > 0.01:
+            failures.append(f"RSI on {rsi_case} should be {rsi_want}, got {rsi_got}")
+    # And it must reach the session frame, or no study can filter on it.
+    if "rsi" not in warm:
+        failures.append("prepare() must carry an rsi column")
+    elif warm["rsi"].isna().all():
+        failures.append("rsi reached the session frame as all-NaN")
 
     # The volume baseline must ignore pre-market, or every bar looks busy.
     # The rolling average needs a full window, so the Nth session bar is the

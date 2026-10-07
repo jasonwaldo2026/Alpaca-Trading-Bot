@@ -62,6 +62,7 @@ from feed_check import (
     CONDITIONS,
     DEFAULT_MACD,
     ET,
+    SESSION_CLOSE,
     SESSION_OPEN,
     Macd,
     add_conditions,
@@ -281,7 +282,8 @@ def score(trades: Sequence[Trade]) -> Dict[str, float]:
 # Signal outcomes
 # --------------------------------------------------------------------------
 
-def signal_outcomes(session: pd.DataFrame, entries: Sequence[int]) -> List[dict]:
+def signal_outcomes(session: pd.DataFrame, entries: Sequence[int],
+                    market: Optional[pd.Series] = None) -> List[dict]:
     """For each signal: how far price went each way, and where it ended up.
 
     MFE is the best price reached before the trade would have been closed;
@@ -296,6 +298,11 @@ def signal_outcomes(session: pd.DataFrame, entries: Sequence[int]) -> List[dict]
     index = session.index
     n = len(session)
     rows = []
+    # The day's range SO FAR, bar by bar. Not the whole day's range: that
+    # is not known at the signal, and a filter built on it would score
+    # itself with tomorrow's newspaper.
+    run_high = pd.Series(highs).cummax().to_numpy()
+    run_low = pd.Series(lows).cummin().to_numpy()
 
     for i in entries:
         fill = i + 1
@@ -307,14 +314,24 @@ def signal_outcomes(session: pd.DataFrame, entries: Sequence[int]) -> List[dict]
             outcome maths below does not need."""
             return float(session[column].iloc[i]) if column in session else default
 
+        span = float(run_high[i] - run_low[i])
         row = {
             "time": index[i],
             "entry_time": index[fill],
             "entry": entry,
             "macd": at("macd"),
+            "rsi": at("rsi"),
             "volume_ratio": at("volume_ratio"),
             "above_vwap": (bool(session["close"].iloc[i] > session["vwap"].iloc[i])
                            if "vwap" in session else None),
+            # 0.0 at the low of the day so far, 1.0 at the high.
+            "range_pos": (float(closes[i] - run_low[i]) / span
+                          if span > 1e-9 else float("nan")),
+            # The market's move so far TODAY, as of this bar -- never the
+            # day's close, which the signal cannot see.
+            "market_pct": (float(market.iloc[i])
+                           if market is not None and i < len(market)
+                           else float("nan")),
         }
         for minutes in HORIZONS_MIN:
             end = min(fill + minutes, n - 1)
@@ -743,6 +760,138 @@ def beat_the_control(sessions: Dict[date, pd.DataFrame],
     return beat, cells, best
 
 
+#: What stands in for "the market". SPY is the S&P 500, which is the
+#: index quoted on the news and the one a trader means by "the market".
+BENCHMARK_SYMBOL = "SPY"
+
+#: Stricter than the alert's own volume gate, which is the point: the gate
+#: is already in the signal, so repeating it would measure nothing.
+HEAVY_VOLUME = 2.0
+
+#: The filters, FIXED IN ADVANCE and deliberately few.
+#:
+#: Five, not fifty. With nothing real to find, trying 5 ideas at the usual
+#: 1-in-20 threshold gives a 23% chance one looks good anyway; 36 gives
+#: 84%. The existing bracket grid already spent 36 tries, which is why its
+#: best cell is quoted beside a control rather than on its own.
+#:
+#: Every one is evaluable AT THE SIGNAL BAR. Nothing here may read the
+#: day's close, its full range, or anything else the clock has not reached
+#: -- a filter scored with tomorrow's newspaper always works.
+#:
+#: Four of the five carry information the MACD cannot see. RSI is the
+#: exception and is included knowing that: it is another momentum average
+#: of the same closing prices, so it is expected to add least.
+FILTER_SPECS = (
+    ("market up",
+     "the market is higher than its own open, as of this bar",
+     lambda f: f["market_pct"] > 0.0),
+    ("low in the day's range",
+     "price in the bottom half of the range so far",
+     lambda f: f["range_pos"] < 0.5),
+    ("above VWAP",
+     "price above the session VWAP",
+     lambda f: f["above_vwap"] == True),      # noqa: E712 -- None must not pass
+    ("heavy volume",
+     f"volume at least {HEAVY_VOLUME:.1f}x the recent average",
+     lambda f: f["volume_ratio"] >= HEAVY_VOLUME),
+    ("RSI below 50",
+     "not already stretched upward",
+     lambda f: f["rsi"] < 50.0),
+)
+
+
+#: What counts as the signal having worked. One hour, finishing up at all.
+#: A proportion, so noise_floor() applies to it directly.
+FILTER_HORIZON = 60
+
+
+def market_moves(symbol: str, sessions: Dict[date, pd.DataFrame],
+                 feed: str = "sip") -> Dict[date, pd.Series]:
+    """The market's move from its OWN open, aligned bar for bar.
+
+    From the open rather than the previous close, because this has to be
+    knowable at the signal: at 10:14 you can see what the market has done
+    since the bell, and that is the number a decision could actually use.
+
+    Forward-filled onto the stock's index, since the two do not trade the
+    same minutes -- a thin minute in SPCX has no bar, and the market's
+    last known move is the right answer for it rather than a gap.
+
+    A day that fails to fetch is simply absent, and the filter reports no
+    data for it. Losing the market series must not cost the other four.
+    """
+    out: Dict[date, pd.Series] = {}
+    for day, session in sessions.items():
+        try:
+            raw = fetch_extended(symbol, day, feed)
+        except Exception:  # noqa: BLE001 -- one filter, not the study
+            continue
+        if raw.empty:
+            continue
+        bars = raw[(raw.index.time >= SESSION_OPEN)
+                   & (raw.index.time < SESSION_CLOSE)]
+        if bars.empty:
+            continue
+        opened = float(bars["open"].iloc[0])
+        if not opened:
+            continue
+        moved = 100.0 * (bars["close"] - opened) / opened
+        out[day] = moved.reindex(session.index, method="ffill")
+    return out
+
+
+def filtered_rate(frame: pd.DataFrame, passes: pd.Series) -> Tuple[int, float]:
+    """How many signals passed the filter, and what share of them finished up."""
+    kept = frame[passes.fillna(False)]
+    column = f"ret_{FILTER_HORIZON}"
+    kept = kept[kept[column].notna()]
+    if kept.empty:
+        return 0, float("nan")
+    return len(kept), 100.0 * float((kept[column] > 0).mean())
+
+
+def filter_study(signals: pd.DataFrame, control: pd.DataFrame,
+                 days: Sequence[date]) -> List[dict]:
+    """Each pre-registered filter, nominated on the older half of the
+    history and confirmed on the newer half.
+
+    The split is the whole design. A filter chosen because it worked will
+    always look good on the data that chose it; the only question worth
+    asking is whether it still looks good on days it never saw. So the
+    older half may nominate and nothing more, and the newer half decides.
+
+    Every filter is scored against the SAME filter applied to random
+    entries. Without that, "the market is up" would win every time by
+    measuring drift: a rising market lifts the stock, so long trades make
+    money on green days whether or not the signal had anything to do with
+    it. The control subtracts that away and leaves only the part the
+    signal can claim.
+    """
+    if not days:
+        return []
+    cut = days[len(days) // 2]
+    halves = (("nominate", lambda f: f["date"] < cut),
+              ("confirm", lambda f: f["date"] >= cut))
+
+    out = []
+    for name, description, predicate in FILTER_SPECS:
+        row = {"filter": name, "what": description}
+        for half, pick in halves:
+            sig = signals[pick(signals)] if not signals.empty else signals
+            ctl = control[pick(control)] if not control.empty else control
+            n, rate = filtered_rate(sig, predicate(sig)) if not sig.empty else (0, float("nan"))
+            cn, crate = filtered_rate(ctl, predicate(ctl)) if not ctl.empty else (0, float("nan"))
+            row[f"{half}_n"] = n
+            row[f"{half}_rate"] = rate
+            row[f"{half}_control_n"] = cn
+            row[f"{half}_control"] = crate
+            row[f"{half}_edge"] = rate - crate
+            row[f"{half}_floor"] = noise_floor(n)
+        out.append(row)
+    return out
+
+
 def winners(outcomes: pd.DataFrame) -> pd.DataFrame:
     """Signals that finished up an hour later -- the ones a stop must not
     have thrown away."""
@@ -810,7 +959,8 @@ def effective_n(weights: Sequence[float]) -> float:
 
 
 def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
-           setup: str = "") -> pd.DataFrame:
+           setup: str = "",
+           markets: Optional[Dict[date, pd.Series]] = None) -> pd.DataFrame:
     rule = "=" * 76
     days = sorted(sessions)
     total_bars = sum(len(s) for s in sessions.values())
@@ -871,7 +1021,8 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
     for day, session in sessions.items():
         entries = [i for i in range(len(session)) if bool(session["alert"].iloc[i])]
         signals_per_day.append(len(entries))
-        for row in signal_outcomes(session, entries):
+        for row in signal_outcomes(session, entries,
+                                   (markets or {}).get(day)):
             row["date"] = day
             all_rows.append(row)
 
@@ -1701,6 +1852,84 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
         print("   as a feeling, and is an argument for not being at the")
         print("   screen at 09:31 rather than for more willpower at 09:31.")
 
+
+    # ---- 16. filters on the signal --------------------------------------
+    print(f"\n{rule}")
+    print("16. DOES ANY FILTER MAKE THE SIGNAL WORTH TAKING?")
+    print(rule)
+    print(f"\n   Five filters, fixed before looking. Each asks whether a MACD")
+    print(f"   signal that ALSO passes it finishes higher {FILTER_HORIZON} minutes later")
+    print("   more often than random entry under the SAME filter.")
+    print("\n   The control is the whole point. A rising market lifts the stock,")
+    print("   so long trades make money on green days whether or not the signal")
+    print("   had anything to do with it. Subtracting a matched control leaves")
+    print("   only the part the signal can claim.")
+    print("\n   The older half may NOMINATE. Only the newer half, which never")
+    print("   chose anything, may CONFIRM.")
+
+    control_rows: List[dict] = []
+    for day, session in sessions.items():
+        stride = list(range(0, len(session) - 1, BASELINE_STRIDE))
+        for row in signal_outcomes(session, stride, (markets or {}).get(day)):
+            row["date"] = day
+            control_rows.append(row)
+    control = pd.DataFrame(control_rows)
+
+    table = filter_study(outcomes, control, days)
+    if not table:
+        print("\n   No sessions. Nothing to measure.")
+    else:
+        cut = days[len(days) // 2]
+        print(f"\n   nominate: {days[0]:%d %b} to {cut:%d %b}        "
+              f"confirm: {cut:%d %b} to {days[-1]:%d %b}\n")
+        for half in ("nominate", "confirm"):
+            print(f"   {half.upper()}")
+            print(f"   {'filter':<24}{'signals':>8}{'up':>7}{'control':>9}"
+                  f"{'edge':>8}{'noise':>8}   verdict")
+            for row in table:
+                n = row[f"{half}_n"]
+                if not n:
+                    # Same column widths as a real row, or the eye reads the
+                    # verdict against the wrong heading.
+                    print(f"   {row['filter']:<24}{'--':>8}{'--':>7}{'--':>9}"
+                          f"{'--':>8}{'--':>8}   no data")
+                    continue
+                edge, floor = row[f"{half}_edge"], row[f"{half}_floor"]
+                # Two standard errors, because one is a coin landing the way
+                # coins land. Anything inside the band is not a result.
+                verdict = ("beats control" if edge > 2 * floor
+                           else "worse" if edge < -2 * floor else "noise")
+                print(f"   {row['filter']:<24}{n:>8,}{row[f'{half}_rate']:>6.0f}%"
+                      f"{row[f'{half}_control']:>8.0f}%{edge:>+7.1f}"
+                      f"{floor:>7.1f}   {verdict}")
+            print()
+
+        survived = [r["filter"] for r in table
+                    if r["nominate_n"] and r["confirm_n"]
+                    and r["nominate_edge"] > 2 * r["nominate_floor"]
+                    and r["confirm_edge"] > 2 * r["confirm_floor"]]
+        nominated = [r["filter"] for r in table
+                     if r["nominate_n"] and r["nominate_edge"] > 2 * r["nominate_floor"]]
+        print(f"   Nominated by the older half: "
+              f"{', '.join(nominated) if nominated else 'none'}")
+        print(f"   Still standing on the newer half: "
+              f"{', '.join(survived) if survived else 'NONE'}")
+        if not survived:
+            print("\n   That is the honest outcome and the likeliest one. The")
+            print("   crossover did not beat a coin flip on its own across 90")
+            print("   days, and a filter cannot add information the price")
+            print("   series does not contain. A filter that nominated and")
+            print("   then failed is the split doing its job -- it would have")
+            print("   looked like a finding without it.")
+        else:
+            print("\n   Survived the split. That is worth more than any single")
+            print("   number above, and still is not proof: five filters means")
+            print("   roughly a 1-in-4 chance one clears a 1-in-20 bar by luck,")
+            print("   and the confirm half is one sample, not a law. Treat it")
+            print("   as the next thing to watch rather than the next thing")
+            print("   to trade.")
+
+
     return outcomes
 
 
@@ -1725,6 +1954,93 @@ def _session(closes, highs=None, lows=None, volumes=None, first=SESSION_OPEN):
 def self_test() -> int:
     print("Self-test: checking the swing, bracket and outcome logic...\n")
     failures = []
+
+    # THE CONTROL IS THE WHOLE SECTION-16 DESIGN, so it gets the hardest
+    # fixture: days where the market and the stock rise together, and days
+    # where both fall, with signals placed by the CLOCK and correlated with
+    # nothing. "Market up" then looks like a perfect filter -- every signal
+    # on those days finishes higher -- and it is worth nothing, because
+    # random entry on the same days does exactly as well. If the control
+    # ever stops subtracting that, this file starts manufacturing findings.
+    drift_sessions, drift_markets = {}, {}
+    for n in range(8):
+        rising = n % 2 == 0
+        step = 0.05 if rising else -0.05
+        when = date(2026, 9, 1) + timedelta(days=n)
+        prices = [100.0 + step * i for i in range(120)]
+        frame = _session(prices)
+        frame.index = pd.DatetimeIndex(
+            [datetime.combine(when, SESSION_OPEN, tzinfo=ET) + timedelta(minutes=i)
+             for i in range(120)])
+        # A real running average, not close itself: close == vwap makes
+        # "above VWAP" false on every bar and the filter matches nothing.
+        frame["vwap"] = frame["close"].expanding().mean()
+        frame["rsi"] = 60.0 if rising else 40.0
+        # Heavy on the rising days only, so this filter ALSO selects
+        # nothing but drift -- a second, independent chance for the
+        # control to fail to subtract it.
+        frame["volume_ratio"] = 3.0 if rising else 1.0
+        drift_sessions[when] = frame
+        drift_markets[when] = pd.Series(
+            [(1.0 if rising else -1.0)] * 120, index=frame.index)
+
+    drift_days = sorted(drift_sessions)
+    sig_rows, ctl_rows = [], []
+    for when in drift_days:
+        frame = drift_sessions[when]
+        for row in signal_outcomes(frame, [20, 40, 60], drift_markets[when]):
+            row["date"] = when
+            sig_rows.append(row)
+        stride = list(range(0, len(frame) - 1, BASELINE_STRIDE))
+        for row in signal_outcomes(frame, stride, drift_markets[when]):
+            row["date"] = when
+            ctl_rows.append(row)
+
+    drift_table = filter_study(pd.DataFrame(sig_rows), pd.DataFrame(ctl_rows),
+                               drift_days)
+    for drift_filter in ("market up", "heavy volume"):
+        row = next((r for r in drift_table if r["filter"] == drift_filter), None)
+        if row is None:
+            failures.append(f"{drift_filter} vanished from the table")
+            continue
+        for half in ("nominate", "confirm"):
+            rate, control = row[f"{half}_rate"], row[f"{half}_control"]
+            if not row[f"{half}_n"]:
+                failures.append(f"{drift_filter}/{half}: matched nothing; the "
+                                f"fixture is built so it should match the "
+                                f"rising days")
+            elif not (rate > 80.0):
+                failures.append(f"{drift_filter}/{half}: every signal on a "
+                                f"rising day wins by construction; got "
+                                f"{rate:.0f}%")
+            elif abs(rate - control) > 10.0:
+                failures.append(
+                    f"{drift_filter}/{half}: a filter that only selects rising "
+                    f"days must show NO edge over random entry on those same "
+                    f"days -- signal {rate:.0f}% vs control {control:.0f}%. "
+                    f"The control has stopped subtracting drift, and this file "
+                    f"is now manufacturing findings.")
+
+    # No look-ahead. The range position at a bar may only know the range up
+    # to that bar; a spike at the very end must not reach backwards.
+    spike = _session([100.0] * 60 + [100.0] * 59 + [200.0])
+    early = signal_outcomes(spike, [30])
+    if early and early[0]["range_pos"] == early[0]["range_pos"]:   # not NaN
+        if early[0]["range_pos"] > 1.0 or early[0]["range_pos"] < 0.0:
+            failures.append("range position must stay inside the range it knows")
+    late = signal_outcomes(spike, [118])
+    if late and late[0]["range_pos"] > 0.5:
+        failures.append("a bar before the spike must not see the spike in its "
+                        "own range position")
+
+    # The split must actually split, or "confirm" is just the same data
+    # wearing a different label.
+    for row in drift_table:
+        if row["nominate_n"] == 0 and row["confirm_n"] == 0:
+            failures.append(f"{row['filter']} matched nothing in either half")
+        if row["nominate_n"] and row["confirm_n"] == 0:
+            failures.append(f"{row['filter']} landed everything in the half "
+                            f"that may only nominate")
 
     # A clean triangle: up 10%, down 10%. One high, one low.
     closes = [100 + i for i in range(11)] + [110 - i for i in range(1, 11)]
@@ -1931,6 +2247,10 @@ def self_test() -> int:
     print("  Cut that misses the recovery   : reads worse than having waited")
     print("  An entry never underwater      : one outcome, not four")
     print(f"  Entries spaced by the clock    : no closer than {RECOVERY_EVERY} min")
+    print("  RSI                            : Wilder's, in core, pinned to his table")
+    print("  Filter vs matched control      : drift subtracted, not called an edge")
+    print("  Range position                 : knows only the bars before it")
+    print("  Nominate / confirm             : the split actually splits")
 
 
     # --- section 14: the open ---------------------------------------------
@@ -2157,6 +2477,10 @@ def main() -> int:
                              "so it has no out-of-sample past; this tests the "
                              "reason the idea was proposed, not the stock. "
                              f"Default set: {','.join(CROSS_SYMBOLS)}")
+    parser.add_argument("--market", default=BENCHMARK_SYMBOL,
+                        help=f"Symbol for the market filter in section 16 "
+                             f"(default {BENCHMARK_SYMBOL}). Empty string to "
+                             f"skip it and save a fetch per day.")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -2251,7 +2575,20 @@ def main() -> int:
 
     setup = ("volume condition OFF" if not require_volume else "volume condition on")
     setup += f" · signals from {earliest:%H:%M}"
-    outcomes = report(symbol, macd, sessions, setup)
+    markets: Dict[date, pd.Series] = {}
+    if args.market:
+        print(f"Fetching {args.market} for the market filter...")
+        markets = market_moves(args.market.upper(), sessions)
+        got = len(markets)
+        if got < len(sessions):
+            # Said out loud: a partly-fetched market series makes one filter
+            # quietly thinner than the other four, and a thinner sample has
+            # a higher noise floor. Better to know which number is weaker.
+            print(f"  {args.market.upper()}: {got} of {len(sessions)} days "
+                  f"({len(sessions) - got} missing; that filter is scored on "
+                  f"the days it has)")
+
+    outcomes = report(symbol, macd, sessions, setup, markets)
 
     if not outcomes.empty:
         path = args.csv or f"{symbol}_signals_{days[0]:%Y%m%d}_{days[-1]:%Y%m%d}.csv"
