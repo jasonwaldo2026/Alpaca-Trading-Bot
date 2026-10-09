@@ -699,6 +699,11 @@ class Alarms:
     volume: float = ALARM_VOLUME
     percent: float = MOVE_PERCENT
     minutes: int = MOVE_MINUTES
+    #: Ring on run-ups only, and stay silent on the way down. For a day
+    #: spent out of the position watching for a reason to come back: a
+    #: decline is not news when you are already flat, and an alarm that
+    #: rings for both is an alarm you start ignoring.
+    up_only: bool = False
     fired: Dict[str, datetime] = field(default_factory=dict)
     above_vwap: Optional[bool] = None
     recent: List[Tuple[datetime, float]] = field(default_factory=list)
@@ -731,6 +736,8 @@ class Alarms:
         if not then:
             return None
         percent = 100.0 * (candle.close - then) / then
+        if self.up_only and percent <= 0:
+            return None
         if abs(percent) < self.percent:
             return None
         return ("buy" if percent > 0 else "sell", percent,
@@ -1271,7 +1278,9 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
              buy_sound: str = SOUND_BUY,
              sell_sound: str = SOUND_SELL,
              move_percent: float = MOVE_PERCENT,
-             move_minutes: int = MOVE_MINUTES) -> int:
+             move_minutes: int = MOVE_MINUTES,
+             alarm_volume: float = ALARM_VOLUME,
+             up_only: bool = False) -> int:
     """Follow the session: full detail early, then only the unusual."""
     today = datetime.now(ET).date()
     window_start = datetime.combine(today, start, tzinfo=ET)
@@ -1327,7 +1336,8 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
     # Once a session, not once an alert. It only moves overnight, and a
     # per-message fetch would put a network call between a spike and the
     # phone. None is survivable: the day's move is the line that goes.
-    alarms = Alarms(percent=move_percent, minutes=move_minutes)
+    alarms = Alarms(percent=move_percent, minutes=move_minutes,
+                    volume=alarm_volume, up_only=up_only)
     prev_close = previous_close(symbol, today)
     # The benchmark's own yesterday, fetched once. If either half is
     # missing the market line is simply absent -- it is context, and no
@@ -1836,6 +1846,28 @@ def self_test() -> int:
     if not rang or rang[0] != "sell":
         failures.append(f"a slide arriving in small steps still has to ring: {rang}")
 
+    # --up-only: a day spent flat, watching for a reason to come back in.
+    # The same slide that must ring above has to stay SILENT here, and a
+    # run-up of the same size still has to ring. If the direction test ever
+    # inverts, the alarm goes quiet on exactly the move it was turned on
+    # for and says nothing about it.
+    for up_only, want_slide, want_rise in ((False, "sell", "buy"),
+                                           (True, None, "buy")):
+        for size, want in ((-0.0015, want_slide), (+0.0015, want_rise)):
+            alarm = Alarms(up_only=up_only)
+            fired = None
+            for minute in range(6):
+                bar, lean, dctx, when = reading(
+                    0.50, 2.0, price=150.5 * (1 + size * minute),
+                    at_minute=30 + minute)
+                fired = fired or alarm.reason(bar, lean, dctx)
+            got = fired[0] if fired else None
+            if got != want:
+                way = "a run-up" if size > 0 else "a slide"
+                failures.append(
+                    f"up_only={up_only}: {way} should give {want!r}, got "
+                    f"{got!r}")
+
     # ...but only while it is inside the window.
     stale = Alarms()
     bar, lean, dctx, when = reading(0.50, 2.0, price=150.5, at_minute=0)
@@ -2039,6 +2071,15 @@ def main() -> int:
                              f"(default {MOVE_PERCENT}%%). Tune it with "
                              f"--replay against a past session rather than "
                              f"by ear")
+    parser.add_argument("--up-only", action="store_true",
+                        help="Ring on run-ups only; stay silent on declines. "
+                             "For a day spent flat, watching for a reason to "
+                             "come back in.")
+    parser.add_argument("--alarm-volume", type=float, default=ALARM_VOLUME,
+                        help=f"Volume the move must ALSO carry to ring "
+                             f"(default {ALARM_VOLUME}x the recent average). "
+                             f"Set 1.0 to ring on the price move alone -- a "
+                             f"quiet grind upward never reaches the default.")
     parser.add_argument("--move-minutes", type=int, default=MOVE_MINUTES,
                         metavar="MIN",
                         help=f"The window that move has to happen inside "
@@ -2097,7 +2138,8 @@ def main() -> int:
     return run_live(symbol, start, end, args.dry_run, db, args.push_empty,
                     args.volume_alert, args.pdf_every, args.db, detail,
                     args.buy_sound, args.sell_sound,
-                    args.move_percent, args.move_minutes)
+                    args.move_percent, args.move_minutes,
+                    args.alarm_volume, args.up_only)
 
 
 if __name__ == "__main__":
