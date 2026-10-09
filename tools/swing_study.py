@@ -1,0 +1,2884 @@
+"""
+SPCX swing study: is this worth day trading, and with what bracket?
+
+Pulls 30 trading days of 1-minute bars from Alpaca's full SIP tape (free
+historically, as long as the request ends 15+ minutes ago) and answers
+four questions, in the order they matter:
+
+  1. SWINGS    How often does it move, and how far? A stock that drifts
+               0.2% a day cannot pay for a 1% target, however good the
+               signal is.
+
+  2. CLOCK     When do the moves happen? If everything is over by 10:30,
+               the afternoon is not worth watching.
+
+  3. SIGNALS   After each buy signal, what did price actually do? How far
+               it went the right way before going the wrong way (MFE) and
+               vice versa (MAE) is what sizes a stop and a target.
+
+  4. BRACKETS  Every stop/target pair scored on real bars -- including
+               the 1%/2% you planned -- against a baseline of entering at
+               random. A bracket that wins on signals but wins just as
+               often on random entries means the signal added nothing.
+
+READ-ONLY. Market-data client only, inherited from feed_check. There is
+no trading client anywhere in these files.
+
+Why it imports from feed_check
+------------------------------
+The MACD, VWAP, volume and buy-condition code lives in feed_check.py and
+is imported, never copied. If this study measured signals computed one
+way and the live alert fired on signals computed another, the numbers
+here would not describe the thing you actually trade -- and nothing would
+catch the drift. Keep both files in the same folder.
+
+Usage
+-----
+    python swing_study.py                  # 30 days, MACD 9,17,6
+    python swing_study.py --days 60
+    python swing_study.py --macd 12,26,9
+    python swing_study.py --symbol AAPL
+    python swing_study.py --self-test      # verify the math, no network
+
+Setup
+-----
+    pip install alpaca-py pandas python-dotenv
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import pandas as pd
+
+try:
+    import lockups
+except ImportError:            # noqa: F401 -- the calendar is a convenience
+    lockups = None             # a study is still a study without unlock dates
+from feed_check import (
+    CONDITIONS,
+    DEFAULT_MACD,
+    ET,
+    SESSION_CLOSE,
+    SESSION_OPEN,
+    Macd,
+    add_conditions,
+    efficiency,
+    fetch_extended,
+    parse_clock,
+    prepare,
+    trading_days,
+)
+
+# Swing sizes to report. One threshold would hide the answer: a 0.25%
+# zigzag finds noise on a trending day, a 1% zigzag finds nothing on a
+# quiet one. Three tells you which scale this stock actually moves at.
+SWING_THRESHOLDS_PCT = (0.25, 0.5, 1.0)
+
+# Stop and target grids for the bracket search, in percent.
+STOP_GRID = (0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
+TARGET_GRID = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
+
+# Minutes after entry at which to record where price got to.
+HORIZONS_MIN = (15, 30, 60)
+
+# An edge smaller than this is noise, not a strategy. A round trip on a
+# $155 stock costs roughly a cent or two of spread even commission-free,
+# so an edge of a few thousandths of a percent per trade buys nothing.
+MIN_EDGE_PCT = 0.05
+
+#: Below this a cell is not scored at all. Twenty trades is already thin;
+#: fewer is a number with no business being compared to anything.
+MIN_TRADES = 20
+
+# The baseline samples every Nth bar rather than all 390. Entering at
+# every minute of 30 days is ~11,700 trades per grid cell, which is slow
+# and no more informative than a fifth of them.
+BASELINE_STRIDE = 5
+
+# Candidate trading windows, for the time-of-day section. SPCX moves
+# roughly three times as much per bar at the open as it does at 14:00,
+# while the signal fires at a flat rate all day -- so most alerts arrive
+# when there is least to act on. These ask whether that is worth gating.
+GATE_WINDOWS = (
+    ("09:40-11:00", ((time(9, 40), time(11, 0)),)),
+    ("09:40-10:30", ((time(9, 40), time(10, 30)),)),
+    ("15:00-16:00", ((time(15, 0), time(16, 0)),)),
+    ("09:40-11:00 + 15:00-16:00", ((time(9, 40), time(11, 0)),
+                                   (time(15, 0), time(16, 0)))),
+    ("all day (now)", ((time(0, 0), time(23, 59)),)),
+)
+
+# --------------------------------------------------------------------------
+# The pre-registered VWAP hypothesis
+# --------------------------------------------------------------------------
+# Written down on 24 September 2026, BEFORE being tested on anything but
+# the sample that produced it. In the 12 Jun - 22 Sep window, morning
+# signals firing above VWAP showed a best-case/worst-case ratio of 1.67
+# and finished higher an hour later 58% of the time, against 0.79 and 48%
+# for those below. That is one of four cells examined, on 108
+# observations, about 1.7 standard errors from a coin flip -- the same
+# shape as a 54% figure that had already fooled this project once.
+#
+# So the rule is fixed here and not adjusted afterwards. A day on or
+# after HYPOTHESIS_FROM is in-sample: the idea was found there and it is
+# expected to look good, which proves nothing. A day before it has never
+# been examined, and is the only place the question can actually be
+# answered. Run with --days large enough to reach back past the cutoff.
+HYPOTHESIS_FROM = date(2026, 6, 12)
+HYPOTHESIS_WINDOW = (time(9, 40), time(11, 0))
+HYPOTHESIS_BRACKET = (0.75, 2.00)
+
+# SPCX listed on 12 June 2026, so its whole history IS the sample the VWAP
+# idea came from and no earlier days exist to test on -- not "hard to get",
+# none. The forward test starts today and takes months.
+#
+# Meanwhile the argument for the idea was never SPCX-specific: VWAP is a
+# line institutions are measured against, so it is a place where behaviour
+# changes. If that is true it should show somewhere else. These are liquid
+# names with years of history, and the POOLED row is the answer -- testing
+# six symbols is six chances at a false positive, and the best of six
+# always looks better than it is.
+CROSS_SYMBOLS = ("AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "AMD")
+
+# The gate sections score ONE bracket, fixed in advance, rather than
+# searching the grid again inside each window. Searching 36 cells per
+# window would hand back the best of 180 tries and call it a finding --
+# and with this many windows something always looks good. This is the
+# bracket Jason planned to trade, scored the same way every time.
+GATE_BRACKET = (1.0, 2.0)
+
+
+# --------------------------------------------------------------------------
+# Swings
+# --------------------------------------------------------------------------
+
+def find_swings(high: Sequence[float], low: Sequence[float], pct: float):
+    """Percentage zigzag: the alternating highs and lows of a session.
+
+    A high is only confirmed once price has fallen `pct` from it, so a
+    pivot is never declared from information the moment itself did not
+    have. Returns [(index, price, "H" | "L")], oldest first.
+    """
+    n = len(high)
+    if n < 2:
+        return []
+    threshold = pct / 100.0
+    pivots: List[Tuple[int, float, str]] = []
+    trend = 0                      # +1 = seeking a high, -1 = seeking a low
+    hi_i, hi_p = 0, high[0]
+    lo_i, lo_p = 0, low[0]
+
+    for i in range(1, n):
+        if high[i] > hi_p:
+            hi_i, hi_p = i, high[i]
+        if low[i] < lo_p:
+            lo_i, lo_p = i, low[i]
+
+        if trend >= 0 and low[i] <= hi_p * (1 - threshold):
+            pivots.append((hi_i, hi_p, "H"))
+            trend = -1
+            lo_i, lo_p = i, low[i]
+        elif trend <= 0 and high[i] >= lo_p * (1 + threshold):
+            pivots.append((lo_i, lo_p, "L"))
+            trend = 1
+            hi_i, hi_p = i, high[i]
+
+    return pivots
+
+
+def swing_legs(pivots) -> Tuple[List[float], List[float]]:
+    """Run-ups (low to high) and pullbacks (high to low), each in percent."""
+    run_ups, pullbacks = [], []
+    for (_, p_from, kind), (_, p_to, _) in zip(pivots, pivots[1:]):
+        move = 100.0 * (p_to - p_from) / p_from
+        (run_ups if kind == "L" else pullbacks).append(abs(move))
+    return run_ups, pullbacks
+
+
+# --------------------------------------------------------------------------
+# Bracket simulation
+# --------------------------------------------------------------------------
+
+@dataclass
+class Trade:
+    entry_index: int
+    entry_price: float
+    outcome: str        # "target", "stop" or "time"
+    return_pct: float
+    bars_held: int
+
+
+def simulate(session: pd.DataFrame, entries: Sequence[int],
+             stop_pct: float, target_pct: float) -> List[Trade]:
+    """Run one bracket over one session.
+
+    A signal on bar i fills at bar i+1's OPEN -- never at the close of the
+    bar that produced it, which would be trading on information the moment
+    did not have.
+
+    When a single bar touches both the stop and the target, the stop is
+    taken. A 1-minute bar records a high and a low but not their order, so
+    the outcome is genuinely unknown; assuming the worse of the two keeps
+    the result pessimistic, and a backtest that flatters itself is worse
+    than useless.
+
+    Anything still open at 16:00 is closed there. This is day trading; no
+    position is carried overnight.
+    """
+    opens = session["open"].to_numpy()
+    highs = session["high"].to_numpy()
+    lows = session["low"].to_numpy()
+    closes = session["close"].to_numpy()
+    n = len(session)
+    trades: List[Trade] = []
+
+    for i in entries:
+        fill = i + 1
+        if fill >= n:
+            continue
+        entry = float(opens[fill])
+        stop = entry * (1 - stop_pct / 100.0)
+        target = entry * (1 + target_pct / 100.0)
+
+        outcome, exit_price, held = "time", float(closes[n - 1]), n - 1 - fill
+        for j in range(fill, n):
+            if lows[j] <= stop:
+                outcome, exit_price, held = "stop", stop, j - fill
+                break
+            if highs[j] >= target:
+                outcome, exit_price, held = "target", target, j - fill
+                break
+
+        trades.append(Trade(
+            entry_index=i,
+            entry_price=entry,
+            outcome=outcome,
+            return_pct=100.0 * (exit_price - entry) / entry,
+            bars_held=held,
+        ))
+    return trades
+
+
+def score(trades: Sequence[Trade]) -> Dict[str, float]:
+    """Win rate and average return per trade -- the number that matters."""
+    if not trades:
+        return {"n": 0, "win_pct": 0.0, "avg_return": 0.0,
+                "target_pct": 0.0, "stop_pct": 0.0, "median_bars": 0.0}
+    returns = [t.return_pct for t in trades]
+    return {
+        "n": len(trades),
+        "win_pct": 100.0 * sum(r > 0 for r in returns) / len(returns),
+        "avg_return": sum(returns) / len(returns),
+        "target_pct": 100.0 * sum(t.outcome == "target" for t in trades) / len(trades),
+        "stop_pct": 100.0 * sum(t.outcome == "stop" for t in trades) / len(trades),
+        "median_bars": float(pd.Series([t.bars_held for t in trades]).median()),
+    }
+
+
+# --------------------------------------------------------------------------
+# Signal outcomes
+# --------------------------------------------------------------------------
+
+def signal_outcomes(session: pd.DataFrame, entries: Sequence[int],
+                    market: Optional[pd.Series] = None) -> List[dict]:
+    """For each signal: how far price went each way, and where it ended up.
+
+    MFE is the best price reached before the trade would have been closed;
+    MAE the worst. They are what a stop and a target should be sized
+    from -- a target beyond the typical MFE rarely fills, and a stop
+    inside the typical MAE is hit on trades that would have worked.
+    """
+    opens = session["open"].to_numpy()
+    highs = session["high"].to_numpy()
+    lows = session["low"].to_numpy()
+    closes = session["close"].to_numpy()
+    index = session.index
+    n = len(session)
+    rows = []
+    # The day's range SO FAR, bar by bar. Not the whole day's range: that
+    # is not known at the signal, and a filter built on it would score
+    # itself with tomorrow's newspaper.
+    run_high = pd.Series(highs).cummax().to_numpy()
+    run_low = pd.Series(lows).cummin().to_numpy()
+
+    for i in entries:
+        fill = i + 1
+        if fill >= n:
+            continue
+        entry = float(opens[fill])
+        def at(column, default=float("nan")):
+            """Context for the CSV. Absent on a bare OHLCV frame, which the
+            outcome maths below does not need."""
+            return float(session[column].iloc[i]) if column in session else default
+
+        span = float(run_high[i] - run_low[i])
+        row = {
+            "time": index[i],
+            "entry_time": index[fill],
+            "entry": entry,
+            "macd": at("macd"),
+            "rsi": at("rsi"),
+            "volume_ratio": at("volume_ratio"),
+            "above_vwap": (bool(session["close"].iloc[i] > session["vwap"].iloc[i])
+                           if "vwap" in session else None),
+            # 0.0 at the low of the day so far, 1.0 at the high.
+            "range_pos": (float(closes[i] - run_low[i]) / span
+                          if span > 1e-9 else float("nan")),
+            # The market's move so far TODAY, as of this bar -- never the
+            # day's close, which the signal cannot see.
+            "market_pct": (float(market.iloc[i])
+                           if market is not None and i < len(market)
+                           else float("nan")),
+        }
+        for minutes in HORIZONS_MIN:
+            end = min(fill + minutes, n - 1)
+            window_hi = float(highs[fill:end + 1].max())
+            window_lo = float(lows[fill:end + 1].min())
+            row[f"mfe_{minutes}"] = 100.0 * (window_hi - entry) / entry
+            row[f"mae_{minutes}"] = 100.0 * (window_lo - entry) / entry
+            row[f"ret_{minutes}"] = 100.0 * (float(closes[end]) - entry) / entry
+        rows.append(row)
+    return rows
+
+
+# --------------------------------------------------------------------------
+# Report
+# --------------------------------------------------------------------------
+
+def pct(values, q: float) -> float:
+    return float(pd.Series(values).quantile(q)) if len(values) else float("nan")
+
+
+#: How much of the winners' adverse excursion a stop should cover. 88%
+#: is where 0.75% landed on the first 90 days; the number is reported
+#: rather than assumed, so a changed regime shows up as a changed stop.
+STOP_COVERS = 0.88
+
+#: Half-lives to report, in sessions. Short enough to catch a regime
+#: change, long enough that the effective sample is still worth reading.
+HALF_LIVES = (30, 20, 10)
+
+#: A winner is a signal that finished at least this far up an hour later.
+#: The stop is sized on what those trades needed, not on every signal:
+#: the all-signal median is dominated by losers and gives a stop wide
+#: enough to be useless.
+WINNER_PCT = 0.5
+
+
+# The live alarm's own thresholds, imported rather than copied. A test
+# that used different numbers would not be testing the alarm.
+try:
+    from open_candles import (
+        ALARM_VOLUME, PRESSING_HIGH, PRESSING_LOW, PRESSURE_MINUTES,
+    )
+except ImportError:      # the study still runs without the watcher present
+    ALARM_VOLUME, PRESSING_LOW, PRESSING_HIGH, PRESSURE_MINUTES = 1.5, 0.30, 0.70, 5
+
+
+#: The set-up Jason trades, staged. The bullish cross must happen with
+#: the MACD BELOW zero -- a turn beginning from a decline, while the
+#: chart still looks weak -- and the zero line must then be taken within
+#: this many bars or the set-up is stale. Thirty minutes is long enough
+#: for a turn to develop on 1-minute bars and short enough that a cross
+#: two hours later is plainly a different move.
+ZERO_CROSS_WINDOW_BARS = 30
+
+#: Bars of widening histogram that count as "diverging". Two running,
+#: the same as the live alert's condition (c) -- a second definition of
+#: the same word is how a study stops describing the thing it fires on.
+DIVERGENCE_BARS = 2
+
+
+def below_zero_setups(session: pd.DataFrame,
+                      window: int = ZERO_CROSS_WINDOW_BARS,
+                      ) -> List[Tuple[int, Optional[int], Optional[int]]]:
+    """Stage the below-zero MACD turn: the cross, the divergence, the zero line.
+
+    One tuple per bullish cross that happened below zero:
+    ``(cross, diverged, zero)``, where the later two are None if the
+    set-up died before reaching them.
+
+    A set-up dies the moment the MACD falls back below its signal line.
+    The turn did not hold, and whatever the indicator does afterwards
+    belongs to some other set-up rather than this one.
+
+    NOTHING HERE LOOKS FORWARD FROM AN ENTRY. The stages are recorded so
+    the follow-through rate can be reported, and a caller must not use
+    "it went on to cross zero" to pick an entry at the earlier bar: that
+    bar did not know. The two entries scored in section 12 are each
+    taken at the stage that defines them, on every set-up that reached
+    it, including the ones that then failed.
+    """
+    needed = ("macd", "macd_signal", "macd_gap")
+    if any(column not in session for column in needed):
+        return []
+
+    macd = session["macd"].astype(float)
+    signal = session["macd_signal"].astype(float)
+    gap = session["macd_gap"].astype(float)
+    above = (macd > signal).fillna(False)
+    widening = (gap > gap.shift(1)).fillna(False)
+    n = len(session)
+
+    setups: List[Tuple[int, Optional[int], Optional[int]]] = []
+    for i in range(1, n):
+        if not (bool(above.iloc[i]) and not bool(above.iloc[i - 1])):
+            continue
+        if not macd.iloc[i] < 0:           # NaN while warming up is not a cross
+            continue
+
+        diverged: Optional[int] = None
+        zero: Optional[int] = None
+        run = 0
+        for j in range(i + 1, min(i + 1 + window, n)):
+            if not bool(above.iloc[j]):
+                break                      # rolled back over; set-up is dead
+            run = run + 1 if bool(widening.iloc[j]) else 0
+            if diverged is None and run >= DIVERGENCE_BARS:
+                diverged = j
+            if macd.iloc[j] >= 0:
+                zero = j
+                break
+        setups.append((i, diverged, zero))
+    return setups
+
+
+#: Where the opening range ends. The first fifteen minutes is the stretch
+#: that bounces hardest and the stretch Jason says should not be traded.
+OPENING_RANGE_END = time(9, 45)
+
+#: Where price is read after the open. The last is the regular close.
+OPEN_HORIZONS = (time(10, 0), time(10, 30), time(11, 0), time(12, 0),
+                 time(16, 0))
+
+
+def price_at(session: pd.DataFrame, when: time) -> Optional[float]:
+    """Close of the last bar at or before `when`.
+
+    At or BEFORE, rather than the bar exactly on it: Alpaca builds bars
+    from trades, so a minute nobody traded in has no bar at all, and a
+    lookup that insisted on 10:00:00 would silently drop the quiet days
+    -- which are not a random subset of days.
+    """
+    upto = session[session.index.time <= when]
+    return float(upto["close"].iloc[-1]) if len(upto) else None
+
+
+def opening_rows(sessions: Dict[date, pd.DataFrame]) -> pd.DataFrame:
+    """One row per day: how it opened, and what happened afterwards.
+
+    Two definitions of "how it opened", because they are different
+    events and a claim about one is not a claim about the other:
+
+      gap    yesterday's 16:00 close -> today's 09:30 open. Nothing
+             trades in between; this is the overnight repricing.
+      range  09:30 open -> 09:45. This is the bouncing Jason describes,
+             and it is a thing that happened during the session.
+
+    What follows is measured from the END of whichever window defined
+    the direction -- from the open for the gap, from 09:45 for the
+    range. Overlap would make part of the "reversal" arithmetic: a
+    window that contains its own definition must move against it
+    sometimes for no reason other than mean reversion within the bar.
+
+    The first day is dropped, since it has no previous close.
+    """
+    days = sorted(sessions)
+    rows: List[dict] = []
+    for previous, day in zip(days, days[1:]):
+        session, before = sessions[day], sessions[previous]
+        prior = price_at(before, time(16, 0))
+        regular = session[session.index.time >= SESSION_OPEN]
+        if not prior or regular.empty:
+            continue
+        opened = float(regular["open"].iloc[0])
+        quarter = price_at(session, OPENING_RANGE_END)
+        if not opened or quarter is None:
+            continue
+        row = {"day": day,
+               "gap": 100.0 * (opened - prior) / prior,
+               "range": 100.0 * (quarter - opened) / opened}
+        for horizon in OPEN_HORIZONS:
+            later = price_at(session, horizon)
+            tag = f"{horizon:%H%M}"
+            row[f"gap_{tag}"] = (None if later is None
+                                 else 100.0 * (later - opened) / opened)
+            row[f"range_{tag}"] = (
+                None if later is None or horizon <= OPENING_RANGE_END
+                else 100.0 * (later - quarter) / quarter)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+#: Section 15. ONE setting, fixed before it sees the data. A grid over
+#: cut and step would return the best of however many pairs were tried,
+#: which is the thing this file exists to avoid.
+#:
+#: 0.50% is the same distance the phone alarm now rings at, and close to
+#: the typical loss actually taken: the five worst round trips of 25-30
+#: September ran -2,420 to -3,149 on roughly 2,400 shares near $150,
+#: which is 0.67% to 0.87%.
+RECOVERY_CUT, RECOVERY_STEP = 0.50, 0.25
+
+#: Entries every quarter hour rather than where a signal fired, for the
+#: same reason the control enters every fifth bar: the question is what
+#: the EXIT RULE does, and picking entries by a rule would measure the
+#: entries instead. Stopping at 15:00 leaves an hour for the path to play
+#: out, so the comparison is not mostly "ran out of day".
+RECOVERY_EVERY = 15
+RECOVERY_FROM, RECOVERY_UNTIL = time(9, 45), time(15, 0)
+
+#: The four ways out, in the order they are reported.
+RECOVERY_PATHS = ("hold to the close", "hold for break-even",
+                  "cut and stay out", "cut and get back in")
+
+
+def recovery_paths(closes: Sequence[float], start: int,
+                   cut: float = RECOVERY_CUT,
+                   step: float = RECOVERY_STEP) -> Dict[str, float]:
+    """Four ways out of ONE entry, each as a percent of the entry price.
+
+    The question: when a position goes against you, is it better to hold
+    until it comes back, or to take the loss, get back in lower, and be
+    ahead by the difference when it returns?
+
+    The arithmetic of the second one is not in doubt. Cut at C, re-enter
+    at R below it, and when price reaches the original entry E again you
+    have realised (C - E) and gained (E - R), for a net (C - R) -- which
+    is positive, always, by construction. What is in doubt is how often
+    you GET that: price has to fall the extra step to let you back in,
+    and then come back. When it cuts you out and recovers without ever
+    offering the re-entry, you have taken the loss and missed the
+    recovery, and that is the case this measures.
+
+    Both "break-even" paths exit at the ORIGINAL entry price, because
+    that is what waiting to get out flat means. Nothing looks past the
+    bar it is standing on.
+    """
+    if start >= len(closes) - 1:
+        return {}
+    entry = closes[start]
+    if entry <= 0:
+        return {}
+    later = list(closes[start + 1:])
+    close_out = 100.0 * (later[-1] - entry) / entry
+    # Waiting to get out flat only means anything once you are DOWN. An
+    # entry that never went against you was never waiting for anything,
+    # and scoring it as a break-even exit would park every winner at 0.00%
+    # and quietly drag this path's average toward zero.
+    under = next((i for i, p in enumerate(later) if p < entry), None)
+    out = {"hold to the close": close_out}
+    out["hold for break-even"] = (
+        close_out if under is None
+        else (0.0 if any(p >= entry for p in later[under + 1:]) else close_out))
+
+    floor = entry * (1.0 - cut / 100.0)
+    cut_at = next((i for i, p in enumerate(later) if p <= floor), None)
+    if cut_at is None:                       # never went against you that far
+        out["cut and stay out"] = out["cut and get back in"] = close_out
+        return out
+    taken = 100.0 * (later[cut_at] - entry) / entry
+    out["cut and stay out"] = taken
+
+    rest = later[cut_at + 1:]
+    back = entry * (1.0 - (cut + step) / 100.0)
+    again = next((i for i, p in enumerate(rest) if p <= back), None)
+    if again is None or again >= len(rest) - 1:
+        out["cut and get back in"] = taken     # never offered the re-entry
+        return out
+    second = rest[again]
+    after = rest[again + 1:]
+    regained = (entry if any(p >= entry for p in after) else after[-1])
+    out["cut and get back in"] = taken + 100.0 * (regained - second) / entry
+    return out
+
+
+def recovery_rows(sessions: Dict[date, pd.DataFrame],
+                  cut: float = RECOVERY_CUT,
+                  step: float = RECOVERY_STEP) -> pd.DataFrame:
+    """Every quarter-hourly entry, scored four ways."""
+    rows = []
+    for day, session in sorted(sessions.items()):
+        window = session[(session.index.time >= RECOVERY_FROM)
+                         & (session.index.time <= RECOVERY_UNTIL)]
+        if window.empty:
+            continue
+        closes = [float(v) for v in session["close"]]
+        stamps = list(session.index)
+        last = None
+        for i, stamp in enumerate(stamps):
+            if not (RECOVERY_FROM <= stamp.time() <= RECOVERY_UNTIL):
+                continue
+            if last is not None and (stamp - last).total_seconds() / 60 < RECOVERY_EVERY:
+                continue
+            paths = recovery_paths(closes, i, cut, step)
+            if not paths:
+                continue
+            last = stamp
+            rows.append({"day": day, "at": stamp, **paths})
+    return pd.DataFrame(rows)
+
+
+def noise_floor(n: int) -> float:
+    """One standard error on a coin flip, in percentage points.
+
+    Printed beside every rate in section 14 because the whole section is
+    a set of proportions on thin buckets, and 55% of 45 days is not a
+    finding -- it is a coin landing the way coins land.
+    """
+    return 100.0 * (0.25 / n) ** 0.5 if n else 0.0
+
+
+def slot_volume(sessions: Dict[date, pd.DataFrame]) -> Dict[time, float]:
+    """The usual volume for each clock minute, across these sessions.
+
+    Per clock slot, never a rolling average of the day. 09:35 and 14:35
+    are different animals, and a rolling baseline turns "is this bar
+    busy" into "is it the morning" -- the same reason the live watcher
+    builds its baseline this way.
+    """
+    buckets: Dict[time, List[float]] = {}
+    for session in sessions.values():
+        for stamp, volume in session["volume"].items():
+            buckets.setdefault(stamp.time(), []).append(float(volume))
+    return {slot: float(pd.Series(v).median()) for slot, v in buckets.items()}
+
+
+def lean_series(session: pd.DataFrame,
+                window: int = PRESSURE_MINUTES) -> pd.Series:
+    """Volume-weighted close position over a rolling window, 0 to 1.
+
+    The same reading the alerts name in words: where in each bar's range
+    the close landed, weighted by how much traded in it. A bar with no
+    range has no opinion and counts as the middle.
+    """
+    # .where, not .replace(0, pd.NA): pd.NA turns a float column into an
+    # object one, and .rolling() then refuses it. A minute with no range
+    # is ordinary in thin pre-market, so this path is not exotic -- it is
+    # most mornings.
+    span = (session["high"] - session["low"]).astype(float)
+    position = ((session["close"] - session["low"]).astype(float)
+                / span.where(span > 0)).fillna(0.5)
+    volume = session["volume"].astype(float)
+    weighted = (position * volume).rolling(window).sum()
+    total = volume.rolling(window).sum()
+    return (weighted / total.where(total > 0)).fillna(0.5)
+
+
+def loud(session: pd.DataFrame, usual: Dict[time, float],
+         window: int = PRESSURE_MINUTES,
+         multiple: float = ALARM_VOLUME) -> pd.Series:
+    """Was the last `window` bars' volume unusual for that time of day?"""
+    expected = pd.Series(
+        [sum(usual.get(t.time(), 0.0) for t in session.index[max(0, i - window + 1):i + 1])
+         for i in range(len(session))], index=session.index)
+    got = session["volume"].astype(float).rolling(window).sum()
+    return (got / expected.where(expected > 0)).fillna(0.0) >= multiple
+
+
+def lean_entries(session: pd.DataFrame, usual: Dict[time, float],
+                 window: int = PRESSURE_MINUTES) -> List[int]:
+    """Where the live alarm would ring on the buy side: the tape leaning
+    past the pressing band with real volume behind it."""
+    lean = lean_series(session, window)
+    hot = loud(session, usual)
+    return [i for i in range(len(session))
+            if lean.iloc[i] >= PRESSING_HIGH and bool(hot.iloc[i])]
+
+
+def sell_entries(session: pd.DataFrame, usual: Dict[time, float],
+                 window: int = PRESSURE_MINUTES) -> List[int]:
+    """Where the live alarm rings on the SELL side -- scored here as a BUY.
+
+    Section 11 left this out by assumption, not by measurement: "a
+    sell-side trigger is an exit rather than an entry and cannot be
+    scored this way". That is only true if the alarm marks the start of
+    a decline. It may mark the end of one.
+
+    The lean is a volume-weighted average of where price closed in its
+    range over the last `window` minutes. It is a description of selling
+    that has ALREADY happened, so it cannot fire at a top -- nothing
+    bearish has occurred there yet. It fires when the selling is at its
+    heaviest, which is either the middle of a slide or its exhaustion.
+    Which of those it usually is, is the question this scores.
+
+    Long-only, so if it marks exhaustion it marks an entry.
+    """
+    lean = lean_series(session, window)
+    hot = loud(session, usual)
+    return [i for i in range(len(session))
+            if lean.iloc[i] <= PRESSING_LOW and bool(hot.iloc[i])]
+
+
+def vwap_entries(session: pd.DataFrame, usual: Dict[time, float]) -> List[int]:
+    """Where price crosses above VWAP on the same volume condition."""
+    if "vwap" not in session:
+        return []
+    above = session["close"] >= session["vwap"]
+    hot = loud(session, usual)
+    return [i for i in range(1, len(session))
+            if bool(above.iloc[i]) and not bool(above.iloc[i - 1])
+            and bool(hot.iloc[i])]
+
+
+def beat_the_control(sessions: Dict[date, pd.DataFrame],
+                     picked: Dict[date, List[int]]):
+    """How many stop/target pairs beat entering every fifth bar regardless.
+
+    The count is the measurement. Any one cell can win on a thin sample
+    by accident; an edge that depends on the levels is not an edge, so a
+    real one shows up across most of the grid.
+
+    Takes entries already chosen rather than a picker, because they do
+    not depend on the bracket. Choosing them inside the grid meant doing
+    it 36 times per session -- unnoticeable for a lookup on an "alert"
+    column, minutes of silence for a trigger that has to compute a
+    rolling lean and a per-slot volume baseline first.
+    """
+    control = {day: list(range(0, len(session) - 1, BASELINE_STRIDE))
+               for day, session in sessions.items()}
+
+    beat, cells, best = 0, 0, None
+    for stop_pct in STOP_GRID:
+        for target_pct in TARGET_GRID:
+            sig, base = [], []
+            for day, session in sessions.items():
+                sig += simulate(session, picked[day], stop_pct, target_pct)
+                base += simulate(session, control[day], stop_pct, target_pct)
+            ss, bs = score(sig), score(base)
+            if ss["n"] < MIN_TRADES or bs["n"] < MIN_TRADES:
+                continue
+            cells += 1
+            edge = ss["avg_return"] - bs["avg_return"]
+            if edge > 0:
+                beat += 1
+            if best is None or edge > best[0]:
+                best = (edge, stop_pct, target_pct, ss, bs)
+    return beat, cells, best
+
+
+#: What stands in for "the market". SPY is the S&P 500, which is the
+#: index quoted on the news and the one a trader means by "the market".
+BENCHMARK_SYMBOL = "SPY"
+
+#: Stricter than the alert's own volume gate, which is the point: the gate
+#: is already in the signal, so repeating it would measure nothing.
+HEAVY_VOLUME = 2.0
+
+#: The filters, FIXED IN ADVANCE and deliberately few.
+#:
+#: Five, not fifty. With nothing real to find, trying 5 ideas at the usual
+#: 1-in-20 threshold gives a 23% chance one looks good anyway; 36 gives
+#: 84%. The existing bracket grid already spent 36 tries, which is why its
+#: best cell is quoted beside a control rather than on its own.
+#:
+#: Every one is evaluable AT THE SIGNAL BAR. Nothing here may read the
+#: day's close, its full range, or anything else the clock has not reached
+#: -- a filter scored with tomorrow's newspaper always works.
+#:
+#: Four of the five carry information the MACD cannot see. RSI is the
+#: exception and is included knowing that: it is another momentum average
+#: of the same closing prices, so it is expected to add least.
+FILTER_SPECS = (
+    ("market up",
+     "the market is higher than its own open, as of this bar",
+     lambda f: f["market_pct"] > 0.0),
+    ("low in the day's range",
+     "price in the bottom half of the range so far",
+     lambda f: f["range_pos"] < 0.5),
+    ("above VWAP",
+     "price above the session VWAP",
+     lambda f: f["above_vwap"] == True),      # noqa: E712 -- None must not pass
+    ("heavy volume",
+     f"volume at least {HEAVY_VOLUME:.1f}x the recent average",
+     lambda f: f["volume_ratio"] >= HEAVY_VOLUME),
+    ("RSI below 50",
+     "not already stretched upward",
+     lambda f: f["rsi"] < 50.0),
+)
+
+
+#: What counts as the signal having worked. One hour, finishing up at all.
+#: A proportion, so noise_floor() applies to it directly.
+FILTER_HORIZON = 60
+
+
+def market_moves(symbol: str, sessions: Dict[date, pd.DataFrame],
+                 feed: str = "sip") -> Dict[date, pd.Series]:
+    """The market's move from its OWN open, aligned bar for bar.
+
+    From the open rather than the previous close, because this has to be
+    knowable at the signal: at 10:14 you can see what the market has done
+    since the bell, and that is the number a decision could actually use.
+
+    Forward-filled onto the stock's index, since the two do not trade the
+    same minutes -- a thin minute in SPCX has no bar, and the market's
+    last known move is the right answer for it rather than a gap.
+
+    A day that fails to fetch is simply absent, and the filter reports no
+    data for it. Losing the market series must not cost the other four.
+    """
+    out: Dict[date, pd.Series] = {}
+    for day, session in sessions.items():
+        try:
+            raw = fetch_extended(symbol, day, feed)
+        except Exception:  # noqa: BLE001 -- one filter, not the study
+            continue
+        if raw.empty:
+            continue
+        bars = raw[(raw.index.time >= SESSION_OPEN)
+                   & (raw.index.time < SESSION_CLOSE)]
+        if bars.empty:
+            continue
+        opened = float(bars["open"].iloc[0])
+        if not opened:
+            continue
+        moved = 100.0 * (bars["close"] - opened) / opened
+        out[day] = moved.reindex(session.index, method="ffill")
+    return out
+
+
+def filtered_rate(frame: pd.DataFrame, passes: pd.Series) -> Tuple[int, float]:
+    """How many signals passed the filter, and what share of them finished up."""
+    kept = frame[passes.fillna(False)]
+    column = f"ret_{FILTER_HORIZON}"
+    kept = kept[kept[column].notna()]
+    if kept.empty:
+        return 0, float("nan")
+    return len(kept), 100.0 * float((kept[column] > 0).mean())
+
+
+def filter_study(signals: pd.DataFrame, control: pd.DataFrame,
+                 days: Sequence[date]) -> List[dict]:
+    """Each pre-registered filter, nominated on the older half of the
+    history and confirmed on the newer half.
+
+    The split is the whole design. A filter chosen because it worked will
+    always look good on the data that chose it; the only question worth
+    asking is whether it still looks good on days it never saw. So the
+    older half may nominate and nothing more, and the newer half decides.
+
+    Every filter is scored against the SAME filter applied to random
+    entries. Without that, "the market is up" would win every time by
+    measuring drift: a rising market lifts the stock, so long trades make
+    money on green days whether or not the signal had anything to do with
+    it. The control subtracts that away and leaves only the part the
+    signal can claim.
+    """
+    if not days:
+        return []
+    cut = days[len(days) // 2]
+    halves = (("nominate", lambda f: f["date"] < cut),
+              ("confirm", lambda f: f["date"] >= cut))
+
+    out = []
+    for name, description, predicate in FILTER_SPECS:
+        row = {"filter": name, "what": description}
+        for half, pick in halves:
+            sig = signals[pick(signals)] if not signals.empty else signals
+            ctl = control[pick(control)] if not control.empty else control
+            n, rate = filtered_rate(sig, predicate(sig)) if not sig.empty else (0, float("nan"))
+            cn, crate = filtered_rate(ctl, predicate(ctl)) if not ctl.empty else (0, float("nan"))
+            row[f"{half}_n"] = n
+            row[f"{half}_rate"] = rate
+            row[f"{half}_control_n"] = cn
+            row[f"{half}_control"] = crate
+            row[f"{half}_edge"] = rate - crate
+            row[f"{half}_floor"] = noise_floor(n)
+        out.append(row)
+    return out
+
+
+#: The morning window the character of a day is judged from. It has to
+#: END while there is still a day left to act on: a measure taken at the
+#: close describes a day you have already traded.
+CHOP_WINDOW = (time(9, 30), time(10, 30))
+
+#: Days are sorted by morning efficiency and the bottom third called
+#: choppy. A fraction rather than a fixed number because efficiency is
+#: not comparable between stocks or eras, and -- this is the part that
+#: matters -- a tercile of the EFFICIENCY column never looks at what the
+#: afternoon did. A threshold tuned against outcomes would be the
+#: heavy-volume row all over again.
+CHOP_FRACTION = 1.0 / 3.0
+
+
+def morning_shape(session: pd.DataFrame) -> Tuple[float, float]:
+    """(efficiency, net move %) over the morning window.
+
+    Both, never efficiency alone. A straight-line collapse is exactly as
+    EFFICIENT as a straight-line rally -- the measure is directionless by
+    construction -- so a bucket built on it without the sign would file
+    the worst mornings of the quarter under "clean trend".
+    """
+    lo, hi = CHOP_WINDOW
+    window = session[(session.index.time >= lo) & (session.index.time < hi)]
+    if len(window) < 2:
+        return float("nan"), float("nan")
+    closes = window["close"].to_numpy()
+    first = float(closes[0])
+    if not first:
+        return float("nan"), float("nan")
+    return efficiency(closes), 100.0 * (float(closes[-1]) - first) / first
+
+
+def day_shapes(sessions: Dict[date, pd.DataFrame]) -> Dict[date, str]:
+    """Each day labelled from its morning alone: choppy, up or down.
+
+    The label is assigned from the EFFICIENCY ordering and the sign of
+    the move, and from nothing else. No outcome of the afternoon reaches
+    this function, which is what lets the afternoon be the test.
+    """
+    shape: Dict[date, Tuple[float, float]] = {}
+    for day, session in sessions.items():
+        eff, move = morning_shape(session)
+        if eff == eff:                      # not NaN
+            shape[day] = (eff, move)
+    if not shape:
+        return {}
+    ranked = sorted(shape, key=lambda d: shape[d][0])
+    cut = max(1, int(len(ranked) * CHOP_FRACTION))
+    choppy = set(ranked[:cut])
+    return {day: ("choppy" if day in choppy
+                  else "trending up" if move > 0 else "trending down")
+            for day, (eff, move) in shape.items()}
+
+
+def clustered_error(rows: pd.DataFrame, column: str) -> float:
+    """Standard error of a hit rate whose entries SHARE DAYS.
+
+    noise_floor() assumes every entry is an independent coin flip. These
+    are not: 330 entries drawn every fifth bar from 5 sessions are five
+    price paths sampled 66 times each, and an afternoon that drifts up
+    makes almost all of its entries win together.
+
+    Treating them as independent claims +/-2.8 points where the honest
+    figure is nearer +/-22. On a fixture whose afternoons were pure
+    random walks that gap reported "choppy mornings are BETTER" at +8.0
+    points -- a finding conjured out of nothing but the wrong denominator.
+
+    So the rate is computed per DAY and the error taken across days. The
+    day is the unit the question is actually about: "is today worth
+    trading" has one answer per day, not sixty-six.
+    """
+    if rows.empty or "date" not in rows:
+        return float("nan")
+    per_day = rows.groupby("date")[column].apply(
+        lambda v: 100.0 * float((v > 0).mean()))
+    if len(per_day) < 2:
+        return float("nan")
+    return float(per_day.std(ddof=1) / (len(per_day) ** 0.5))
+
+
+def afternoon_rows(sessions: Dict[date, pd.DataFrame],
+                   shapes: Dict[date, str]) -> pd.DataFrame:
+    """Random long entries AFTER the morning window, tagged with the
+    shape the morning had already taken.
+
+    Random entry rather than signal entry on purpose. The question is
+    whether the STOCK is harder to trade once a morning has chopped --
+    a property of the day, not of any indicator. Scoring a signal here
+    would answer a different question and confound the two.
+    """
+    _, hi = CHOP_WINDOW
+    rows: List[dict] = []
+    for day, session in sessions.items():
+        shape = shapes.get(day)
+        if shape is None:
+            continue
+        after = [i for i in range(len(session) - 1)
+                 if session.index[i].time() >= hi]
+        if not after:
+            continue
+        stride = after[::BASELINE_STRIDE]
+        for row in signal_outcomes(session, stride):
+            row["date"] = day
+            row["shape"] = shape
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def winners(outcomes: pd.DataFrame) -> pd.DataFrame:
+    """Signals that finished up an hour later -- the ones a stop must not
+    have thrown away."""
+    if outcomes.empty or "ret_60" not in outcomes:
+        return outcomes.iloc[0:0]
+    return outcomes[outcomes["ret_60"] >= WINNER_PCT]
+
+
+def stop_for(rows: pd.DataFrame, covers: float = STOP_COVERS,
+             weights: Optional[pd.Series] = None) -> Optional[float]:
+    """The stop distance that would have kept `covers` of these winners.
+
+    Their MAE is negative, so the quantile is taken on its magnitude:
+    cover 88% of them and the stop is wide enough that only the worst
+    12% were shaken out.
+    """
+    if rows.empty or "mae_60" not in rows:
+        return None
+    dips = rows["mae_60"].abs()
+    if weights is None:
+        return float(dips.quantile(covers))
+    return weighted_quantile(dips, weights.loc[dips.index], covers)
+
+
+def weighted_quantile(values: pd.Series, weights: pd.Series,
+                      q: float) -> Optional[float]:
+    """A quantile where some observations count more than others.
+
+    Sort, walk the cumulative weight, and take the first value at which
+    it passes q. No interpolation: with an effective sample this small,
+    interpolating between two points would be precision the data has not
+    earned.
+    """
+    frame = pd.DataFrame({"v": values, "w": weights}).dropna().sort_values("v")
+    total = frame["w"].sum()
+    if not len(frame) or total <= 0:
+        return None
+    running = frame["w"].cumsum() / total
+    hit = frame.loc[running >= q, "v"]
+    return float(hit.iloc[0]) if len(hit) else float(frame["v"].iloc[-1])
+
+
+def recency_weights(days: Sequence[date], half_life: float) -> Dict[date, float]:
+    """Exponential weights: the newest session counts 1, and a session
+    `half_life` sessions older counts half as much.
+
+    This adds no information -- it discards some. With a 90-session
+    history a 20-session half-life leaves an effective sample near 30,
+    and small samples in this project have a record of flattering
+    themselves. It exists to be compared against the unweighted answer,
+    not to replace it.
+    """
+    order = sorted(days)
+    newest = len(order) - 1
+    return {day: 0.5 ** ((newest - i) / half_life)
+            for i, day in enumerate(order)}
+
+
+def effective_n(weights: Sequence[float]) -> float:
+    """Kish's effective sample size: how many equally-weighted
+    observations this weighting is really worth."""
+    total = sum(weights)
+    squares = sum(w * w for w in weights)
+    return (total * total / squares) if squares else 0.0
+
+
+def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
+           setup: str = "",
+           markets: Optional[Dict[date, pd.Series]] = None) -> pd.DataFrame:
+    rule = "=" * 76
+    days = sorted(sessions)
+    total_bars = sum(len(s) for s in sessions.values())
+    print(f"\n{rule}\n  {symbol}  swing study  --  {len(days)} sessions, "
+          f"{days[0]:%Y-%m-%d} to {days[-1]:%Y-%m-%d}, MACD {macd}\n{rule}")
+    if setup:
+        print(f"  {setup}")
+    print(f"\n  {total_bars:,} one-minute bars "
+          f"({total_bars / len(days):.0f} per session out of 390)")
+
+    # ---- 1. swings ------------------------------------------------------
+    print("\n1. SWINGS -- how often it moves, and how far\n")
+    print(f"   {'Threshold':<12}{'Swings/day':>12}{'Run-up: med':>14}{'90th':>9}"
+          f"{'Pullback: med':>16}{'90th':>9}")
+    for threshold in SWING_THRESHOLDS_PCT:
+        ups, downs, per_day = [], [], []
+        for session in sessions.values():
+            pivots = find_swings(session["high"].to_numpy(),
+                                 session["low"].to_numpy(), threshold)
+            u, d = swing_legs(pivots)
+            ups += u
+            downs += d
+            per_day.append(len(pivots))
+        print(f"   {threshold:>5.2f}%     {sum(per_day) / len(per_day):>11.1f}"
+              f"{pct(ups, 0.5):>13.2f}%{pct(ups, 0.9):>8.2f}%"
+              f"{pct(downs, 0.5):>15.2f}%{pct(downs, 0.9):>8.2f}%")
+    print("\n   A swing is only counted once price has retraced the threshold,")
+    print("   so nothing here is measured with hindsight the moment lacked.")
+
+    # ---- 2. clock -------------------------------------------------------
+    print("\n2. CLOCK -- when the moves and the signals happen\n")
+    buckets: Dict[str, Dict[str, float]] = {}
+    for session in sessions.values():
+        pivots = find_swings(session["high"].to_numpy(), session["low"].to_numpy(), 0.5)
+        for i, _, kind in pivots:
+            key = f"{session.index[i]:%H}:{'00' if session.index[i].minute < 30 else '30'}"
+            buckets.setdefault(key, {"swings": 0, "signals": 0, "range": []})["swings"] += 1
+        for i in range(len(session)):
+            ts = session.index[i]
+            key = f"{ts:%H}:{'00' if ts.minute < 30 else '30'}"
+            slot = buckets.setdefault(key, {"swings": 0, "signals": 0, "range": []})
+            slot["range"].append(100.0 * (session["high"].iloc[i] - session["low"].iloc[i])
+                                 / session["close"].iloc[i])
+            if bool(session["alert"].iloc[i]):
+                slot["signals"] += 1
+
+    print(f"   {'Half hour':<12}{'Swings':>9}{'Signals':>10}{'Avg bar range':>16}")
+    for key in sorted(buckets):
+        slot = buckets[key]
+        avg_range = sum(slot["range"]) / len(slot["range"]) if slot["range"] else 0.0
+        bar = "#" * int(avg_range * 200)
+        print(f"   {key:<12}{slot['swings']:>9}{slot['signals']:>10}"
+              f"{avg_range:>15.3f}%  {bar}")
+
+    # ---- 3. signals -----------------------------------------------------
+    all_rows: List[dict] = []
+    signals_per_day = []
+    for day, session in sessions.items():
+        entries = [i for i in range(len(session)) if bool(session["alert"].iloc[i])]
+        signals_per_day.append(len(entries))
+        for row in signal_outcomes(session, entries,
+                                   (markets or {}).get(day)):
+            row["date"] = day
+            all_rows.append(row)
+
+    outcomes = pd.DataFrame(all_rows)
+    print(f"\n3. SIGNALS -- {len(outcomes)} of them, "
+          f"{sum(signals_per_day) / len(sessions):.1f} per session\n")
+
+    if outcomes.empty:
+        print("   No signals fired. Nothing to measure.")
+    else:
+        print(f"   {'Horizon':<10}{'Median MFE':>13}{'Median MAE':>13}"
+              f"{'Median move':>14}{'Higher after':>15}")
+        for minutes in HORIZONS_MIN:
+            higher = 100.0 * (outcomes[f"ret_{minutes}"] > 0).mean()
+            print(f"   +{minutes:<9}{outcomes[f'mfe_{minutes}'].median():>12.2f}%"
+                  f"{outcomes[f'mae_{minutes}'].median():>12.2f}%"
+                  f"{outcomes[f'ret_{minutes}'].median():>13.2f}%{higher:>14.0f}%")
+        print("\n   MFE is how far it went your way before you would have been out;")
+        print("   MAE how far against. A target past the median MFE rarely fills;")
+        print("   a stop inside the median MAE is hit on trades that would work.")
+        print("\n   'Higher after' at 50% is a coin flip. Meaningfully above 50%")
+        print("   is the signal earning its keep.")
+
+    # ---- 4. brackets ----------------------------------------------------
+    print("\n4. BRACKETS -- every stop/target pair on real bars\n")
+
+    def grid(entry_picker, label: str):
+        print(f"   {label}")
+        header = "stop vs target"
+        print(f"   {header:<14}" + "".join(f"{t:>10.2f}%" for t in TARGET_GRID))
+        best = None
+        for stop_pct in STOP_GRID:
+            cells = []
+            for target_pct in TARGET_GRID:
+                trades = []
+                for session in sessions.values():
+                    trades += simulate(session, entry_picker(session), stop_pct, target_pct)
+                s = score(trades)
+                cells.append(s["avg_return"])
+                if s["n"] >= MIN_TRADES and (best is None or s["avg_return"] > best[0]):
+                    best = (s["avg_return"], stop_pct, target_pct, s)
+            print(f"   {stop_pct:>6.2f}%       " + "".join(f"{c:>10.3f}" for c in cells))
+        return best
+
+    def signal_entries(session):
+        return [i for i in range(len(session)) if bool(session["alert"].iloc[i])]
+
+    def baseline_entries(session):
+        return list(range(0, len(session) - 1, BASELINE_STRIDE))
+
+    print("   Average % return per trade. Entry fills at the NEXT bar's open;")
+    print("   when one bar touches both levels the stop is taken; anything")
+    print("   still open at 16:00 is closed there.\n")
+
+    best_signal = grid(signal_entries, "ON SIGNALS")
+    print()
+    best_base = grid(baseline_entries,
+                     f"BASELINE -- entering every {BASELINE_STRIDE}th bar regardless")
+
+    print(f"\n{rule}\n  VERDICT")
+    if best_signal is None:
+        print("  Too few signals to score a bracket. Try more days.")
+    else:
+        avg, stop_pct_best, target_pct_best, s = best_signal
+        timed_out = 100.0 - s["target_pct"] - s["stop_pct"]
+        print(f"  Best bracket on signals : {stop_pct_best:.2f}% stop / "
+              f"{target_pct_best:.2f}% target")
+        print(f"    {s['n']} trades, {s['win_pct']:.0f}% winners, "
+              f"{avg:+.3f}% average, {s['median_bars']:.0f} bars held")
+        print(f"    {s['target_pct']:.0f}% hit the target, {s['stop_pct']:.0f}% stopped, "
+              f"{timed_out:.0f}% closed at 16:00")
+
+        if timed_out > 50:
+            print("\n  WARNING: most trades never reached either level, so this grid")
+            print("  is mostly measuring how the stock drifted over the day rather")
+            print("  than how the bracket performed. Either the levels are too wide")
+            print("  for this stock's daily range, or it does not move enough to")
+            print("  trade this way. Look at section 1 before trusting any cell.")
+
+        if best_base:
+            edge = avg - best_base[0]
+            print(f"\n  Best bracket on random entries: {best_base[0]:+.3f}% average")
+            print(f"  Signal edge: {edge:+.3f}% per trade")
+            if edge <= 0:
+                print("  -> The signal did NOT beat entering at random. Do not build")
+                print("     the alert on these conditions; they are not finding")
+                print("     anything a coin flip would miss.")
+            elif edge < MIN_EDGE_PCT:
+                print(f"  -> The edge is under {MIN_EDGE_PCT}% a trade, which is inside")
+                print("     the bid-ask spread. That is noise, not a strategy: the")
+                print("     signal is picking entries no better than a coin flip.")
+            elif avg <= 0:
+                print("  -> The signal beats random but still loses money. The")
+                print("     conditions have some information; the bracket does not")
+                print("     harvest it. Costs would make this worse.")
+            else:
+                print("  -> The signal beats random AND makes money before costs.")
+                print("     Worth building. Check the edge survives commissions and")
+                print("     the bid-ask spread before trading it.")
+    print(rule)
+
+    # Your planned bracket, scored explicitly, whatever the grid best was.
+    if not outcomes.empty:
+        trades = []
+        for session in sessions.values():
+            trades += simulate(session, signal_entries(session), 1.0, 2.0)
+        s = score(trades)
+        print("\n  Your planned 1% stop / 2% target, on signals:")
+        print(f"    {s['n']} trades, {s['win_pct']:.0f}% winners, "
+              f"{s['avg_return']:+.3f}% average per trade")
+        print(f"    {s['target_pct']:.0f}% hit the target, {s['stop_pct']:.0f}% were "
+              f"stopped, {100 - s['target_pct'] - s['stop_pct']:.0f}% closed at 16:00\n")
+
+    # ---- 5. is a signal worth more at some times than others? ----------
+    if not outcomes.empty:
+        print("\n5. SIGNAL QUALITY BY TIME OF DAY\n")
+        print("   Section 2 counts signals. This one asks whether they were any")
+        print("   good -- the same measurements as section 3, cut by half hour.\n")
+        print(f"   {'Half hour':<12}{'Signals':>9}{'Med MFE':>10}{'Med MAE':>10}"
+              f"{'MFE/MAE':>10}{'Higher 60m':>13}")
+        stamped = outcomes.copy()
+        stamped["slot"] = [f"{t:%H}:{'00' if t.minute < 30 else '30'}"
+                           for t in stamped["time"]]
+        for slot in sorted(stamped["slot"].unique()):
+            part = stamped[stamped["slot"] == slot]
+            mfe = part["mfe_60"].median()
+            mae = part["mae_60"].median()
+            ratio = abs(mfe / mae) if mae else float("nan")
+            higher = 100.0 * (part["ret_60"] > 0).mean()
+            print(f"   {slot:<12}{len(part):>9}{mfe:>9.2f}%{mae:>9.2f}%"
+                  f"{ratio:>10.2f}{higher:>12.0f}%")
+        print("\n   MFE/MAE above 1.00 means the typical signal went further your")
+        print("   way than against it. At 1.00 the two are the same size, which")
+        print("   is what a random walk looks like and what no bracket can fix.")
+
+    # ---- 6. what a time-of-day gate would actually buy -------------------
+    print("\n6. A TIME-OF-DAY GATE\n")
+    stop_gate, target_gate = GATE_BRACKET
+    print(f"   One bracket, {stop_gate:.2f}% stop / {target_gate:.2f}% target, fixed")
+    print("   in advance and scored identically in every window -- not a fresh")
+    print("   search per window, which would find a winner by trying enough.\n")
+    print("   The control matters most here. Restricting to the busiest hours")
+    print("   raises returns on its own, because there is more movement to")
+    print("   catch; so random entry is restricted to the SAME hours. The last")
+    print("   column is the only one that says whether the SIGNAL improved.\n")
+
+    def inside(stamp, spans) -> bool:
+        return any(lo <= stamp.time() < hi for lo, hi in spans)
+
+    total_swings = 0
+    total_range = 0.0
+    swing_slots: List[datetime] = []
+    range_rows: List[Tuple[datetime, float]] = []
+    for session in sessions.values():
+        pivots = find_swings(session["high"].to_numpy(),
+                             session["low"].to_numpy(), 0.5)
+        for i, _, _ in pivots:
+            swing_slots.append(session.index[i])
+        for i in range(len(session)):
+            span = 100.0 * (session["high"].iloc[i] - session["low"].iloc[i]) \
+                / session["close"].iloc[i]
+            range_rows.append((session.index[i], span))
+            total_range += span
+    total_swings = len(swing_slots)
+
+    print(f"   {'Window':<28}{'Signals':>9}{'Swings':>9}{'Movement':>11}"
+          f"{'Signal':>9}{'Random':>9}{'Edge':>9}")
+    for label, spans in GATE_WINDOWS:
+        signal_trades, random_trades = [], []
+        for session in sessions.values():
+            picks = [i for i in range(len(session))
+                     if bool(session["alert"].iloc[i])
+                     and inside(session.index[i], spans)]
+            signal_trades += simulate(session, picks, stop_gate, target_gate)
+            rolls = [i for i in range(0, len(session) - 1, BASELINE_STRIDE)
+                     if inside(session.index[i], spans)]
+            random_trades += simulate(session, rolls, stop_gate, target_gate)
+
+        sig, rnd = score(signal_trades), score(random_trades)
+        kept_swings = sum(1 for stamp in swing_slots if inside(stamp, spans))
+        kept_range = sum(span for stamp, span in range_rows if inside(stamp, spans))
+        swing_share = (f"{100.0 * kept_swings / total_swings:>7.0f}%"
+                       if total_swings else f"{'--':>8}")
+        range_share = (f"{100.0 * kept_range / total_range:>9.0f}%"
+                       if total_range else f"{'--':>10}")
+        # A handful of trades is not a measurement. Say so rather than
+        # printing three decimals that invite reading a pattern into six
+        # coin flips -- the whole point of this section is to resist that.
+        if sig["n"] < 20 or rnd["n"] < 20:
+            numbers = f"{'--':>9}{'--':>9}{'too few':>9}"
+        else:
+            numbers = (f"{sig['avg_return']:>9.3f}{rnd['avg_return']:>9.3f}"
+                       f"{sig['avg_return'] - rnd['avg_return']:>9.3f}")
+        print(f"   {label:<28}{sig['n']:>9}{swing_share}{range_share}{numbers}")
+
+    print("\n   Signals / Swings / Movement are shares of the whole session kept")
+    print("   by the gate. Signal and Random are average % per trade inside the")
+    print("   window; Edge is the difference. An edge that is still near zero")
+    print("   in every row means the gate cut the noise without finding an")
+    print("   edge underneath -- fewer interruptions, not a better entry.")
+
+    # ---- 7. the pre-registered VWAP test --------------------------------
+    print("\n7. THE VWAP HYPOTHESIS, TESTED THE ONLY WAY THAT COUNTS\n")
+    lo_h, hi_h = HYPOTHESIS_WINDOW
+    stop_h, target_h = HYPOTHESIS_BRACKET
+    print(f"   Rule, fixed before this ran: a signal between {lo_h:%H:%M} and")
+    print(f"   {hi_h:%H:%M} with price above VWAP. {stop_h:.2f}% stop, "
+          f"{target_h:.2f}% target.")
+    print(f"   Days from {HYPOTHESIS_FROM:%d %b %Y} are where the idea came "
+          f"from, so they")
+    print("   are expected to look good and prove nothing. Days before it have")
+    print("   never been examined. Only that row is evidence.\n")
+
+    def vwap_picks(session, signals_only: bool):
+        if "vwap" not in session:
+            return []
+        picks = []
+        for i in range(len(session)):
+            stamp = session.index[i]
+            if not (lo_h <= stamp.time() < hi_h):
+                continue
+            close, vwap = session["close"].iloc[i], session["vwap"].iloc[i]
+            if not (vwap == vwap and close > vwap):     # NaN-safe
+                continue
+            if signals_only:
+                if bool(session["alert"].iloc[i]):
+                    picks.append(i)
+            elif i % BASELINE_STRIDE == 0:
+                picks.append(i)
+        return picks
+
+    groups = {
+        "before the sample (never looked at)": [d for d in days if d < HYPOTHESIS_FROM],
+        f"from {HYPOTHESIS_FROM:%d %b} (where it came from)":
+            [d for d in days if d >= HYPOTHESIS_FROM],
+    }
+    print(f"   {'Days':<38}{'n':>6}{'Signal':>9}{'Random':>9}{'Edge':>9}")
+    for label, group in groups.items():
+        sig_trades, rnd_trades = [], []
+        for day in group:
+            session = sessions[day]
+            sig_trades += simulate(session, vwap_picks(session, True),
+                                   stop_h, target_h)
+            rnd_trades += simulate(session, vwap_picks(session, False),
+                                   stop_h, target_h)
+        sig, rnd = score(sig_trades), score(rnd_trades)
+        if sig["n"] < 20 or rnd["n"] < 20:
+            body = f"{sig['n']:>6}{'--':>9}{'--':>9}{'too few':>9}"
+        else:
+            body = (f"{sig['n']:>6}{sig['avg_return']:>9.3f}"
+                    f"{rnd['avg_return']:>9.3f}"
+                    f"{sig['avg_return'] - rnd['avg_return']:>9.3f}")
+        print(f"   {label:<38}{body}")
+
+    out_of_sample = [d for d in days if d < HYPOTHESIS_FROM]
+    if not out_of_sample:
+        print(f"\n   No days before {HYPOTHESIS_FROM:%d %b %Y} were fetched, so the")
+        print("   test has not actually been run. Increase --days until the first")
+        print("   session listed above is earlier than the cutoff; anything else")
+        print("   is the idea grading its own homework.")
+    else:
+        print(f"\n   {len(out_of_sample)} unexamined sessions. An edge under "
+              f"{MIN_EDGE_PCT}% is inside")
+        print("   the spread and counts as zero however it is signed.")
+
+    # ---- 8. what actually happened on unlock days -----------------------
+    dated = [u for u in (lockups.for_symbol(symbol) if lockups else [])
+             if u.day and u.day in sessions]
+    if dated:
+        print("\n8. UNLOCK DAYS\n")
+        print(f"   {len(dated)} dated unlock(s) fall inside this window. This is what")
+        print("   happened on them. It is not what happens on them: a handful of")
+        print("   events is an anecdote, and the honest use of this table is to")
+        print("   see whether the days were remarkable at all, not to forecast")
+        print("   the next one.\n")
+
+        def day_stats(session):
+            first, last = session.iloc[0], session.iloc[-1]
+            move = 100.0 * (last["close"] - first["open"]) / first["open"]
+            span = 100.0 * (session["high"].max() - session["low"].min()) / first["open"]
+            return move, span, float(session["volume"].sum())
+
+        stats = {day: day_stats(session) for day, session in sessions.items()}
+        volumes = sorted(v for _, _, v in stats.values())
+        typical = volumes[len(volumes) // 2] if volumes else 0.0
+
+        print(f"   {'Date':<12}{'Shares':>10}{'Day move':>11}{'Range':>9}"
+              f"{'Volume':>11}{'x typical':>11}")
+        for unlock in dated:
+            move, span, volume = stats[unlock.day]
+            ratio = volume / typical if typical else float("nan")
+            print(f"   {unlock.day:%d %b %Y}{unlock.size().replace(' shares', ''):>10}"
+                  f"{move:>10.2f}%{span:>8.2f}%"
+                  f"{volume / 1_000_000:>10.1f}M{ratio:>11.2f}")
+
+        others = [(m, r, v) for day, (m, r, v) in stats.items()
+                  if day not in {u.day for u in dated}]
+        if others:
+            moves = sorted(m for m, _, _ in others)
+            spans = sorted(r for _, r, _ in others)
+            mid = len(moves) // 2
+            print(f"\n   Every other session here, for comparison ({len(others)} days):")
+            print(f"   {'median':<12}{'':>10}{moves[mid]:>10.2f}%{spans[mid]:>8.2f}%")
+            down = sum(1 for m in moves if m < 0)
+            print(f"   {down} of {len(moves)} were down days "
+                  f"({100.0 * down / len(moves):.0f}%), so a fall on any given")
+            print("   day is not itself evidence of anything.")
+        print("\n   Dates are UNCONFIRMED unless lockups.json says otherwise.")
+
+    # ---- 9. has the stock settled down? ---------------------------------
+    print(f"\n{rule}")
+    print("9. HAS IT SETTLED DOWN?\n")
+    won = winners(outcomes) if not outcomes.empty else outcomes
+
+    if outcomes.empty or won.empty:
+        print("   No winning signals to size a stop on.")
+    else:
+        # A plain split first. If the first stretch is wild and the rest
+        # are alike, the answer is not a weighting scheme -- it is that
+        # the IPO weeks were a different stock, and saying so is cleaner
+        # than burying it in an exponential.
+        thirds = max(1, len(days) // 3)
+        parts = (("first", days[:thirds]), ("middle", days[thirds:2 * thirds]),
+                 ("recent", days[2 * thirds:]))
+        print(f"   {'Period':<9}{'Sessions':>10}{'Med range':>12}{'Signals':>9}"
+              f"{'Winners':>9}{'Their MAE':>12}{'Stop @88%':>11}")
+        for name, span in parts:
+            if not span:
+                continue
+            ranges = [100.0 * (s["high"].max() - s["low"].min()) / s["open"].iloc[0]
+                      for d, s in sessions.items() if d in span and len(s)]
+            here = outcomes[outcomes["date"].isin(span)]
+            hw = winners(here)
+            stop = stop_for(hw)
+            med_range = pd.Series(ranges).median() if ranges else float("nan")
+            dip = hw["mae_60"].abs().median() if len(hw) else float("nan")
+            print(f"   {name:<9}{len(span):>10}{med_range:>11.2f}%{len(here):>9}"
+                  f"{len(hw):>9}{dip:>11.2f}%"
+                  + (f"{stop:>10.2f}%" if stop is not None else f"{'--':>11}"))
+        print("\n   'Their MAE' is how far the winners dipped before working.")
+        print(f"   'Stop @88%' is the distance that would have kept {STOP_COVERS:.0%}")
+        print("   of them. If the recent column is much tighter than the first,")
+        print("   the IPO weeks were a different stock. If the last two columns")
+        print("   agree, nothing has changed and the whole history is usable.")
+
+        # Then the weighting, alongside the plain answer rather than
+        # instead of it.
+        flat = stop_for(won)
+        print(f"\n   {'Weighting':<22}{'Eff. sessions':>15}{'Stop @88%':>12}")
+        print(f"   {'none (all ' + str(len(days)) + ' equal)':<22}"
+              f"{len(days):>15}{flat:>11.2f}%")
+        for hl in HALF_LIVES:
+            if hl >= len(days):
+                continue
+            w = recency_weights(days, hl)
+            per_signal = won["date"].map(w)
+            stop = stop_for(won, weights=per_signal)
+            eff = effective_n([w[d] for d in days])
+            if stop is None:
+                continue
+            print(f"   {'half-life ' + str(hl) + ' sessions':<22}{eff:>15.0f}"
+                  f"{stop:>11.2f}%")
+        print("\n   Weighting adds no data -- it discards some. 'Eff. sessions'")
+        print("   is what the weighted sample is really worth, and this project")
+        print("   has already been fooled once by a result that rested on three")
+        print("   days. Treat a move of a few hundredths as noise.")
+        print("\n   A stop too wide costs a little on every loss. A stop too")
+        print("   tight costs the trades that would have worked. Those are not")
+        print("   the same mistake, so tighten only on a difference that is")
+        print("   plainly larger than the wobble between these rows.")
+
+    # ---- 10. the recent regime, scored against its own control ----------
+    print(f"\n{rule}")
+    print("10. THE RECENT REGIME -- does the signal beat chance NOW?\n")
+    recent = days[2 * (len(days) // 3):]
+    recent_sessions = {d: s for d, s in sessions.items() if d in recent}
+
+    if len(recent_sessions) < 10:
+        print("   Too few recent sessions to score. Ask for more days.")
+    else:
+        macd_entries = {d: [i for i in range(len(ses))
+                            if bool(ses["alert"].iloc[i])]
+                        for d, ses in recent_sessions.items()}
+        beat, cells, best_cell = beat_the_control(recent_sessions, macd_entries)
+
+        if not cells:
+            print(f"   No cell had {MIN_TRADES} trades on both sides. Too thin "
+                  f"to judge.")
+        else:
+            share = 100.0 * beat / cells
+            print(f"   {len(recent_sessions)} sessions, {cells} bracket "
+                  f"combinations with enough trades on both sides.\n")
+            print(f"   Cells where the signal beat its own control : "
+                  f"{beat} of {cells}  ({share:.0f}%)\n")
+            print("   This count is the answer, not the best cell. Search 36")
+            print("   brackets on a thin sample and one will look excellent by")
+            print("   accident -- that is how a three-day result once passed for")
+            print("   an edge here. A real edge shows up as MOST cells beating")
+            print("   the control, because it does not depend on the levels.")
+            if share >= 70:
+                verdict = ("Most cells beat chance. Worth a forward test with "
+                           "one bracket fixed in advance.")
+            elif share <= 30:
+                verdict = ("Most cells LOST to chance. The signal is not "
+                           "working in this regime.")
+            else:
+                verdict = ("About half either way, which is what a coin flip "
+                           "looks like. No edge here.")
+            print(f"\n   {verdict}")
+
+            edge, sp, tp, ss, bs = best_cell
+            print(f"\n   Best of the {cells}, and inflated by being the best "
+                  f"of {cells}:")
+            print(f"     {sp:.2f}% stop / {tp:.2f}% target")
+            print(f"     signal   {ss['avg_return']:+.3f}% over {ss['n']} trades")
+            print(f"     control  {bs['avg_return']:+.3f}% over {bs['n']} trades")
+            print(f"     edge     {edge:+.3f}% a trade"
+                  + ("  -- inside the spread, so it is nothing"
+                     if abs(edge) < MIN_EDGE_PCT else ""))
+            print("\n   Do not trade that cell because it topped this table.")
+            print("   Pick a bracket for reasons that exist before the search,")
+            print("   then measure it forward.")
+
+    # ---- 11. the triggers that actually ring the phone ------------------
+    print(f"\n{rule}")
+    print("11. WHAT THE ALARM ACTUALLY FIRES ON\n")
+
+    if len(recent_sessions) < 10:
+        print("   Too few recent sessions to score.")
+    else:
+        usual = slot_volume(sessions)
+        triggers = (
+            ("MACD crossover",
+             lambda ses: [i for i in range(len(ses)) if bool(ses["alert"].iloc[i])]),
+            (f"lean >= {PRESSING_HIGH:.0%} on {ALARM_VOLUME:.1f}x volume",
+             lambda ses: lean_entries(ses, usual)),
+            (f"VWAP cross up on {ALARM_VOLUME:.1f}x volume",
+             lambda ses: vwap_entries(ses, usual)),
+        )
+        print("   Buy side only -- long-only, so a sell-side trigger is an exit")
+        print("   rather than an entry and cannot be scored this way.\n")
+        print(f"   {'Trigger':<38}{'Entries':>9}{'Beat control':>15}{'Verdict':>12}")
+        for label, picker in triggers:
+            picked = {d: picker(ses) for d, ses in recent_sessions.items()}
+            fired = sum(len(v) for v in picked.values())
+            beat, cells, _ = beat_the_control(recent_sessions, picked)
+            if not cells:
+                print(f"   {label:<38}{fired:>9}{'too thin':>15}{'--':>12}")
+                continue
+            share = 100.0 * beat / cells
+            verdict = ("edge?" if share >= 70 else
+                       "loses" if share <= 30 else "chance")
+            print(f"   {label:<38}{fired:>9}"
+                  f"{str(beat) + ' of ' + str(cells):>15}{verdict:>12}")
+
+        print("\n   Same grid, same matched control, same count as section 10.")
+        print("   Noise scores about a third of the cells; a real edge scores")
+        print("   most of them. 'edge?' is a question, not a finding -- it means")
+        print("   this is worth pre-registering and measuring forward, not that")
+        print("   it has been proven.")
+        print("\n   The volume baseline here is the median for each clock minute")
+        print("   across all these sessions, which is how the live watcher builds")
+        print("   its own. The thresholds are imported from it, so this cannot")
+        print("   drift from what actually rings.")
+
+    # ---- 12. the below-zero turn ----------------------------------------
+    print(f"\n{rule}")
+    print("12. THE BELOW-ZERO TURN -- the set-up actually being traded\n")
+    print("   Not section 11's \"MACD crossover\". That one fires on any")
+    print("   bullish cross, above or below zero, and never waits for the")
+    print("   zero line -- so it buys strength already visible on the chart.")
+    print("   This requires the cross to happen BELOW zero, with the chart")
+    print("   still weak, and then asks whether the move took the zero line.")
+
+    staged = {day: below_zero_setups(session) for day, session in sessions.items()}
+    crosses = sum(len(v) for v in staged.values())
+
+    if not crosses:
+        print("\n   No below-zero crosses in this sample.")
+    else:
+        diverged_n = sum(1 for v in staged.values() for _, d, _ in v if d is not None)
+        both_n = sum(1 for v in staged.values() for _, d, z in v
+                     if d is not None and z is not None)
+
+        print(f"\n   {len(sessions)} sessions."
+              f"  {crosses / len(sessions):.1f} below-zero crosses a session.\n")
+        print(f"   {'Stage':<46}{'Count':>8}{'of crosses':>13}")
+        print(f"   {'1. bullish cross, MACD below zero':<46}{crosses:>8}"
+              f"{'100%':>13}")
+        print(f"   {'2. ... histogram widening ' + str(DIVERGENCE_BARS) + ' bars running':<46}"
+              f"{diverged_n:>8}{100.0 * diverged_n / crosses:>12.0f}%")
+        print(f"   {'3. ... MACD takes zero within ' + str(ZERO_CROSS_WINDOW_BARS) + ' bars':<46}"
+              f"{both_n:>8}{100.0 * both_n / crosses:>12.0f}%")
+
+        follow = 100.0 * both_n / diverged_n if diverged_n else 0.0
+        print(f"\n   FOLLOW-THROUGH: {follow:.0f}% of the set-ups that diverge go on")
+        print("   to take the zero line. The rest are the calls to your screen")
+        print("   that should end with you closing the laptop.")
+
+        # Scored on the recent slice, so the count is comparable with 10 and 11.
+        if len(recent_sessions) < 10:
+            print("\n   Too few recent sessions to score the entries.")
+        else:
+            recent_staged = {d: staged[d] for d in recent_sessions}
+            early = {d: [x for _, x, _ in v if x is not None]
+                     for d, v in recent_staged.items()}
+            confirmed = {d: [z for _, x, z in v
+                             if z is not None and x is not None]
+                         for d, v in recent_staged.items()}
+
+            print(f"\n   Two entries, over the same {len(recent_sessions)} recent sessions"
+                  f" as sections 10 and 11:\n")
+            print(f"   {'Entry':<38}{'Entries':>9}{'Beat control':>15}{'Verdict':>12}")
+            for label, picked in (("at the divergence (unconfirmed)", early),
+                                  ("at the zero-line cross", confirmed)):
+                fired = sum(len(v) for v in picked.values())
+                beat, cells, _ = beat_the_control(recent_sessions, picked)
+                if not cells:
+                    print(f"   {label:<38}{fired:>9}{'too thin':>15}{'--':>12}")
+                    continue
+                share = 100.0 * beat / cells
+                verdict = ("edge?" if share >= 70 else
+                           "loses" if share <= 30 else "chance")
+                print(f"   {label:<38}{fired:>9}"
+                      f"{str(beat) + ' of ' + str(cells):>15}{verdict:>12}")
+
+            print("\n   The early entry is taken on EVERY set-up that diverged,")
+            print("   including the ones that never reached the zero line.")
+            print("   Scoring it only on the ones that worked would be reading")
+            print("   tomorrow's paper: at the divergence bar nobody knows yet")
+            print("   which kind this is. That is what the two rows cost --")
+            print("   the early entry buys room and pays for it in failures,")
+            print("   the confirmed one pays for certainty in giving up room.")
+
+            # How far it runs, for the entry that is actually confirmed.
+            runs = []
+            for day, session in recent_sessions.items():
+                runs += signal_outcomes(session, confirmed[day])
+            frame = pd.DataFrame(runs)
+            if len(frame) < MIN_TRADES:
+                print(f"\n   Only {len(frame)} confirmed entries -- too few to")
+                print("   describe the run. Ask for more days.")
+            else:
+                mfe, mae = frame["mfe_60"], frame["mae_60"]
+                higher = 100.0 * (frame["ret_60"] > 0).mean()
+                print(f"\n   Where price got to within 60 minutes of the zero-line")
+                print(f"   cross, over {len(frame)} entries:\n")
+                print(f"   {'':<22}{'median':>10}{'upper qtr':>12}{'best':>10}")
+                print(f"   {'best case reached':<22}{pct(mfe, 0.5):>9.2f}%"
+                      f"{pct(mfe, 0.75):>11.2f}%{mfe.max():>9.2f}%")
+                print(f"   {'worst case first':<22}{pct(mae, 0.5):>9.2f}%"
+                      f"{pct(mae, 0.25):>11.2f}%{mae.min():>9.2f}%")
+                print(f"\n   Higher an hour later: {higher:.0f}% of the time.")
+                print("   'Upper qtr' on the worst case is the lower quartile --")
+                print("   the bad end of the dip, which is the end a stop meets.")
+
+            # How much of the rise is already gone by the time the zero
+            # line is taken. The objection to waiting for confirmation,
+            # measured rather than argued.
+            legs = []
+            for day, session in recent_sessions.items():
+                closes = session["close"].to_numpy()
+                highs_a = session["high"].to_numpy()
+                n = len(session)
+                for cross, div, zero in recent_staged[day]:
+                    if div is None or zero is None:
+                        continue
+                    after = highs_a[zero + 1:min(zero + 1 + 60, n - 1) + 1]
+                    if not len(after):
+                        continue
+                    legs.append({
+                        "to_div": 100.0 * (closes[div] - closes[cross]) / closes[cross],
+                        "to_zero": 100.0 * (closes[zero] - closes[div]) / closes[div],
+                        "after": 100.0 * (float(after.max()) - closes[zero]) / closes[zero],
+                    })
+
+            if len(legs) >= MIN_TRADES:
+                parts = pd.DataFrame(legs)
+                print(f"\n   HOW MUCH IS LEFT. The move broken into its legs,"
+                      f" {len(parts)} set-ups:\n")
+                print(f"   {'':<40}{'median':>10}{'upper qtr':>12}")
+                for label, column in (
+                        ("cross below zero -> divergence", "to_div"),
+                        ("divergence -> zero-line cross", "to_zero"),
+                        ("left after the zero cross (60m)", "after")):
+                    print(f"   {label:<40}{pct(parts[column], 0.5):>9.2f}%"
+                          f"{pct(parts[column], 0.75):>11.2f}%")
+                spent = parts["to_div"].median() + parts["to_zero"].median()
+                left = parts["after"].median()
+                total = spent + left
+                if total > 0:
+                    print(f"\n   By the zero-line cross, {100.0 * spent / total:.0f}% of the"
+                          f" typical move is already")
+                    print(f"   behind you and {100.0 * left / total:.0f}% is still ahead.")
+                print("   The legs are measured close to close between the")
+                print("   indicator's own bars, and the last one is the best")
+                print("   price reached afterwards -- not a fill, which is why")
+                print("   it is not added up as a return.")
+
+        print("\n   A negative result in section 11 says nothing about this.")
+        print("   The two enter from opposite places: one after strength is")
+        print("   visible, this one before. Nor does a good result here prove")
+        print("   anything yet -- it means pre-register it and measure forward.")
+
+    # ---- 13. the sell alarm, scored as a buy ---------------------------
+    print(f"\n{rule}")
+    print("13. THE SELL ALARM, SCORED AS A BUY\n")
+    print("   Section 11 left this out by assumption: a sell-side trigger")
+    print("   was called an exit and never scored. That holds only if the")
+    print("   alarm marks the START of a decline. The lean averages selling")
+    print("   that has already happened, so it cannot fire at a top -- it")
+    print("   fires where selling is heaviest, which is either mid-slide or")
+    print("   exhaustion. Long-only: if it is exhaustion, it is an entry.")
+
+    if len(recent_sessions) < 10:
+        print("\n   Too few recent sessions to score.")
+    else:
+        usual = slot_volume(sessions)
+        print(f"\n   {len(recent_sessions)} recent sessions, the same ones"
+              f" scored in 10, 11 and 12.\n")
+        print(f"   {'Lean window':<26}{'Entries':>9}{'Beat control':>15}"
+              f"{'Verdict':>12}")
+
+        scored: Dict[int, List[int]] = {}
+        for minutes in (2, 3, PRESSURE_MINUTES):
+            picked = {d: sell_entries(ses, usual, minutes)
+                      for d, ses in recent_sessions.items()}
+            scored[minutes] = picked
+            fired = sum(len(v) for v in picked.values())
+            beat, cells, _ = beat_the_control(recent_sessions, picked)
+            label = (f"{minutes} minutes"
+                     + (" (live now)" if minutes == PRESSURE_MINUTES else ""))
+            if not cells:
+                print(f"   {label:<26}{fired:>9}{'too thin':>15}{'--':>12}")
+                continue
+            share = 100.0 * beat / cells
+            verdict = ("edge?" if share >= 70 else
+                       "loses" if share <= 30 else "chance")
+            print(f"   {label:<26}{fired:>9}"
+                  f"{str(beat) + ' of ' + str(cells):>15}{verdict:>12}")
+
+        print("\n   The window is how many minutes of tape the lean averages.")
+        print("   Shorter fires earlier and noisier; longer is surer and")
+        print("   later. That trade-off is the whole tuning question, so it")
+        print("   is shown rather than chosen.")
+
+        # What the alarm looks like from either side, at the live window.
+        # Joined on the signal's timestamp, never on position: an entry
+        # too close to the bell to fill is dropped by signal_outcomes,
+        # so zipping the two lists would silently pair each alarm with
+        # some other alarm's outcome.
+        live = scored[PRESSURE_MINUTES]
+        rows: List[dict] = []
+        for day, session in recent_sessions.items():
+            closes = session["close"].to_numpy()
+            fell = {}
+            for i in live[day]:
+                before = closes[max(0, i - PRESSURE_MINUTES)]
+                fell[session.index[i]] = 100.0 * (closes[i] - before) / before
+            for row in signal_outcomes(session, live[day]):
+                row["drop"] = fell[row["time"]]
+                rows.append(row)
+
+        frame = pd.DataFrame(rows)
+        if len(frame) < MIN_TRADES or "mfe_60" not in frame:
+            print(f"\n   Only {len(frame)} alarms -- too few to describe.")
+        else:
+            higher = 100.0 * (frame["ret_60"] > 0).mean()
+            print(f"\n   Either side of the alarm, {len(frame)} of them:\n")
+            print(f"   {'':<34}{'median':>10}{'lower qtr':>12}{'upper qtr':>12}")
+            for label, column in (
+                    (f"fell in the {PRESSURE_MINUTES} min before", "drop"),
+                    ("best case reached, next 60 min", "mfe_60"),
+                    ("worst case first, next 60 min", "mae_60")):
+                print(f"   {label:<34}{pct(frame[column], 0.5):>9.2f}%"
+                      f"{pct(frame[column], 0.25):>11.2f}%"
+                      f"{pct(frame[column], 0.75):>11.2f}%")
+            print(f"\n   Higher an hour later: {higher:.0f}% of the time.")
+            print("   A flush that gets bought back shows a deep 'fell")
+            print("   before' and a best case larger than the worst case.")
+            print("   A slide that kept going shows the opposite.")
+
+        print("\n   Whatever this says, it says it about one stock over a few")
+        print("   dozen recent sessions, and the grid cells are not")
+        print("   independent. A good number here means pre-register it and")
+        print("   watch it forward, exactly as everywhere else in this file.")
+
+    # ---- 14. the open, and whether it reverses -------------------------
+    print(f"\n{rule}")
+    print("14. THE OPEN, AND WHETHER IT REVERSES\n")
+    print("   The claim being tested: the stock reverses from whichever")
+    print("   way it opens. Measured two ways, because \"the open\" means")
+    print("   two different things -- the overnight gap, and the first")
+    print("   fifteen minutes of trading -- and they can disagree.")
+    print("\n   Long-only, so only half of this is actionable. A positive")
+    print("   open that reverses DOWN is a reason to stay out, not a trade.")
+    print("   The row that could become a hot button is the negative one.")
+
+    opens = opening_rows(sessions)
+    if len(opens) < MIN_TRADES:
+        print(f"\n   Only {len(opens)} usable sessions -- too few. Each needs "
+              f"a previous\n   close to measure the gap against.")
+    else:
+        for name, anchor, label in (
+                ("gap", "gap", "GAP  (yesterday's close -> 09:30 open), "
+                                "measured from the open"),
+                ("range", "range", "OPENING RANGE  (09:30 -> 09:45), "
+                                   "measured from 09:45")):
+            print(f"\n   {label}")
+            columns = [(h, f"{name}_{h:%H%M}") for h in OPEN_HORIZONS
+                       if f"{name}_{h:%H%M}" in opens
+                       and opens[f"{name}_{h:%H%M}"].notna().any()]
+            head = "".join(f"{h:%H:%M}".rjust(10) for h, _ in columns)
+            print(f"\n   {'':<18}{'Days':>6}{head}")
+
+            buckets = (("opened down", opens[opens[anchor] < 0]),
+                       ("opened up", opens[opens[anchor] > 0]),
+                       ("ALL DAYS", opens))
+            for title, frame in buckets:
+                if frame.empty:
+                    continue
+                cells = ""
+                for _, column in columns:
+                    values = frame[column].dropna()
+                    cells += ("       --" if len(values) < MIN_TRADES
+                              else f"{100.0 * (values > 0).mean():9.0f}%")
+                mark = "  <- baseline" if title == "ALL DAYS" else ""
+                print(f"   {title:<18}{len(frame):>6}{cells}{mark}")
+
+            thin = [t for t, f in buckets if 0 < len(f) < MIN_TRADES]
+            if thin:
+                print(f"\n   '--' means under {MIN_TRADES} days in that cell. "
+                      f"Too thin: {', '.join(thin)}")
+            print(f"\n   Read DOWN the column, not across. A bucket only says")
+            print(f"   something if it differs from ALL DAYS by more than the")
+            print(f"   noise floor -- +/-{noise_floor(len(opens)):.0f} points "
+                  f"at {len(opens)} days, wider for a")
+            print(f"   smaller bucket. Equal to the baseline means the open "
+                  f"told you nothing.")
+
+        # The actionable half, with the numbers a bracket needs. Percent
+        # up is a direction; a stop needs to know how far it goes wrong
+        # first, and a target needs to know how far it goes right.
+        down = opens[opens["range"] < 0]
+        column = f"range_{time(12, 0):%H%M}"
+        if len(down) >= MIN_TRADES and column in down:
+            values = down[column].dropna()
+            if len(values) >= MIN_TRADES:
+                print(f"\n   Buying 09:45 on a negative opening range, held to "
+                      f"noon, {len(values)} days:")
+                print(f"   {'median move':<24}{pct(values, 0.5):>8.2f}%")
+                print(f"   {'lower quarter':<24}{pct(values, 0.25):>8.2f}%")
+                print(f"   {'upper quarter':<24}{pct(values, 0.75):>8.2f}%")
+                print("\n   That is the move to the horizon, not the excursion")
+                print("   on the way. A stop needs section 6's numbers, and a")
+                print("   median near zero with quarters either side of it is")
+                print("   a coin flip whatever the percentage above says.")
+
+    # ---- 15. holding a loser, against cutting and getting back in -----
+    print(f"\n{rule}")
+    print("15. WAITING FOR IT TO COME BACK, AGAINST CUTTING AND RE-ENTERING\n")
+    print("   The claim being tested: when a position goes against you it")
+    print("   is better to take the loss, get back in lower, and be ahead")
+    print("   by the difference when price returns -- rather than sitting")
+    print("   there waiting to get out flat.")
+    print("\n   The arithmetic of that is not in question. Cut at C,")
+    print("   re-enter at R below it, and reaching the original entry E")
+    print("   again leaves you (C - R) ahead, always. The question is how")
+    print("   OFTEN you get it: price has to fall the extra step to let")
+    print("   you back in, and then come back. When it cuts you out and")
+    print("   recovers without ever offering the re-entry, you took the")
+    print("   loss AND missed the recovery. That is what this counts.")
+    print(f"\n   Cut at {RECOVERY_CUT:.2f}%, back in {RECOVERY_STEP:.2f}% lower "
+          f"again. One setting,")
+    print("   fixed before it saw the data -- a grid over both would return")
+    print("   the best of however many pairs were tried.")
+    print(f"\n   Entries every {RECOVERY_EVERY} minutes between "
+          f"{RECOVERY_FROM:%H:%M} and {RECOVERY_UNTIL:%H:%M}, regardless of")
+    print("   what the chart was doing, because the question is what the")
+    print("   EXIT rule does. Picking entries by a rule measures entries.")
+
+    moves = recovery_rows(sessions)
+    if len(moves) < MIN_TRADES:
+        print(f"\n   Only {len(moves)} usable entries -- too few to say anything.")
+    else:
+        print(f"\n   {len(moves):,} entries across {moves['day'].nunique()} days\n")
+        print(f"   {'':<24}{'median':>9}{'mean':>9}{'ended up':>10}")
+        for path in RECOVERY_PATHS:
+            values = moves[path].dropna()
+            if values.empty:
+                continue
+            print(f"   {path:<24}{values.median():>8.3f}%{values.mean():>8.3f}%"
+                  f"{100.0 * (values > 0).mean():>9.0f}%")
+
+        # How often the rule even engages, and how often it pays. Without
+        # these the table above is four numbers with no mechanism behind
+        # them -- and the mechanism is the whole question.
+        cut_fired = moves["cut and stay out"] < moves["hold to the close"] - 1e-9
+        offered = cut_fired & (moves["cut and get back in"]
+                               > moves["cut and stay out"] + 1e-9)
+        better = moves["cut and get back in"] > moves["hold for break-even"] + 1e-9
+        print(f"\n   The cut triggered on {100.0 * cut_fired.mean():.0f}% of entries "
+              f"({int(cut_fired.sum()):,} of {len(moves):,}).")
+        if cut_fired.any():
+            print(f"   Of those, the lower re-entry was offered "
+                  f"{100.0 * offered.sum() / cut_fired.sum():.0f}% of the time.")
+            hurt = moves.loc[cut_fired & ~offered, "cut and stay out"]
+            if not hurt.empty:
+                print(f"   When it was not, the median outcome was "
+                      f"{hurt.median():.3f}% -- the loss taken, the recovery")
+                print("   missed. That is the cost of the rule, and it is the")
+                print("   case worth looking at before adopting it.")
+        print(f"\n   Cutting and getting back in beat waiting it out on "
+              f"{100.0 * better.mean():.0f}% of entries.")
+        floor = noise_floor(len(moves))
+        print(f"   Noise floor at {len(moves):,} entries is +/-{floor:.1f} points, "
+              f"so anything")
+        print(f"   between {50 - floor:.0f}% and {50 + floor:.0f}% is a coin flip.")
+        print("\n   Long-only, and none of this is an edge: every path starts")
+        print("   from an entry chosen by the clock. It compares EXITS from")
+        print("   the same entry, which is the only thing it can claim.")
+
+        print("\n   Three of the four things measured in this file came back")
+        print("   negative, including the MACD crossover twice. If this one")
+        print("   matches its baseline, the finding is that the open is not")
+        print("   tradeable -- which is worth having as a number rather than")
+        print("   as a feeling, and is an argument for not being at the")
+        print("   screen at 09:31 rather than for more willpower at 09:31.")
+
+
+    # ---- 16. filters on the signal --------------------------------------
+    print(f"\n{rule}")
+    print("16. DOES ANY FILTER MAKE THE SIGNAL WORTH TAKING?")
+    print(rule)
+    print(f"\n   Five filters, fixed before looking. Each asks whether a MACD")
+    print(f"   signal that ALSO passes it finishes higher {FILTER_HORIZON} minutes later")
+    print("   more often than random entry under the SAME filter.")
+    print("\n   The control is the whole point. A rising market lifts the stock,")
+    print("   so long trades make money on green days whether or not the signal")
+    print("   had anything to do with it. Subtracting a matched control leaves")
+    print("   only the part the signal can claim.")
+    print("\n   The older half may NOMINATE. Only the newer half, which never")
+    print("   chose anything, may CONFIRM.")
+
+    control_rows: List[dict] = []
+    for day, session in sessions.items():
+        stride = list(range(0, len(session) - 1, BASELINE_STRIDE))
+        for row in signal_outcomes(session, stride, (markets or {}).get(day)):
+            row["date"] = day
+            control_rows.append(row)
+    control = pd.DataFrame(control_rows)
+
+    table = filter_study(outcomes, control, days)
+    if not table:
+        print("\n   No sessions. Nothing to measure.")
+    else:
+        cut = days[len(days) // 2]
+        print(f"\n   nominate: {days[0]:%d %b} to {cut:%d %b}        "
+              f"confirm: {cut:%d %b} to {days[-1]:%d %b}\n")
+        for half in ("nominate", "confirm"):
+            print(f"   {half.upper()}")
+            print(f"   {'filter':<24}{'signals':>8}{'up':>7}{'control':>9}"
+                  f"{'edge':>8}{'noise':>8}   verdict")
+            for row in table:
+                n = row[f"{half}_n"]
+                if not n:
+                    # Same column widths as a real row, or the eye reads the
+                    # verdict against the wrong heading.
+                    print(f"   {row['filter']:<24}{'--':>8}{'--':>7}{'--':>9}"
+                          f"{'--':>8}{'--':>8}   no data")
+                    continue
+                edge, floor = row[f"{half}_edge"], row[f"{half}_floor"]
+                # Two standard errors, because one is a coin landing the way
+                # coins land. Anything inside the band is not a result.
+                verdict = ("beats control" if edge > 2 * floor
+                           else "worse" if edge < -2 * floor else "noise")
+                print(f"   {row['filter']:<24}{n:>8,}{row[f'{half}_rate']:>6.0f}%"
+                      f"{row[f'{half}_control']:>8.0f}%{edge:>+7.1f}"
+                      f"{floor:>7.1f}   {verdict}")
+            print()
+
+        survived = [r["filter"] for r in table
+                    if r["nominate_n"] and r["confirm_n"]
+                    and r["nominate_edge"] > 2 * r["nominate_floor"]
+                    and r["confirm_edge"] > 2 * r["confirm_floor"]]
+        nominated = [r["filter"] for r in table
+                     if r["nominate_n"] and r["nominate_edge"] > 2 * r["nominate_floor"]]
+        print(f"   Nominated by the older half: "
+              f"{', '.join(nominated) if nominated else 'none'}")
+        print(f"   Still standing on the newer half: "
+              f"{', '.join(survived) if survived else 'NONE'}")
+        if not survived:
+            print("\n   That is the honest outcome and the likeliest one. The")
+            print("   crossover did not beat a coin flip on its own across 90")
+            print("   days, and a filter cannot add information the price")
+            print("   series does not contain. A filter that nominated and")
+            print("   then failed is the split doing its job -- it would have")
+            print("   looked like a finding without it.")
+        else:
+            print("\n   Survived the split. That is worth more than any single")
+            print("   number above, and still is not proof: five filters means")
+            print("   roughly a 1-in-4 chance one clears a 1-in-20 bar by luck,")
+            print("   and the confirm half is one sample, not a law. Treat it")
+            print("   as the next thing to watch rather than the next thing")
+            print("   to trade.")
+
+
+
+    # ---- 17. is it a bad day to trade? ----------------------------------
+    print(f"\n{rule}")
+    print("17. CAN A CHOPPY MORNING BE SEEN WHILE THERE IS STILL A DAY LEFT?")
+    print(rule)
+    lo, hi = CHOP_WINDOW
+    print(f"\n   Each day is labelled from {lo:%H:%M}-{hi:%H:%M} ALONE, then the rest")
+    print("   of the day is measured. Nothing about the afternoon reaches the")
+    print("   label, which is what lets the afternoon be the test.")
+    print("\n   Efficiency is net move over distance travelled: 1.0 is a clean")
+    print("   trend, 0.1 is two dollars of ground covered finishing where it")
+    print("   began. The bottom third by efficiency is called CHOPPY. The rest")
+    print("   are split by direction, because a straight-line collapse is")
+    print("   exactly as efficient as a straight-line rally.")
+    print(f"\n   Entries are random (every {BASELINE_STRIDE}th bar) after {hi:%H:%M} --")
+    print("   the question is whether the STOCK is harder to trade, not")
+    print("   whether some indicator is.")
+
+    shapes = day_shapes(sessions)
+    after = afternoon_rows(sessions, shapes)
+    column = f"ret_{FILTER_HORIZON}"
+    if after.empty or column not in after:
+        print("\n   Not enough bars after the morning window to measure.")
+    else:
+        cut = days[len(days) // 2]
+        for half, pick in (("NOMINATE", lambda f: f["date"] < cut),
+                           ("CONFIRM", lambda f: f["date"] >= cut)):
+            part = after[pick(after)]
+            print(f"\n   {half}")
+            print(f"   {'morning':<16}{'days':>6}{'entries':>9}{'up 60m':>9}"
+                  f"{'median':>10}{'noise':>8}")
+            if part.empty:
+                print("      (no days in this half)")
+                continue
+            for shape in ("choppy", "trending up", "trending down"):
+                rows = part[part["shape"] == shape]
+                rows = rows[rows[column].notna()]
+                n_days = rows["date"].nunique()
+                if rows.empty:
+                    print(f"   {shape:<16}{n_days:>6}{'--':>9}{'--':>9}"
+                          f"{'--':>10}{'--':>8}")
+                    continue
+                rate = 100.0 * float((rows[column] > 0).mean())
+                spread = clustered_error(rows, column)
+                print(f"   {shape:<16}{n_days:>6}{len(rows):>9,}{rate:>8.0f}%"
+                      f"{rows[column].median():>9.3f}%"
+                      + (f"{spread:>7.1f}" if spread == spread else f"{'--':>7}"))
+
+            chop = part[(part["shape"] == "choppy") & part[column].notna()]
+            rest = part[(part["shape"] != "choppy") & part[column].notna()]
+            if not chop.empty and not rest.empty:
+                a = 100.0 * float((chop[column] > 0).mean())
+                b = 100.0 * float((rest[column] > 0).mean())
+                # Errors across DAYS, combined. Not noise_floor(entries),
+                # which counts one afternoon sixty-six times.
+                ea, eb = clustered_error(chop, column), clustered_error(rest, column)
+                floor = ((ea ** 2 + eb ** 2) ** 0.5
+                         if ea == ea and eb == eb else float("nan"))
+                gap = a - b
+                verdict = ("too few days to say" if floor != floor
+                           else "choppy mornings ARE worse" if gap < -2 * floor
+                           else "choppy mornings are BETTER" if gap > 2 * floor
+                           else "no difference worth acting on")
+                print(f"\n      choppy minus the rest: {gap:+.1f} points "
+                      + (f"(noise +/-{floor:.1f})" if floor == floor
+                         else "(noise unmeasurable)")
+                      + f"  ->  {verdict}")
+
+        print("\n   A difference that shows in the nominate half and not the")
+        print("   confirm half is the split doing its job. Only a gap that")
+        print("   survives both is worth an alert, and even then it is one")
+        print("   measure tested once -- the stronger test is your own P&L by")
+        print("   morning shape, which needs the trading days logged.")
+
+
+    return outcomes
+
+
+# --------------------------------------------------------------------------
+# Self-test
+# --------------------------------------------------------------------------
+
+def _session(closes, highs=None, lows=None, volumes=None, first=SESSION_OPEN):
+    n = len(closes)
+    start = datetime.combine(date(2026, 9, 18), first, tzinfo=ET)
+    idx = pd.DatetimeIndex([start + timedelta(minutes=i) for i in range(n)])
+    return pd.DataFrame(
+        {"open": closes,
+         "high": highs if highs is not None else [c + 0.02 for c in closes],
+         "low": lows if lows is not None else [c - 0.02 for c in closes],
+         "close": closes,
+         "volume": volumes if volumes is not None else [1000] * n},
+        index=idx,
+    )
+
+
+def self_test() -> int:
+    print("Self-test: checking the swing, bracket and outcome logic...\n")
+    failures = []
+
+    # THE CONTROL IS THE WHOLE SECTION-16 DESIGN, so it gets the hardest
+    # fixture: days where the market and the stock rise together, and days
+    # where both fall, with signals placed by the CLOCK and correlated with
+    # nothing. "Market up" then looks like a perfect filter -- every signal
+    # on those days finishes higher -- and it is worth nothing, because
+    # random entry on the same days does exactly as well. If the control
+    # ever stops subtracting that, this file starts manufacturing findings.
+    drift_sessions, drift_markets = {}, {}
+    for n in range(8):
+        rising = n % 2 == 0
+        step = 0.05 if rising else -0.05
+        when = date(2026, 9, 1) + timedelta(days=n)
+        prices = [100.0 + step * i for i in range(120)]
+        frame = _session(prices)
+        frame.index = pd.DatetimeIndex(
+            [datetime.combine(when, SESSION_OPEN, tzinfo=ET) + timedelta(minutes=i)
+             for i in range(120)])
+        # A real running average, not close itself: close == vwap makes
+        # "above VWAP" false on every bar and the filter matches nothing.
+        frame["vwap"] = frame["close"].expanding().mean()
+        frame["rsi"] = 60.0 if rising else 40.0
+        # Heavy on the rising days only, so this filter ALSO selects
+        # nothing but drift -- a second, independent chance for the
+        # control to fail to subtract it.
+        frame["volume_ratio"] = 3.0 if rising else 1.0
+        drift_sessions[when] = frame
+        drift_markets[when] = pd.Series(
+            [(1.0 if rising else -1.0)] * 120, index=frame.index)
+
+    drift_days = sorted(drift_sessions)
+    sig_rows, ctl_rows = [], []
+    for when in drift_days:
+        frame = drift_sessions[when]
+        for row in signal_outcomes(frame, [20, 40, 60], drift_markets[when]):
+            row["date"] = when
+            sig_rows.append(row)
+        stride = list(range(0, len(frame) - 1, BASELINE_STRIDE))
+        for row in signal_outcomes(frame, stride, drift_markets[when]):
+            row["date"] = when
+            ctl_rows.append(row)
+
+    drift_table = filter_study(pd.DataFrame(sig_rows), pd.DataFrame(ctl_rows),
+                               drift_days)
+    for drift_filter in ("market up", "heavy volume"):
+        row = next((r for r in drift_table if r["filter"] == drift_filter), None)
+        if row is None:
+            failures.append(f"{drift_filter} vanished from the table")
+            continue
+        for half in ("nominate", "confirm"):
+            rate, control = row[f"{half}_rate"], row[f"{half}_control"]
+            if not row[f"{half}_n"]:
+                failures.append(f"{drift_filter}/{half}: matched nothing; the "
+                                f"fixture is built so it should match the "
+                                f"rising days")
+            elif not (rate > 80.0):
+                failures.append(f"{drift_filter}/{half}: every signal on a "
+                                f"rising day wins by construction; got "
+                                f"{rate:.0f}%")
+            elif abs(rate - control) > 10.0:
+                failures.append(
+                    f"{drift_filter}/{half}: a filter that only selects rising "
+                    f"days must show NO edge over random entry on those same "
+                    f"days -- signal {rate:.0f}% vs control {control:.0f}%. "
+                    f"The control has stopped subtracting drift, and this file "
+                    f"is now manufacturing findings.")
+
+    # No look-ahead. The range position at a bar may only know the range up
+    # to that bar; a spike at the very end must not reach backwards.
+    spike = _session([100.0] * 60 + [100.0] * 59 + [200.0])
+    early = signal_outcomes(spike, [30])
+    if early and early[0]["range_pos"] == early[0]["range_pos"]:   # not NaN
+        if early[0]["range_pos"] > 1.0 or early[0]["range_pos"] < 0.0:
+            failures.append("range position must stay inside the range it knows")
+    late = signal_outcomes(spike, [118])
+    if late and late[0]["range_pos"] > 0.5:
+        failures.append("a bar before the spike must not see the spike in its "
+                        "own range position")
+
+    # The split must actually split, or "confirm" is just the same data
+    # wearing a different label.
+    for row in drift_table:
+        if row["nominate_n"] == 0 and row["confirm_n"] == 0:
+            failures.append(f"{row['filter']} matched nothing in either half")
+        if row["nominate_n"] and row["confirm_n"] == 0:
+            failures.append(f"{row['filter']} landed everything in the half "
+                            f"that may only nominate")
+
+    # The morning label must come from the MORNING and from nothing else.
+    # Two properties, and the second is the one that bites:
+    #   a choppy morning is called choppy however the afternoon turns out;
+    #   a straight-line COLLAPSE is not choppy -- efficiency is
+    #   directionless, so without the sign of the move the worst mornings
+    #   of the quarter get filed as clean trends.
+    def shaped(morning, afternoon, when):
+        prices = list(morning) + list(afternoon)
+        frame = _session(prices)
+        frame.index = pd.DatetimeIndex(
+            [datetime.combine(when, SESSION_OPEN, tzinfo=ET)
+             + timedelta(minutes=i) for i in range(len(prices))])
+        return frame
+
+    rise = [100.0 + 0.05 * i for i in range(60)]
+    fall = [100.0 - 0.05 * i for i in range(60)]
+    chop = [100.0 + (0.6 if i % 2 else 0.0) for i in range(60)]
+
+    for tail_name, tail in (("a soaring afternoon", [120.0 + i for i in range(60)]),
+                            ("a collapsing afternoon", [80.0 - i for i in range(60)])):
+        built = {}
+        for n, morning in enumerate([rise] * 3 + [fall] * 3 + [chop] * 3):
+            built[date(2026, 8, 3) + timedelta(days=n)] = shaped(morning, tail,
+                                                                 date(2026, 8, 3)
+                                                                 + timedelta(days=n))
+        labels = day_shapes(built)
+        got = [labels[d] for d in sorted(labels)]
+        want = ["trending up"] * 3 + ["trending down"] * 3 + ["choppy"] * 3
+        if got != want:
+            failures.append(
+                f"with {tail_name} the morning labels should be {want}, got "
+                f"{got}. The label must come from the morning alone, and a "
+                f"straight-line collapse is not chop.")
+
+    # And the measure itself: a collapse is as EFFICIENT as a rally, which
+    # is precisely why day_shapes may not use it on its own.
+    if abs(efficiency(fall) - efficiency(rise)) > 0.001:
+        failures.append("a straight collapse and a straight rally must score "
+                        "the same efficiency; the sign is what tells them "
+                        "apart, not the magnitude")
+
+    # The error bar on those rates must be measured ACROSS DAYS, because
+    # the entries share days. This test exists because the section first
+    # shipped with noise_floor(entries) and reported "choppy mornings are
+    # BETTER, +8.0 points, noise +/-2.8" on a fixture whose afternoons
+    # were pure random walks. The rate was real; the denominator was not.
+    #
+    # Perfect clustering is the clearest case: six afternoons, each one
+    # entirely up or entirely down, sampled fifty-five times. There are
+    # six facts here, not three hundred and thirty.
+    clustered = pd.DataFrame([
+        {"date": date(2026, 8, 3) + timedelta(days=n), "ret": 1.0 if n % 2 else -1.0}
+        for n in range(6) for _ in range(55)])
+    across_days = clustered_error(clustered, "ret")
+    as_if_independent = noise_floor(len(clustered))
+    if not (across_days > 5 * as_if_independent):
+        failures.append(
+            f"entries that share days must carry a far wider error bar than "
+            f"independent ones: across days {across_days:.1f} vs "
+            f"{as_if_independent:.1f} as-if-independent. Anything near the "
+            f"latter manufactures findings out of the denominator.")
+
+    # One day cannot tell you how much days vary. Better to print nothing
+    # than to print a floor of zero, which would make every gap a finding.
+    lone = clustered[clustered["date"] == date(2026, 8, 3)]
+    if clustered_error(lone, "ret") == clustered_error(lone, "ret"):
+        failures.append("a single day has no measurable spread across days; "
+                        "clustered_error must return NaN so the section says "
+                        "'too few days to say' rather than inventing a floor")
+
+    # And the case that actually burned: an eight-point gap between two
+    # groups of ordinary, varied days is not a finding. If this stops
+    # failing to clear the bar, the bar has gone soft again.
+    def varied(start, rates):
+        rows = []
+        for n, rate in enumerate(rates):
+            won = round(rate * 66)
+            rows += [{"date": start + timedelta(days=n),
+                      "ret": 1.0 if i < won else -1.0} for i in range(66)]
+        return pd.DataFrame(rows)
+
+    # Five days a side, each day an ordinary mix. Pooled: 60% against 46%.
+    group_a = varied(date(2026, 8, 3), [0.30, 0.85, 0.40, 0.75, 0.70])
+    group_b = varied(date(2026, 9, 1), [0.60, 0.30, 0.55, 0.40, 0.45])
+    gap = (100.0 * float((group_a["ret"] > 0).mean())
+           - 100.0 * float((group_b["ret"] > 0).mean()))
+    ea = clustered_error(group_a, "ret")
+    eb = clustered_error(group_b, "ret")
+    floor = (ea ** 2 + eb ** 2) ** 0.5
+    if abs(gap) > 2 * floor:
+        failures.append(
+            f"a {gap:+.1f} point gap across five days a side is within the "
+            f"day-to-day spread (+/-{floor:.1f}) and must not read as a "
+            f"finding")
+
+    # A clean triangle: up 10%, down 10%. One high, one low.
+    closes = [100 + i for i in range(11)] + [110 - i for i in range(1, 11)]
+    pivots = find_swings([c + 0.01 for c in closes], [c - 0.01 for c in closes], 1.0)
+    kinds = [k for _, _, k in pivots]
+    # The path starts at 100 and rises, so 100 is itself a swing low -- the
+    # anchor the run-up is measured from -- and the peak follows it.
+    if kinds != ["L", "H"]:
+        failures.append(f"expected a low then a high on an up-then-down path, got {kinds}")
+    highs_found = [p for _, p, k in pivots if k == "H"]
+    if not highs_found or abs(highs_found[0] - 110.01) > 0.05:
+        failures.append(f"the high should be ~110, got {highs_found}")
+    run_ups, pullbacks = swing_legs(pivots)
+    if not run_ups or abs(run_ups[0] - 10.0) > 0.2:
+        failures.append(f"the run-up should measure ~10%, got {run_ups}")
+
+    # Noise below the threshold must produce no pivots at all.
+    flat = [100 + (0.05 if i % 2 else -0.05) for i in range(60)]
+    if find_swings([c + 0.01 for c in flat], [c - 0.01 for c in flat], 1.0):
+        failures.append("0.1% noise should not register as a 1% swing")
+
+    # Bracket: a bar that touches both levels must be recorded as a stop.
+    both = _session([100.0, 100.0, 100.0], highs=[100.0, 100.0, 103.0],
+                    lows=[100.0, 100.0, 98.0])
+    trades = simulate(both, [0], stop_pct=1.0, target_pct=2.0)
+    if not trades or trades[0].outcome != "stop":
+        failures.append(f"a bar touching both levels must be a stop, got "
+                        f"{trades[0].outcome if trades else 'nothing'}")
+
+    # Entry fills at the NEXT bar's open, never the signal bar's close.
+    gap = _session([100.0, 105.0, 105.0])
+    t = simulate(gap, [0], stop_pct=50.0, target_pct=50.0)[0]
+    if abs(t.entry_price - 105.0) > 1e-9:
+        failures.append(f"entry should fill at the next open (105), got {t.entry_price}")
+
+    # A clean winner and a clean loser.
+    up = _session([100.0] + [100.0 + i for i in range(1, 10)],
+                  highs=[100.0] + [100.4 + i for i in range(1, 10)])
+    t = simulate(up, [0], stop_pct=1.0, target_pct=2.0)[0]
+    if t.outcome != "target" or abs(t.return_pct - 2.0) > 1e-6:
+        failures.append(f"a clean rally should hit the target for +2%, got "
+                        f"{t.outcome} {t.return_pct:.3f}%")
+
+    down = _session([100.0] + [100.0 - i for i in range(1, 10)],
+                    lows=[100.0] + [99.6 - i for i in range(1, 10)])
+    t = simulate(down, [0], stop_pct=1.0, target_pct=2.0)[0]
+    if t.outcome != "stop" or abs(t.return_pct + 1.0) > 1e-6:
+        failures.append(f"a clean decline should stop out for -1%, got "
+                        f"{t.outcome} {t.return_pct:.3f}%")
+
+    # Never exiting means closing at 16:00, not running forever.
+    quiet = _session([100.0] * 30)
+    t = simulate(quiet, [0], stop_pct=5.0, target_pct=5.0)[0]
+    if t.outcome != "time":
+        failures.append(f"an unresolved trade should close at the bell, got {t.outcome}")
+
+    # --- recency weighting -------------------------------------------------
+    span = [date(2026, 6, 12) + timedelta(days=i) for i in range(40)]
+    w = recency_weights(span, half_life=10)
+    if abs(w[span[-1]] - 1.0) > 1e-9:
+        failures.append("the newest session should weigh 1")
+    if abs(w[span[-11]] - 0.5) > 1e-9:
+        failures.append(f"ten sessions back should weigh a half, got {w[span[-11]]}")
+    if abs(w[span[-21]] - 0.25) > 1e-9:
+        failures.append("twenty back should weigh a quarter")
+    if any(w[span[i]] > w[span[i + 1]] for i in range(len(span) - 1)):
+        failures.append("weights must rise with recency, never fall")
+
+    # Weighting discards information, and the effective sample says how
+    # much. Equal weights must come back as the real count.
+    if abs(effective_n([1.0] * 40) - 40) > 1e-9:
+        failures.append("equal weights are worth their own count")
+    if effective_n([w[d] for d in span]) >= 40:
+        failures.append("a weighted sample cannot be worth more than its count")
+    if effective_n([]) != 0.0:
+        failures.append("nothing weighs nothing")
+
+    # A weighted quantile with equal weights is an ordinary one, and
+    # piling weight on the low values must pull it down.
+    flat = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+    even = pd.Series([1.0] * 10)
+    mid = weighted_quantile(flat, even, 0.5)
+    if mid is None or not (4.5 <= mid <= 6.0):
+        failures.append(f"an evenly weighted median should sit mid-range: {mid}")
+    low_heavy = pd.Series([10.0] * 5 + [0.01] * 5)
+    pulled = weighted_quantile(flat, low_heavy, 0.5)
+    if pulled is None or pulled >= mid:
+        failures.append(f"weighting the low half must pull the quantile down: "
+                        f"{pulled} vs {mid}")
+    if weighted_quantile(flat, pd.Series([0.0] * 10), 0.5) is not None:
+        failures.append("weights summing to zero should yield nothing")
+    if weighted_quantile(pd.Series([], dtype=float), pd.Series([], dtype=float),
+                         0.5) is not None:
+        failures.append("no values should yield nothing")
+
+    # The stop is sized on winners only. Including the losers is what
+    # produced the 1% that had to be corrected.
+    rows = pd.DataFrame({
+        "ret_60": [2.0, 1.5, 0.8, -3.0, -4.0],
+        "mae_60": [-0.2, -0.4, -0.6, -3.0, -5.0],
+    })
+    won = winners(rows)
+    if len(won) != 3:
+        failures.append(f"three of those finished up 0.5%, got {len(won)}")
+    tight = stop_for(won)
+    loose = stop_for(rows)
+    if tight is None or loose is None or tight >= loose:
+        failures.append("sizing on winners must give a tighter stop than "
+                        "sizing on everything")
+    if stop_for(rows.iloc[0:0]) is not None:
+        failures.append("no rows should size no stop")
+
+    # MFE and MAE must bracket the realised move.
+    rows = signal_outcomes(up, [0])
+    if rows:
+        r = rows[0]
+        if not (r["mae_15"] <= r["ret_15"] <= r["mfe_15"]):
+            failures.append("MAE <= return <= MFE was violated")
+
+    # score() on nothing must not divide by zero.
+    if score([])["n"] != 0:
+        failures.append("score([]) should report zero trades")
+
+    # ---- the below-zero turn -------------------------------------------
+    # Built from explicit MACD columns rather than from prices, so this
+    # tests the staging and not the indicator (which has its own test).
+    def macd_frame(macd_values, signal_values):
+        frame = _session([100.0] * len(macd_values))
+        frame["macd"] = macd_values
+        frame["macd_signal"] = signal_values
+        frame["macd_gap"] = [m - s for m, s in zip(macd_values, signal_values)]
+        return frame
+
+    # Crosses above signal at bar 2 while below zero, gap widens every bar
+    # after, takes the zero line at bar 6.
+    good = macd_frame([-.9, -.8, -.6, -.5, -.3, -.1, .1, .3],
+                      [-.5, -.5, -.7, -.8, -.9, -1., -1.1, -1.2])
+    staged = below_zero_setups(good)
+    if len(staged) != 1:
+        failures.append(f"one below-zero set-up expected, got {len(staged)}")
+    else:
+        cross, diverged, zero = staged[0]
+        if cross != 2:
+            failures.append(f"the cross is at bar 2, got {cross}")
+        if diverged != 4:
+            failures.append(f"divergence confirms two widening bars after "
+                            f"the cross, at bar 4, got {diverged}")
+        if zero != 6:
+            failures.append(f"the zero line is taken at bar 6, got {zero}")
+
+    # THE FILTER THAT SECTION 11's TRIGGER LACKED: an identical cross
+    # that happens ABOVE zero is not this set-up at all.
+    high = macd_frame([.1, .2, .4, .5, .7, .9, 1.1, 1.3],
+                      [.5, .5, .3, .2, .1, 0., -.1, -.2])
+    if below_zero_setups(high):
+        failures.append("a cross above zero is not a below-zero set-up")
+
+    # A set-up that rolls back under its signal line is dead there, and
+    # a later zero crossing belongs to some other move.
+    died = macd_frame([-.9, -.8, -.6, -.5, -.9, -.4, .2, .4],
+                      [-.5, -.5, -.7, -.8, -.7, -.6, -.5, -.4])
+    staged = below_zero_setups(died)
+    if not staged or staged[0][2] is not None:
+        failures.append("a set-up that rolls over must not claim the zero "
+                        "line it never reached alive")
+
+    # Never reaches zero inside the window: stage 3 is simply absent.
+    slow = macd_frame([-.9, -.8, -.7, -.65, -.6, -.55, -.5, -.45],
+                      [-.5, -.5, -.8, -.85, -.9, -.95, -1., -1.05])
+    staged = below_zero_setups(slow)
+    if not staged or staged[0][2] is not None:
+        failures.append("a set-up that never takes zero must report None")
+
+    # The anti-look-ahead property, stated as a test: the early entry is
+    # taken on set-ups that later failed. If it were only ever taken on
+    # the ones that worked, this list would be empty.
+    failed_early = [d for _, d, z in below_zero_setups(slow)
+                    if d is not None and z is None]
+    if not failed_early:
+        failures.append("the early entry must exist on set-ups that never "
+                        "reached the zero line, or it is reading ahead")
+
+    # A frame with no MACD columns is silence, not a crash.
+    if below_zero_setups(_session([100.0, 100.1, 100.2])):
+        failures.append("no MACD columns should yield no set-ups")
+
+    print(f"  Triangle pivots found          : {kinds}")
+    print("  Sub-threshold noise pivots     : 0 (expected)")
+    print("  Bar touching both levels       : stop (pessimistic, as specified)")
+    print("  Entry fill price               : next bar's open")
+    print("  Unresolved trade               : closed at 16:00")
+    print("  Recency weights                : newest 1.0, one half-life back 0.5")
+    print(f"  40 sessions, half-life 10      : worth "
+          f"{effective_n([w[d] for d in span]):.0f} equally-weighted")
+    print("  Stop sizing                    : winners only, tighter than all")
+    print("  Below-zero turn                : cross 2, diverged 4, zero 6")
+    print("  Same cross above zero          : not a set-up")
+    print("  Set-up that rolls over         : dead at the re-cross")
+    print("  Early entry on failed set-ups  : present (no look-ahead)")
+    print("  Gap vs opening range           : measured from separate anchors")
+    print("  A minute with no trades        : read at-or-before, day kept")
+    print("  Noise floor                    : 7.5 points on 45 days")
+    print("  Cut and re-enter, by hand      : -0.60 then +0.80 is +0.20")
+    print("  Cut that misses the recovery   : reads worse than having waited")
+    print("  An entry never underwater      : one outcome, not four")
+    print(f"  Entries spaced by the clock    : no closer than {RECOVERY_EVERY} min")
+    print("  RSI                            : Wilder's, in core, pinned to his table")
+    print("  Filter vs matched control      : drift subtracted, not called an edge")
+    print("  Range position                 : knows only the bars before it")
+    print("  Nominate / confirm             : the split actually splits")
+    print("  Morning shape                  : read from the morning alone")
+    print("  Entries that share days        : error bar across days, not entries")
+
+
+    # --- section 14: the open ---------------------------------------------
+    # Two sessions so the second has a previous close to gap against.
+    thursday = _session([150.0] * 30 + [151.0] * 360)          # closes 151.00
+    # Opens at 149.00 (a -1.32% gap), sags to 148.50 by 09:45, then climbs
+    # all afternoon: a down open that reverses, which is the shape claimed.
+    friday = _session([149.0] * 15 + [148.5] * 15 + [152.0] * 360,
+                      first=SESSION_OPEN)
+    table = opening_rows({date(2026, 9, 17): thursday, date(2026, 9, 18): friday})
+    if len(table) != 1:
+        failures.append(f"the first day has no previous close and is dropped; "
+                        f"got {len(table)} rows")
+    else:
+        row = table.iloc[0]
+        if round(row["gap"], 2) != round(100 * (149.0 - 151.0) / 151.0, 2):
+            failures.append(f"gap should be prev close -> open: {row['gap']}")
+        if round(row["range"], 2) != round(100 * (148.5 - 149.0) / 149.0, 2):
+            failures.append(f"range should be open -> 09:45: {row['range']}")
+        # The range is measured FROM 09:45, so a rise after it is positive
+        # even though the day is still below its open. That distinction is
+        # the whole reason the two anchors are separate.
+        if not row["range_1200"] > 0:
+            failures.append("a climb after 09:45 is a positive range move")
+        if not row["gap_1200"] > 0:
+            failures.append("152.00 against a 149.00 open is a positive gap move")
+        # No horizon inside the defining window, or the reversal is partly
+        # arithmetic rather than a fact about the stock.
+        if row.get("range_1000") is None:
+            failures.append("10:00 is after 09:45 and should be measured")
+
+    # --- section 15: holding a loser against cutting and re-entering ------
+    # Worked by hand. Entry 100, cut floor 99.50, re-entry 99.25.
+    #   dips to 99.40  -> cut, -0.60%
+    #   dips to 99.20  -> back in below 99.25
+    #   recovers to 100.50 -> out at the original 100.00, +0.80%
+    #   net +0.20%, against 0.00% for waiting it out and -0.60% for
+    #   cutting and staying away.
+    worked = recovery_paths([100.0, 99.4, 99.2, 100.5], 0)
+    for path, want in (("hold to the close", 0.500), ("hold for break-even", 0.0),
+                       ("cut and stay out", -0.600), ("cut and get back in", 0.200)):
+        if round(worked.get(path, 99), 3) != want:
+            failures.append(f"recovery path {path!r}: {worked.get(path)} "
+                            f"against {want}")
+
+    # The case that decides whether the rule is worth having: it cuts you
+    # out, never falls the extra step, and then recovers without you.
+    missed = recovery_paths([100.0, 99.45, 99.6, 101.0], 0)
+    if round(missed["cut and get back in"], 3) != round(missed["cut and stay out"], 3):
+        failures.append("with no re-entry offered, getting back in cannot "
+                        "differ from staying out")
+    if not missed["cut and get back in"] < missed["hold for break-even"]:
+        failures.append("a cut that misses the recovery must read as worse "
+                        "than having waited -- that is the cost of the rule")
+
+    # Never goes against you: every path is the same, and none of them
+    # invents a trade that did not happen.
+    calm = recovery_paths([100.0, 100.2, 100.4], 0)
+    if len({round(v, 6) for v in calm.values()}) != 1:
+        failures.append(f"an entry that never went against you has one "
+                        f"outcome, not four: {calm}")
+
+    # Nothing looks past the last bar, and an entry on it has no future.
+    if recovery_paths([100.0, 99.0], 1) != {}:
+        failures.append("an entry on the final bar cannot be scored")
+
+    # Entries are spaced by the clock, not taken on every bar.
+    spaced = recovery_rows({date(2026, 9, 18): _session([150.0] * 400)})
+    if not spaced.empty:
+        gaps = spaced["at"].diff().dropna().dt.total_seconds() / 60
+        if (gaps < RECOVERY_EVERY).any():
+            failures.append(f"entries closer together than "
+                            f"{RECOVERY_EVERY} min: {sorted(gaps)[:3]}")
+
+    # A missing minute must not drop the day: price_at reads at-or-before.
+    gappy = _session([100.0] * 60)
+    gappy = gappy.drop(gappy.index[30])
+    if price_at(gappy, time(10, 0)) is None:
+        failures.append("a minute with no trades should not lose the reading")
+    if price_at(_session([100.0] * 5), time(8, 0)) is not None:
+        failures.append("nothing before 08:00 should read as nothing, not 0")
+
+    if round(noise_floor(45), 1) != 7.5:
+        failures.append(f"one standard error on 45 coin flips is 7.5 points, "
+                        f"got {noise_floor(45):.2f}")
+    if noise_floor(0) != 0.0:
+        failures.append("no days is no noise floor, not a division by zero")
+
+    if failures:
+        print("\nFAILED:")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    print("\nAll checks passed. The math is sound; now run it against real data.")
+    return 0
+
+
+# --------------------------------------------------------------------------
+
+def cross_symbol(symbols: Sequence[str], days: Sequence[date], macd: Macd,
+                 earliest: time) -> int:
+    """The pre-registered VWAP rule, on symbols it was not invented on.
+
+    Not a test of SPCX -- nothing can be, until time passes. A test of the
+    reason the idea was proposed: that VWAP is a line behaviour changes at.
+    A mechanism that only exists in the seventy days that suggested it is
+    not a mechanism.
+    """
+    lo, hi = HYPOTHESIS_WINDOW
+    stop, target = HYPOTHESIS_BRACKET
+    print(f"\n{'=' * 76}")
+    print("  THE VWAP RULE, ON SYMBOLS IT WAS NOT FOUND ON")
+    print(f"{'=' * 76}")
+    print(f"  A signal between {lo:%H:%M} and {hi:%H:%M} with price above VWAP, "
+          f"{stop:.2f}% stop,")
+    print(f"  {target:.2f}% target. Fixed in advance, identical for every symbol, "
+          f"scored")
+    print("  against random entry under the same conditions.\n")
+    print(f"  {len(days)} trading days per symbol, MACD {macd}, volume "
+          f"condition off.\n")
+
+    def picks(session, signals_only: bool):
+        if "vwap" not in session:
+            return []
+        out = []
+        for i in range(len(session)):
+            stamp = session.index[i]
+            if not (lo <= stamp.time() < hi):
+                continue
+            close, vwap = session["close"].iloc[i], session["vwap"].iloc[i]
+            if not (vwap == vwap and close > vwap):
+                continue
+            if signals_only:
+                if bool(session["alert"].iloc[i]):
+                    out.append(i)
+            elif i % BASELINE_STRIDE == 0:
+                out.append(i)
+        return out
+
+    print(f"  {'Symbol':<10}{'Days':>7}{'n':>8}{'Signal':>10}{'Random':>10}{'Edge':>10}")
+    pooled_signal, pooled_random = [], []
+    for symbol in symbols:
+        sessions: Dict[date, pd.DataFrame] = {}
+        for day in days:
+            try:
+                raw = fetch_extended(symbol, day, "sip")
+            except Exception:  # noqa: BLE001 -- one symbol short is not fatal
+                continue
+            if raw.empty:
+                continue
+            session = add_conditions(prepare(raw, macd), False, earliest)
+            if not session.empty:
+                sessions[day] = session
+
+        sig_trades, rnd_trades = [], []
+        for session in sessions.values():
+            sig_trades += simulate(session, picks(session, True), stop, target)
+            rnd_trades += simulate(session, picks(session, False), stop, target)
+        pooled_signal += sig_trades
+        pooled_random += rnd_trades
+
+        sig, rnd = score(sig_trades), score(rnd_trades)
+        if sig["n"] < 20 or rnd["n"] < 20:
+            body = f"{sig['n']:>8}{'--':>10}{'--':>10}{'too few':>10}"
+        else:
+            body = (f"{sig['n']:>8}{sig['avg_return']:>10.3f}"
+                    f"{rnd['avg_return']:>10.3f}"
+                    f"{sig['avg_return'] - rnd['avg_return']:>10.3f}")
+        print(f"  {symbol:<10}{len(sessions):>7}{body}")
+
+    sig, rnd = score(pooled_signal), score(pooled_random)
+    print(f"  {'-' * 53}")
+    if sig["n"] < 20 or rnd["n"] < 20:
+        print(f"  {'POOLED':<10}{'':>7}{sig['n']:>8}{'--':>10}{'--':>10}"
+              f"{'too few':>10}")
+        print("\n  Not enough trades anywhere to say anything.")
+        return 1
+
+    edge = sig["avg_return"] - rnd["avg_return"]
+    print(f"  {'POOLED':<10}{'':>7}{sig['n']:>8}{sig['avg_return']:>10.3f}"
+          f"{rnd['avg_return']:>10.3f}{edge:>10.3f}")
+
+    print(f"\n  The POOLED row is the answer. Individual symbols are "
+          f"{len(symbols)} chances")
+    print("  at a false positive, and one of them looking good is what noise "
+          "does.")
+    if edge <= 0:
+        print(f"\n  -> {edge:+.3f}%. The rule did not beat random entry under "
+              f"its own")
+        print("     conditions on symbols it was not invented on. The VWAP")
+        print("     filter is not a mechanism; it was a pattern in the seventy")
+        print("     days that suggested it.")
+    elif edge < MIN_EDGE_PCT:
+        print(f"\n  -> {edge:+.3f}%, under {MIN_EDGE_PCT}% and therefore inside "
+              f"the spread.")
+        print("     Real in sign, worth nothing after costs. Not tradeable, and")
+        print("     not a reason to change anything.")
+    else:
+        print(f"\n  -> {edge:+.3f}%, above the {MIN_EDGE_PCT}% noise floor, on "
+              f"symbols the")
+        print("     idea was not built on. That is the first result in this")
+        print("     project to survive a test it could have failed. Worth")
+        print("     pursuing -- and still not proof about SPCX, which needs")
+        print("     its own forward test.")
+    print(f"{'=' * 76}\n")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Measure SPCX's swings and brackets.")
+    parser.add_argument("--symbol", default="SPCX")
+    parser.add_argument("--days", type=int, default=30, help="Trading days (default 30)")
+    parser.add_argument("--date", help="End on this day, YYYY-MM-DD (default: yesterday)")
+    parser.add_argument("--macd", help="fast,slow,signal (default 9,17,6)")
+    parser.add_argument("--csv", default=None)
+    parser.add_argument("--no-volume", action="store_true",
+                        help="Drop condition (d), the volume test")
+    parser.add_argument("--from", dest="earliest", default="09:45",
+                        help="Earliest signal time, ET (default 09:45; 09:30 is the open)")
+    parser.add_argument("--cross-symbol", nargs="?", const=",".join(CROSS_SYMBOLS),
+                        metavar="AAPL,MSFT",
+                        help="Run the pre-registered VWAP rule on other symbols "
+                             "instead of the full study. SPCX listed in June 2026 "
+                             "so it has no out-of-sample past; this tests the "
+                             "reason the idea was proposed, not the stock. "
+                             f"Default set: {','.join(CROSS_SYMBOLS)}")
+    parser.add_argument("--market", default=BENCHMARK_SYMBOL,
+                        help=f"Symbol for the market filter in section 16 "
+                             f"(default {BENCHMARK_SYMBOL}). Empty string to "
+                             f"skip it and save a fetch per day.")
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+
+    if args.self_test:
+        return self_test()
+
+    macd = Macd.parse(args.macd) if args.macd else DEFAULT_MACD
+    end = (datetime.strptime(args.date, "%Y-%m-%d").date() if args.date
+           else date.today() - timedelta(days=1))
+    days = trading_days(end, max(1, args.days))
+    symbol = args.symbol.upper()
+    require_volume = not args.no_volume
+    earliest = parse_clock(args.earliest)
+    active = [CONDITIONS[c] for c in CONDITIONS if c != "cond_d_volume" or require_volume]
+    print("Conditions: " + ", ".join(active).replace("(e) after 09:45",
+                                                     f"(e) after {earliest:%H:%M}"))
+
+    if args.cross_symbol:
+        names = [n.strip().upper() for n in args.cross_symbol.split(",") if n.strip()]
+        return cross_symbol(names, days, macd, earliest)
+
+    print(f"Fetching {symbol} 1-minute bars for {len(days)} trading days from SIP...")
+    sessions: Dict[date, pd.DataFrame] = {}
+    empty: List[date] = []
+    errors: List[Tuple[date, str]] = []
+    shown = 0                       # identical errors already printed
+    for n, day in enumerate(days, 1):
+        try:
+            raw = fetch_extended(symbol, day, "sip")
+        except Exception as exc:  # noqa: BLE001 -- the message is the point
+            kind = f"{type(exc).__name__}: {exc}"
+            errors.append((day, kind))
+            # One cause repeated is one fact. Printing it once per day turns
+            # the message that matters into a wall nobody reads to the end
+            # of -- and a network that is down is down for all of them.
+            same = sum(1 for _, k in errors if k == kind)
+            if same <= 2:
+                print(f"  {day:%Y-%m-%d}  failed: {kind}")
+                shown += 1
+            elif same == 3:
+                print(f"  {day:%Y-%m-%d}  failed: (same again -- further "
+                      f"identical failures counted, not printed)")
+            continue
+        if raw.empty:
+            empty.append(day)
+            continue
+        session = add_conditions(prepare(raw, macd), require_volume, earliest)
+        if session.empty:
+            empty.append(day)
+            continue
+        sessions[day] = session
+        if n % 5 == 0 or n == len(days):
+            print(f"  {n}/{len(days)} days fetched...")
+
+    if errors:
+        kinds = {k for _, k in errors}
+        print(f"\n  {len(errors)} of {len(days)} days failed to fetch.")
+        if len(kinds) == 1:
+            print(f"  Every one of them with the same error, so this is one "
+                  f"problem and not {len(errors)}:")
+            print(f"    {errors[0][1][:150]}")
+            if "resolve" in errors[0][1].lower() or "NameResolution" in errors[0][1]:
+                print("  That is your machine's name resolution, not Alpaca and "
+                      "not this")
+                print("  code. Check the network, a VPN, or Tailscale, then run "
+                      "it again.")
+
+    if empty:
+        # A long unbroken run of empty days is not a run of holidays. It is a
+        # symbol that was not trading -- which is a more useful thing to be
+        # told, and for a recent listing it is the whole explanation.
+        runs, run = [], [empty[0]]
+        for previous, day in zip(empty, empty[1:]):
+            if (days.index(day) - days.index(previous)) == 1:
+                run.append(day)
+            else:
+                runs.append(run)
+                run = [day]
+        runs.append(run)
+        longest = max(runs, key=len)
+        print(f"\n  {len(empty)} of {len(days)} days returned no bars.")
+        if len(longest) >= 5:
+            print(f"  {longest[0]} to {longest[-1]} is {len(longest)} consecutive "
+                  f"sessions,")
+            print(f"  which is not a run of holidays -- {symbol} was almost "
+                  f"certainly not")
+            print("  trading then. For a recent listing that is the whole story.")
+
+    if not sessions:
+        print(f"\nNo usable data for {symbol}. Try --symbol AAPL to check the setup.")
+        return 1
+
+    setup = ("volume condition OFF" if not require_volume else "volume condition on")
+    setup += f" · signals from {earliest:%H:%M}"
+    markets: Dict[date, pd.Series] = {}
+    if args.market:
+        print(f"Fetching {args.market} for the market filter...")
+        markets = market_moves(args.market.upper(), sessions)
+        got = len(markets)
+        if got < len(sessions):
+            # Said out loud: a partly-fetched market series makes one filter
+            # quietly thinner than the other four, and a thinner sample has
+            # a higher noise floor. Better to know which number is weaker.
+            print(f"  {args.market.upper()}: {got} of {len(sessions)} days "
+                  f"({len(sessions) - got} missing; that filter is scored on "
+                  f"the days it has)")
+
+    outcomes = report(symbol, macd, sessions, setup, markets)
+
+    if not outcomes.empty:
+        path = args.csv or f"{symbol}_signals_{days[0]:%Y%m%d}_{days[-1]:%Y%m%d}.csv"
+        outcomes.to_csv(path, index=False)
+        print(f"Per-signal outcomes written to {path}\n")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

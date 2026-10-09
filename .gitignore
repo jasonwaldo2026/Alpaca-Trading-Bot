@@ -38,3 +38,30 @@ floats.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Trade records — personal financial data, never committed.
+# daily_report.py reads these if present and draws nothing if not, so a
+# checkout without them still builds every chart.
+#
+# These rules used to name the files: trades*.csv, *_fills.csv and so on.
+# That was backwards. A broker export arrives called whatever the broker
+# felt like -- 9-25-26_Robinhood.csv, 9-25-26_IBKR.xlsx -- and neither of
+# those matched any pattern here, so the real files this tool was written
+# for were the ones it would have let through. The listing is public.
+#
+# So the class is blocked instead of the names, and nothing tracked in
+# tools/ is a spreadsheet or a CSV, so this costs nothing. Add an
+# exception deliberately if that ever changes; the data files that DO
+# belong in version control (notes.json and the two calendars) are JSON
+# and are unaffected.
+tools/*.csv
+tools/*.tsv
+tools/*.xlsx
+tools/*.xlsm
+tools/*.xls
+tools/trades*.json
+tools/*statement*
+tools/*confirmation*
+# Generated reports carry positions and P&L in the header.
+tools/*.pdf
+!tools/primer/SPCX_primer.pdf
