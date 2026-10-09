@@ -718,6 +718,17 @@ class Alarms:
     #: decline is not news when you are already flat, and an alarm that
     #: rings for both is an alarm you start ignoring.
     up_only: bool = False
+    #: Anchor for the level alarm: a price you name, or None to use
+    #: today's regular-session close. A held position asks "how far from
+    #: the close", or "how far from what I paid" -- neither is a question
+    #: about the last five minutes.
+    anchor_price: Optional[float] = None
+    #: Which side of the band price is currently outside, so a level that
+    #: STAYS true rings once per crossing rather than every minute. It
+    #: clears when price comes back inside, which re-arms it -- the same
+    #: reasoning as the scanner's dedupe: a lapsed setup that returns has
+    #: to be able to alert again, or it is silenced forever.
+    beyond: Optional[str] = None
     fired: Dict[str, datetime] = field(default_factory=dict)
     above_vwap: Optional[bool] = None
     recent: List[Tuple[datetime, float]] = field(default_factory=list)
@@ -732,6 +743,54 @@ class Alarms:
         if was is None or was == now_above:
             return None
         return "buy" if now_above else "sell"
+
+    def anchor_for(self, day: Optional[Day]) -> Optional[float]:
+        """The price the level alarm measures from, or None if there is
+        none yet.
+
+        A named price wins. Otherwise today's regular-session close, which
+        read_day freezes at 16:00 -- so after the bell it is exactly the
+        number every quote screen compares an after-hours print against.
+        None means the watcher was started with no regular-hours bars to
+        close on; run_live says so out loud rather than leaving the alarm
+        quietly switched off.
+        """
+        if self.anchor_price:
+            return self.anchor_price
+        return day.last if day is not None else None
+
+    def _level(self, candle: Candle,
+               day: Optional[Day]) -> Optional[Tuple[str, float, float]]:
+        """(direction, percent, anchor) once price sits far enough from the
+        anchor -- with NO time window at all.
+
+        The 5-minute window in _move measures SPEED, and after hours there
+        is none: a 0.6% slide spread over forty minutes is 0.08% per
+        five-minute slice and never trips it. Over an evening that is the
+        difference between being told and not. So this asks the other
+        question -- how far from the anchor are we, however long it took.
+
+        Regular hours are left alone: inside the session the speed alarm
+        is the one that has been calibrated, and a level alarm on top of
+        it would ring all afternoon on any trending day.
+        """
+        if candle.at.time() < REGULAR_CLOSE:
+            self.beyond = None
+            return None
+        anchor = self.anchor_for(day)
+        if not anchor:
+            return None
+        percent = 100.0 * (candle.close - anchor) / anchor
+        if self.up_only and percent <= 0:
+            return None
+        if abs(percent) < self.percent:
+            self.beyond = None          # back inside the band: re-arm
+            return None
+        side = "buy" if percent > 0 else "sell"
+        if self.beyond == side:
+            return None                 # this crossing already rang
+        self.beyond = side
+        return side, percent, anchor
 
     def _move(self, candle: Candle) -> Optional[Tuple[str, float, float]]:
         """(direction, percent, minutes) once price has travelled far enough.
@@ -768,7 +827,21 @@ class Alarms:
         be the move since the last thing that happened to be interesting.
         """
         self._cross(day)
+        # Both sides see every bar, fired or not: _move's window and
+        # _level's crossing state are only correct if nothing is skipped.
         moved = self._move(candle)
+        level = self._level(candle, day)
+
+        # The level alarm answers the question a HELD position asks, so it
+        # speaks first when both have something to say.
+        if level is not None:
+            side, percent, anchor = level
+            whence = ("your price" if self.anchor_price
+                      else f"the {REGULAR_CLOSE:%H:%M} close")
+            return side, (f"{'up' if percent > 0 else 'down'} "
+                          f"{abs(percent):.2f}% from {whence} "
+                          f"({anchor:.2f} \u2192 {candle.close:.2f})")
+
         if not moved:
             return None
         direction, percent, over = moved
@@ -1308,7 +1381,8 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
              move_percent: float = MOVE_PERCENT,
              move_minutes: int = MOVE_MINUTES,
              alarm_volume: float = ALARM_VOLUME,
-             up_only: bool = False) -> int:
+             up_only: bool = False,
+             from_price: Optional[float] = None) -> int:
     """Follow the session: full detail early, then only the unusual."""
     today = datetime.now(ET).date()
     window_start = datetime.combine(today, start, tzinfo=ET)
@@ -1365,7 +1439,19 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
     # per-message fetch would put a network call between a spike and the
     # phone. None is survivable: the day's move is the line that goes.
     alarms = Alarms(percent=move_percent, minutes=move_minutes,
-                    volume=alarm_volume, up_only=up_only)
+                    volume=alarm_volume, up_only=up_only,
+                    anchor_price=from_price)
+    # Say which anchor the level alarm will use. Printing the policy is
+    # the cheap half; the warning below is the half that matters, because
+    # an alarm that cannot arm is indistinguishable from a quiet tape.
+    if from_price:
+        print(f"After-hours level alarm: {move_percent:.2f}% from "
+              f"{from_price:.2f} (your price).\n")
+    else:
+        print(f"After-hours level alarm: {move_percent:.2f}% from today's "
+              f"{REGULAR_CLOSE:%H:%M} close, once there is one.\n")
+    warned_no_anchor = False
+
     prev_close = previous_close(symbol, today)
     # The benchmark's own yesterday, fetched once. If either half is
     # missing the market line is simply absent -- it is context, and no
@@ -1420,6 +1506,14 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 # with participation behind it earns a noise, because a
                 # phone that shouts at every busy minute is a phone whose
                 # shouting stops meaning anything.
+                if (stamp.time() >= REGULAR_CLOSE
+                        and alarms.anchor_for(day) is None
+                        and not warned_no_anchor):
+                    warned_no_anchor = True
+                    print("  ** after-hours level alarm has NO ANCHOR: no "
+                          "regular-hours bars to close on. Pass --from-price "
+                          "to arm it. **")
+
                 call = alarms.reason(minute, lean, day)
                 ringing = call is not None and alarms.should_sound(call[0], stamp)
                 # Past the detail window only the unusual leaves the machine.
@@ -1931,6 +2025,85 @@ def self_test() -> int:
                 f"an after-hours alarm fires without volume confirmation, so "
                 f"the message has to say so: {fired[1]!r}")
 
+    # THE SLOW SLIDE. 0.6% spread over forty minutes is 0.08% per
+    # five-minute slice, so the speed alarm in _move cannot see it at any
+    # threshold worth having -- and after hours that is the normal shape
+    # of a move. Holding a position through an evening, the question is
+    # not "how fast" but "how far from the close", so _level asks that
+    # with no time window at all.
+    #
+    # Real numbers from 9 Oct: close 163.27, drifting to 162.29 is -0.60%.
+    close_at_four = 163.27
+    def evening(price, at_minute):
+        when = datetime.combine(date(2026, 10, 9), time(16, 30), tzinfo=ET) \
+            + timedelta(minutes=at_minute)
+        bar = Candle(at=when, open=price, high=price + 0.02, low=price - 0.02,
+                     close=price, volume=9_000, usual_volume=None)
+        # day.last is the REGULAR-session close: read_day cuts at 16:00, so
+        # after the bell it stays put however far the after-hours tape goes.
+        return (bar, Lean(0.5, 5, 5, 5, volume_ratio=1.0),
+                Day(last=close_at_four, high=164.0, low=161.0,
+                    prev_close=158.90, vwap=close_at_four))
+
+    slide = [close_at_four * (1 - 0.0065 * m / 39) for m in range(40)]
+
+    # The speed alarm, alone, must be blind to it. If this ever starts
+    # firing, the level alarm below is no longer earning its place.
+    speed = Alarms(percent=0.6)
+    if any(speed._move(evening(px, m)[0]) for m, px in enumerate(slide)):
+        failures.append("a 0.65% drift over 40 minutes is 0.08% per 5-minute "
+                        "slice; the speed alarm must not see it, or this "
+                        "test is not testing the thing it was written for")
+
+    # The level alarm must ring, ONCE, and say what it measured from.
+    level = Alarms(percent=0.6)
+    rings = [level.reason(*evening(px, m)) for m, px in enumerate(slide)]
+    rang = [r for r in rings if r is not None]
+    if len(rang) != 1:
+        failures.append(
+            f"a slow slide past 0.6% from the close must ring exactly once, "
+            f"not {len(rang)} times: a level that stays true would otherwise "
+            f"ring every minute until the alerts stopped meaning anything")
+    elif rang[0][0] != "sell" or "from the 16:00 close" not in rang[0][1]:
+        failures.append(f"the level alarm should sell and name its anchor, "
+                        f"got {rang[0]!r}")
+
+    # Back inside the band, then out again: the second crossing is a new
+    # event and has to ring. Accumulating instead would silence it forever.
+    #
+    # Asserted against _level directly, not reason(). A fall quick enough
+    # to re-cross in a couple of bars also trips the SPEED alarm, so
+    # reason() would answer "something rang" either way and the re-arm
+    # could rot untested behind it -- which is exactly what the first
+    # draft of this test did.
+    back = [close_at_four] * 3 + [close_at_four * 0.99]
+    again = [level._level(evening(px, 40 + m)[0], evening(px, 40 + m)[2])
+             for m, px in enumerate(back)]
+    if again[-1] is None:
+        failures.append("price that returns inside the band and falls out "
+                        "again is a new crossing: the level alarm has to "
+                        "re-arm when price comes back inside, or one lapsed "
+                        "setup silences it for the rest of the evening")
+    if any(r is not None for r in again[:3]):
+        failures.append(f"back at the close is inside the band and must be "
+                        f"silent, not {again[:3]!r}")
+
+    # A named anchor wins over the close, and the SAME BARS then give the
+    # opposite verdict: 163 is 0.6% BELOW the 163.27 close and 2% ABOVE a
+    # 160.00 entry. If the anchor were ignored, both would read alike.
+    mine = Alarms(percent=0.6, anchor_price=160.00)
+    said = None
+    for m, px in enumerate(slide):
+        said = said or mine.reason(*evening(px, m))
+    if not said or said[0] != "buy":
+        failures.append(
+            f"anchored on a 160.00 entry, bars near 163 are 2% UP and must "
+            f"ring buy -- the same bars the close anchor calls a 0.6% fall. "
+            f"Got {said!r}; the anchor is being ignored.")
+    elif "from your price" not in said[1]:
+        failures.append(f"with --from-price the message must name the anchor "
+                        f"as yours, not the close: {said[1]!r}")
+
     # ...but only while it is inside the window.
     stale = Alarms()
     bar, lean, dctx, when = reading(0.50, 2.0, price=150.5, at_minute=0)
@@ -2134,6 +2307,11 @@ def main() -> int:
                              f"(default {MOVE_PERCENT}%%). Tune it with "
                              f"--replay against a past session rather than "
                              f"by ear")
+    parser.add_argument("--from-price", type=float, default=None,
+                        metavar="PRICE",
+                        help="Anchor the after-hours level alarm on this "
+                             "price -- your entry, say -- instead of today's "
+                             "regular-session close")
     parser.add_argument("--up-only", action="store_true",
                         help="Ring on run-ups only; stay silent on declines. "
                              "For a day spent flat, watching for a reason to "
@@ -2202,7 +2380,7 @@ def main() -> int:
                     args.volume_alert, args.pdf_every, args.db, detail,
                     args.buy_sound, args.sell_sound,
                     args.move_percent, args.move_minutes,
-                    args.alarm_volume, args.up_only)
+                    args.alarm_volume, args.up_only, args.from_price)
 
 
 if __name__ == "__main__":
