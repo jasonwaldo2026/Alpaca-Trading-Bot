@@ -106,6 +106,13 @@ BAR_MINUTES = 5
 WINDOW_START = time(9, 15)
 WINDOW_END = time(16, 0)
 
+#: When regular trading hours end. Past it the tape is a different
+#: animal: a few hundred shares can print, and the volume baseline is
+#: thin to absent. The move alarm stops requiring volume confirmation
+#: after this -- see Alarms.reason, which is the only thing that made
+#: an after-hours alarm possible at all.
+REGULAR_CLOSE = time(16, 0)
+
 # Up to here the phone gets everything: a quiet line each minute and an
 # alarm each candle. After it, only the unusual -- a volume spike -- is
 # worth an interruption at a desk job. The readings keep being computed,
@@ -255,6 +262,13 @@ def volume_baselines(symbol: str, day: date,
     open, and averaging across them is what made an earlier relative-
     volume rule fire in the deadest hours of the day.
 
+    The window runs 04:00-20:00, the whole extended session. It used to
+    stop at 16:00, which left every after-hours slot without a median --
+    so vol_ratio was None after the close, the move alarm's volume gate
+    could never pass, and no after-hours alarm could fire at all. The
+    gate no longer applies then (see Alarms.reason), but the ratio is
+    still worth having in the message.
+
     `force_sip` must match the feed the readings come from. SIP is the
     whole tape and IEX is one venue carrying a fraction of it, so a
     baseline built on one and compared against the other is not a ratio
@@ -268,7 +282,7 @@ def volume_baselines(symbol: str, day: date,
             minutes = fetch_minutes(
                 symbol,
                 datetime.combine(past, time(4, 0), tzinfo=ET),
-                datetime.combine(past, time(16, 0), tzinfo=ET),
+                datetime.combine(past, time(20, 0), tzinfo=ET),
                 force_sip=force_sip,
             )
         except Exception:  # noqa: BLE001 -- a baseline is a nicety, not a requirement
@@ -755,13 +769,27 @@ class Alarms:
         """
         self._cross(day)
         moved = self._move(candle)
-        loud = candle.vol_ratio is not None and candle.vol_ratio >= self.volume
-        if not (moved and loud):
+        if not moved:
             return None
         direction, percent, over = moved
-        return direction, (f"{'up' if percent > 0 else 'down'} "
-                           f"{abs(percent):.2f}% in {over:.0f} min on "
-                           f"{candle.vol_ratio:.1f}x volume")
+
+        # Volume confirmation is a regular-hours idea. After the close
+        # there is barely any volume to be unusual against, and a gate
+        # that cannot pass is not a filter -- it is silence. Price alone
+        # rings then, and the message says the confirmation is missing
+        # so the reading is never mistaken for a confirmed one.
+        loud = candle.vol_ratio is not None and candle.vol_ratio >= self.volume
+        after_hours = candle.at.time() >= REGULAR_CLOSE
+        if not (loud or after_hours):
+            return None
+
+        why = (f"{'up' if percent > 0 else 'down'} "
+               f"{abs(percent):.2f}% in {over:.0f} min")
+        if candle.vol_ratio is not None:
+            why += f" on {candle.vol_ratio:.1f}x volume"
+        if after_hours and not loud:
+            why += " \u00b7 after hours, no volume confirmation"
+        return direction, why
 
     def should_sound(self, direction: str, at: datetime) -> bool:
         last = self.fired.get(direction)
@@ -1790,11 +1818,16 @@ def self_test() -> int:
         failures.append("the routine stream must be quieter than the alarm")
 
     # --- what earns a noise ------------------------------------------------
-    def reading(score, ratio, price=150.5, vwap_gap=1.0, at_minute=35):
-        """A candle, its lean and its day, at one clock minute."""
-        when = datetime.combine(date(2026, 9, 18), time(10, at_minute), tzinfo=ET)
+    def reading(score, ratio, price=150.5, vwap_gap=1.0, at_minute=35,
+                hour=10, usual=40_000):
+        """A candle, its lean and its day, at one clock minute.
+
+        `usual=None` is an after-hours slot the baseline never saw, which
+        is what makes vol_ratio None and the volume gate impassable.
+        """
+        when = datetime.combine(date(2026, 9, 18), time(hour, at_minute), tzinfo=ET)
         bar = Candle(at=when, open=price, high=price + 0.5, low=price - 0.5,
-                     close=price, volume=ratio * 40_000, usual_volume=40_000)
+                     close=price, volume=ratio * 40_000, usual_volume=usual)
         return (bar, Lean(score, 5, 5, 5, volume_ratio=ratio),
                 Day(last=price, high=151.0, low=149.0,
                     prev_close=149.0, vwap=price - vwap_gap), when)
@@ -1867,6 +1900,36 @@ def self_test() -> int:
                 failures.append(
                     f"up_only={up_only}: {way} should give {want!r}, got "
                     f"{got!r}")
+
+    # AFTER HOURS. The baseline is built from past sessions, so a 17:30
+    # slot it never saw leaves usual_volume None, vol_ratio None, and the
+    # volume gate impassable. Before this, no after-hours alarm could
+    # fire at all -- the watcher ran, printed, and said nothing however
+    # far price fell. Holding a position overnight is exactly when that
+    # silence costs money, so price alone has to ring after the close.
+    #
+    # The control is the same slide at 10:30 on the same ordinary volume:
+    # inside regular hours the gate still has to hold, or this fix has
+    # quietly removed volume confirmation from the whole session.
+    for hour, usual, want, where in ((17, None, "sell", "after hours"),
+                                     (10, 40_000, None, "regular hours")):
+        alarm = Alarms()
+        fired = None
+        for minute in range(6):
+            bar, lean, dctx, when = reading(
+                0.50, 1.0, price=150.5 * (1 - 0.0015 * minute),
+                at_minute=30 + minute, hour=hour, usual=usual)
+            fired = fired or alarm.reason(bar, lean, dctx)
+        got = fired[0] if fired else None
+        if got != want:
+            failures.append(
+                f"{where}: a 0.75% slide on ordinary volume should give "
+                f"{want!r}, got {got!r}. After the close price alone must "
+                f"ring; inside regular hours the volume gate must hold.")
+        if hour == 17 and fired and "no volume confirmation" not in fired[1]:
+            failures.append(
+                f"an after-hours alarm fires without volume confirmation, so "
+                f"the message has to say so: {fired[1]!r}")
 
     # ...but only while it is inside the window.
     stale = Alarms()
