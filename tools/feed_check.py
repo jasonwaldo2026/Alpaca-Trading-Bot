@@ -63,7 +63,7 @@ import sys
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -199,6 +199,38 @@ def add_rsi(frame: pd.DataFrame, period: int = RSI_PERIOD) -> pd.DataFrame:
         rsi[i] = value(avg_gain, avg_loss)
     df["rsi"] = rsi
     return df
+
+
+def efficiency(closes: Sequence[float]) -> float:
+    """How much of the distance travelled actually went somewhere, 0 to 1.
+
+    Net move divided by path length. A clean trend scores near 1.0 --
+    every step carried price further from where it started. A chopped-up
+    stretch scores near 0.1: two dollars of ground covered, finishing
+    where it began.
+
+    That second case is the one that punishes a dip-buyer. The entries
+    look identical to the good days and the setup forms the same way; it
+    just does not go anywhere afterwards.
+
+    DIRECTIONLESS BY CONSTRUCTION. A clean selloff is just as efficient
+    as a clean rally, so this alone cannot say whether a morning was
+    good or bad -- only whether it was ORDERLY. Anything reading it has
+    to pair it with the sign of the move, or it will file a straight-line
+    collapse under the same heading as a straight-line rally.
+
+    NaN when price never moved at all: no travel and no net move is 0/0,
+    which is an absence of information rather than perfect efficiency,
+    and returning 1.0 there would file a dead flat hour as the cleanest
+    trend of the quarter.
+    """
+    if closes is None or len(closes) < 2:
+        return float("nan")
+    values = [float(c) for c in closes]
+    travelled = sum(abs(b - a) for a, b in zip(values, values[1:]))
+    if travelled <= 0.0:
+        return float("nan")
+    return abs(values[-1] - values[0]) / travelled
 
 
 def add_vwap(session: pd.DataFrame) -> pd.DataFrame:
@@ -647,6 +679,28 @@ def self_test() -> int:
         failures.append("pre-market bars leaked into the session output")
     if not warm.attrs.get("macd_warm_at_open"):
         failures.append("60 pre-market bars should be enough to warm a 9/17/6 MACD")
+
+    # Efficiency: how much of the distance travelled went somewhere.
+    for eff_case, eff_closes, eff_want in (
+            ("a straight rally", [10.0 + i for i in range(6)], 1.0),
+            # The one that matters: a collapse is just as ORDERLY as a
+            # rally. Anything reading this without the sign of the move
+            # files a straight-line selloff as a clean trending day.
+            ("a straight selloff", [15.0 - i for i in range(6)], 1.0),
+            ("perfect chop", [10.0, 11.0, 10.0, 11.0, 10.0, 11.0, 10.0], 0.0),
+            ("chop with a drift", [10.0, 11.0, 10.5, 11.5, 11.0, 12.0, 11.5], 1/3)):
+        eff_got = efficiency(eff_closes)
+        if abs(eff_got - eff_want) > 0.001:
+            failures.append(f"efficiency of {eff_case} should be {eff_want:.3f}, "
+                            f"got {eff_got:.3f}")
+    # Never moved is 0/0 -- an absence of information, not perfection. As
+    # 1.0 it would file a dead flat hour as the cleanest trend there is.
+    for eff_case, eff_closes in (("dead flat", [10.0] * 4),
+                                 ("a single bar", [10.0]),
+                                 ("nothing at all", [])):
+        if efficiency(eff_closes) == efficiency(eff_closes):      # not NaN
+            failures.append(f"efficiency of {eff_case} must be NaN, got "
+                            f"{efficiency(eff_closes)}")
 
     # RSI, pinned against Wilder's own worked example. The seeding is the
     # whole test: an exponential average started from the first bar gives

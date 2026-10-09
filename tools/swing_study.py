@@ -66,6 +66,7 @@ from feed_check import (
     SESSION_OPEN,
     Macd,
     add_conditions,
+    efficiency,
     fetch_extended,
     parse_clock,
     prepare,
@@ -890,6 +891,115 @@ def filter_study(signals: pd.DataFrame, control: pd.DataFrame,
             row[f"{half}_floor"] = noise_floor(n)
         out.append(row)
     return out
+
+
+#: The morning window the character of a day is judged from. It has to
+#: END while there is still a day left to act on: a measure taken at the
+#: close describes a day you have already traded.
+CHOP_WINDOW = (time(9, 30), time(10, 30))
+
+#: Days are sorted by morning efficiency and the bottom third called
+#: choppy. A fraction rather than a fixed number because efficiency is
+#: not comparable between stocks or eras, and -- this is the part that
+#: matters -- a tercile of the EFFICIENCY column never looks at what the
+#: afternoon did. A threshold tuned against outcomes would be the
+#: heavy-volume row all over again.
+CHOP_FRACTION = 1.0 / 3.0
+
+
+def morning_shape(session: pd.DataFrame) -> Tuple[float, float]:
+    """(efficiency, net move %) over the morning window.
+
+    Both, never efficiency alone. A straight-line collapse is exactly as
+    EFFICIENT as a straight-line rally -- the measure is directionless by
+    construction -- so a bucket built on it without the sign would file
+    the worst mornings of the quarter under "clean trend".
+    """
+    lo, hi = CHOP_WINDOW
+    window = session[(session.index.time >= lo) & (session.index.time < hi)]
+    if len(window) < 2:
+        return float("nan"), float("nan")
+    closes = window["close"].to_numpy()
+    first = float(closes[0])
+    if not first:
+        return float("nan"), float("nan")
+    return efficiency(closes), 100.0 * (float(closes[-1]) - first) / first
+
+
+def day_shapes(sessions: Dict[date, pd.DataFrame]) -> Dict[date, str]:
+    """Each day labelled from its morning alone: choppy, up or down.
+
+    The label is assigned from the EFFICIENCY ordering and the sign of
+    the move, and from nothing else. No outcome of the afternoon reaches
+    this function, which is what lets the afternoon be the test.
+    """
+    shape: Dict[date, Tuple[float, float]] = {}
+    for day, session in sessions.items():
+        eff, move = morning_shape(session)
+        if eff == eff:                      # not NaN
+            shape[day] = (eff, move)
+    if not shape:
+        return {}
+    ranked = sorted(shape, key=lambda d: shape[d][0])
+    cut = max(1, int(len(ranked) * CHOP_FRACTION))
+    choppy = set(ranked[:cut])
+    return {day: ("choppy" if day in choppy
+                  else "trending up" if move > 0 else "trending down")
+            for day, (eff, move) in shape.items()}
+
+
+def clustered_error(rows: pd.DataFrame, column: str) -> float:
+    """Standard error of a hit rate whose entries SHARE DAYS.
+
+    noise_floor() assumes every entry is an independent coin flip. These
+    are not: 330 entries drawn every fifth bar from 5 sessions are five
+    price paths sampled 66 times each, and an afternoon that drifts up
+    makes almost all of its entries win together.
+
+    Treating them as independent claims +/-2.8 points where the honest
+    figure is nearer +/-22. On a fixture whose afternoons were pure
+    random walks that gap reported "choppy mornings are BETTER" at +8.0
+    points -- a finding conjured out of nothing but the wrong denominator.
+
+    So the rate is computed per DAY and the error taken across days. The
+    day is the unit the question is actually about: "is today worth
+    trading" has one answer per day, not sixty-six.
+    """
+    if rows.empty or "date" not in rows:
+        return float("nan")
+    per_day = rows.groupby("date")[column].apply(
+        lambda v: 100.0 * float((v > 0).mean()))
+    if len(per_day) < 2:
+        return float("nan")
+    return float(per_day.std(ddof=1) / (len(per_day) ** 0.5))
+
+
+def afternoon_rows(sessions: Dict[date, pd.DataFrame],
+                   shapes: Dict[date, str]) -> pd.DataFrame:
+    """Random long entries AFTER the morning window, tagged with the
+    shape the morning had already taken.
+
+    Random entry rather than signal entry on purpose. The question is
+    whether the STOCK is harder to trade once a morning has chopped --
+    a property of the day, not of any indicator. Scoring a signal here
+    would answer a different question and confound the two.
+    """
+    _, hi = CHOP_WINDOW
+    rows: List[dict] = []
+    for day, session in sessions.items():
+        shape = shapes.get(day)
+        if shape is None:
+            continue
+        after = [i for i in range(len(session) - 1)
+                 if session.index[i].time() >= hi]
+        if not after:
+            continue
+        stride = after[::BASELINE_STRIDE]
+        for row in signal_outcomes(session, stride):
+            row["date"] = day
+            row["shape"] = shape
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def winners(outcomes: pd.DataFrame) -> pd.DataFrame:
@@ -1930,6 +2040,81 @@ def report(symbol: str, macd: Macd, sessions: Dict[date, pd.DataFrame],
             print("   to trade.")
 
 
+
+    # ---- 17. is it a bad day to trade? ----------------------------------
+    print(f"\n{rule}")
+    print("17. CAN A CHOPPY MORNING BE SEEN WHILE THERE IS STILL A DAY LEFT?")
+    print(rule)
+    lo, hi = CHOP_WINDOW
+    print(f"\n   Each day is labelled from {lo:%H:%M}-{hi:%H:%M} ALONE, then the rest")
+    print("   of the day is measured. Nothing about the afternoon reaches the")
+    print("   label, which is what lets the afternoon be the test.")
+    print("\n   Efficiency is net move over distance travelled: 1.0 is a clean")
+    print("   trend, 0.1 is two dollars of ground covered finishing where it")
+    print("   began. The bottom third by efficiency is called CHOPPY. The rest")
+    print("   are split by direction, because a straight-line collapse is")
+    print("   exactly as efficient as a straight-line rally.")
+    print(f"\n   Entries are random (every {BASELINE_STRIDE}th bar) after {hi:%H:%M} --")
+    print("   the question is whether the STOCK is harder to trade, not")
+    print("   whether some indicator is.")
+
+    shapes = day_shapes(sessions)
+    after = afternoon_rows(sessions, shapes)
+    column = f"ret_{FILTER_HORIZON}"
+    if after.empty or column not in after:
+        print("\n   Not enough bars after the morning window to measure.")
+    else:
+        cut = days[len(days) // 2]
+        for half, pick in (("NOMINATE", lambda f: f["date"] < cut),
+                           ("CONFIRM", lambda f: f["date"] >= cut)):
+            part = after[pick(after)]
+            print(f"\n   {half}")
+            print(f"   {'morning':<16}{'days':>6}{'entries':>9}{'up 60m':>9}"
+                  f"{'median':>10}{'noise':>8}")
+            if part.empty:
+                print("      (no days in this half)")
+                continue
+            for shape in ("choppy", "trending up", "trending down"):
+                rows = part[part["shape"] == shape]
+                rows = rows[rows[column].notna()]
+                n_days = rows["date"].nunique()
+                if rows.empty:
+                    print(f"   {shape:<16}{n_days:>6}{'--':>9}{'--':>9}"
+                          f"{'--':>10}{'--':>8}")
+                    continue
+                rate = 100.0 * float((rows[column] > 0).mean())
+                spread = clustered_error(rows, column)
+                print(f"   {shape:<16}{n_days:>6}{len(rows):>9,}{rate:>8.0f}%"
+                      f"{rows[column].median():>9.3f}%"
+                      + (f"{spread:>7.1f}" if spread == spread else f"{'--':>7}"))
+
+            chop = part[(part["shape"] == "choppy") & part[column].notna()]
+            rest = part[(part["shape"] != "choppy") & part[column].notna()]
+            if not chop.empty and not rest.empty:
+                a = 100.0 * float((chop[column] > 0).mean())
+                b = 100.0 * float((rest[column] > 0).mean())
+                # Errors across DAYS, combined. Not noise_floor(entries),
+                # which counts one afternoon sixty-six times.
+                ea, eb = clustered_error(chop, column), clustered_error(rest, column)
+                floor = ((ea ** 2 + eb ** 2) ** 0.5
+                         if ea == ea and eb == eb else float("nan"))
+                gap = a - b
+                verdict = ("too few days to say" if floor != floor
+                           else "choppy mornings ARE worse" if gap < -2 * floor
+                           else "choppy mornings are BETTER" if gap > 2 * floor
+                           else "no difference worth acting on")
+                print(f"\n      choppy minus the rest: {gap:+.1f} points "
+                      + (f"(noise +/-{floor:.1f})" if floor == floor
+                         else "(noise unmeasurable)")
+                      + f"  ->  {verdict}")
+
+        print("\n   A difference that shows in the nominate half and not the")
+        print("   confirm half is the split doing its job. Only a gap that")
+        print("   survives both is worth an alert, and even then it is one")
+        print("   measure tested once -- the stronger test is your own P&L by")
+        print("   morning shape, which needs the trading days logged.")
+
+
     return outcomes
 
 
@@ -2041,6 +2226,101 @@ def self_test() -> int:
         if row["nominate_n"] and row["confirm_n"] == 0:
             failures.append(f"{row['filter']} landed everything in the half "
                             f"that may only nominate")
+
+    # The morning label must come from the MORNING and from nothing else.
+    # Two properties, and the second is the one that bites:
+    #   a choppy morning is called choppy however the afternoon turns out;
+    #   a straight-line COLLAPSE is not choppy -- efficiency is
+    #   directionless, so without the sign of the move the worst mornings
+    #   of the quarter get filed as clean trends.
+    def shaped(morning, afternoon, when):
+        prices = list(morning) + list(afternoon)
+        frame = _session(prices)
+        frame.index = pd.DatetimeIndex(
+            [datetime.combine(when, SESSION_OPEN, tzinfo=ET)
+             + timedelta(minutes=i) for i in range(len(prices))])
+        return frame
+
+    rise = [100.0 + 0.05 * i for i in range(60)]
+    fall = [100.0 - 0.05 * i for i in range(60)]
+    chop = [100.0 + (0.6 if i % 2 else 0.0) for i in range(60)]
+
+    for tail_name, tail in (("a soaring afternoon", [120.0 + i for i in range(60)]),
+                            ("a collapsing afternoon", [80.0 - i for i in range(60)])):
+        built = {}
+        for n, morning in enumerate([rise] * 3 + [fall] * 3 + [chop] * 3):
+            built[date(2026, 8, 3) + timedelta(days=n)] = shaped(morning, tail,
+                                                                 date(2026, 8, 3)
+                                                                 + timedelta(days=n))
+        labels = day_shapes(built)
+        got = [labels[d] for d in sorted(labels)]
+        want = ["trending up"] * 3 + ["trending down"] * 3 + ["choppy"] * 3
+        if got != want:
+            failures.append(
+                f"with {tail_name} the morning labels should be {want}, got "
+                f"{got}. The label must come from the morning alone, and a "
+                f"straight-line collapse is not chop.")
+
+    # And the measure itself: a collapse is as EFFICIENT as a rally, which
+    # is precisely why day_shapes may not use it on its own.
+    if abs(efficiency(fall) - efficiency(rise)) > 0.001:
+        failures.append("a straight collapse and a straight rally must score "
+                        "the same efficiency; the sign is what tells them "
+                        "apart, not the magnitude")
+
+    # The error bar on those rates must be measured ACROSS DAYS, because
+    # the entries share days. This test exists because the section first
+    # shipped with noise_floor(entries) and reported "choppy mornings are
+    # BETTER, +8.0 points, noise +/-2.8" on a fixture whose afternoons
+    # were pure random walks. The rate was real; the denominator was not.
+    #
+    # Perfect clustering is the clearest case: six afternoons, each one
+    # entirely up or entirely down, sampled fifty-five times. There are
+    # six facts here, not three hundred and thirty.
+    clustered = pd.DataFrame([
+        {"date": date(2026, 8, 3) + timedelta(days=n), "ret": 1.0 if n % 2 else -1.0}
+        for n in range(6) for _ in range(55)])
+    across_days = clustered_error(clustered, "ret")
+    as_if_independent = noise_floor(len(clustered))
+    if not (across_days > 5 * as_if_independent):
+        failures.append(
+            f"entries that share days must carry a far wider error bar than "
+            f"independent ones: across days {across_days:.1f} vs "
+            f"{as_if_independent:.1f} as-if-independent. Anything near the "
+            f"latter manufactures findings out of the denominator.")
+
+    # One day cannot tell you how much days vary. Better to print nothing
+    # than to print a floor of zero, which would make every gap a finding.
+    lone = clustered[clustered["date"] == date(2026, 8, 3)]
+    if clustered_error(lone, "ret") == clustered_error(lone, "ret"):
+        failures.append("a single day has no measurable spread across days; "
+                        "clustered_error must return NaN so the section says "
+                        "'too few days to say' rather than inventing a floor")
+
+    # And the case that actually burned: an eight-point gap between two
+    # groups of ordinary, varied days is not a finding. If this stops
+    # failing to clear the bar, the bar has gone soft again.
+    def varied(start, rates):
+        rows = []
+        for n, rate in enumerate(rates):
+            won = round(rate * 66)
+            rows += [{"date": start + timedelta(days=n),
+                      "ret": 1.0 if i < won else -1.0} for i in range(66)]
+        return pd.DataFrame(rows)
+
+    # Five days a side, each day an ordinary mix. Pooled: 60% against 46%.
+    group_a = varied(date(2026, 8, 3), [0.30, 0.85, 0.40, 0.75, 0.70])
+    group_b = varied(date(2026, 9, 1), [0.60, 0.30, 0.55, 0.40, 0.45])
+    gap = (100.0 * float((group_a["ret"] > 0).mean())
+           - 100.0 * float((group_b["ret"] > 0).mean()))
+    ea = clustered_error(group_a, "ret")
+    eb = clustered_error(group_b, "ret")
+    floor = (ea ** 2 + eb ** 2) ** 0.5
+    if abs(gap) > 2 * floor:
+        failures.append(
+            f"a {gap:+.1f} point gap across five days a side is within the "
+            f"day-to-day spread (+/-{floor:.1f}) and must not read as a "
+            f"finding")
 
     # A clean triangle: up 10%, down 10%. One high, one low.
     closes = [100 + i for i in range(11)] + [110 - i for i in range(1, 11)]
@@ -2251,6 +2531,8 @@ def self_test() -> int:
     print("  Filter vs matched control      : drift subtracted, not called an edge")
     print("  Range position                 : knows only the bars before it")
     print("  Nominate / confirm             : the split actually splits")
+    print("  Morning shape                  : read from the morning alone")
+    print("  Entries that share days        : error bar across days, not entries")
 
 
     # --- section 14: the open ---------------------------------------------
