@@ -368,6 +368,31 @@ SOUND_COOLDOWN_MINUTES = 15
 #: per run with --buy-sound / --sell-sound.
 SOUND_BUY, SOUND_SELL = "Buy_Stock", "Sell_Positions"
 
+#: THE TREND ALARM (14 Oct). The speed alarm answers "is it moving fast
+#: right now", so a zigzag climb rang buy, sell, buy, sell and never said
+#: the one thing that mattered: each high was higher than the last. This
+#: follows the RUN instead. It rings with its own sounds -- Pushover's
+#: built-in "climb" and "falling" -- so the shape of the move is audible
+#: from a pocket: climb... climb... climb... falling.
+#:
+#: TREND_STEP is how far a run must extend, from where it started, to
+#: ring again. TREND_GIVEBACK is how far a run must reverse off its
+#: extreme to count as over (None = the same as the step). Pullbacks
+#: smaller than that are silent: they are the zig of a zigzag, not news.
+#: Neither number is measured yet -- choose them with --replay.
+TREND_STEP: float = 0.50
+TREND_GIVEBACK: Optional[float] = None
+SOUND_CLIMB, SOUND_FALLING = "climb", "falling"
+
+#: THE MARKET ALARM (14 Oct). The S&P 500's move was already fetched
+#: every pass and printed under the stock's -- as text, which nobody
+#: hears. This rings once the market is down MARKET_DROP percent from
+#: yesterday's close, and again every MARKET_STEP further, with a sound
+#: that means "the whole market", not "this stock".
+MARKET_DROP: float = 1.00
+MARKET_STEP: float = 0.50
+SOUND_MARKET = "siren"
+
 #: The slider's track. Eleven cells so there is an exact middle, and two
 #: hues plus a neutral centre rather than a red-orange-yellow-green ramp:
 #: a hue at the midpoint would colour "balanced" as though it meant
@@ -1269,7 +1294,9 @@ def stale_sender() -> Optional[str]:
 
 
 def test_push(buy_sound: str = SOUND_BUY, sell_sound: str = SOUND_SELL,
-              pause: int = 6) -> int:
+              pause: int = 6, climb_sound: str = SOUND_CLIMB,
+              falling_sound: str = SOUND_FALLING,
+              market_sound: str = SOUND_MARKET) -> int:
     """Send one of each kind to the phone, and say what happened.
 
     Three messages: the silent stream, a buy ring, a sell ring. Built by
@@ -1313,7 +1340,9 @@ def test_push(buy_sound: str = SOUND_BUY, sell_sound: str = SOUND_SELL,
     if sound_error:
         print(f"  sounds                 UNKNOWN — {sound_error}")
     else:
-        for role, name in (("buy", buy_sound), ("sell", sell_sound)):
+        for role, name in (("buy", buy_sound), ("sell", sell_sound),
+                           ("climb", climb_sound), ("falling", falling_sound),
+                           ("market", market_sound)):
             if name in names:
                 print(f"  {role + ' sound':<22} {name}")
             else:
@@ -1389,14 +1418,153 @@ def rebuild_report(symbol: str, day: date, start: time, end: time,
         return None
 
 
+@dataclass
+class Trend:
+    """Follows the run, not the last five minutes. See TREND_STEP.
+
+    One state machine. Until something rings it watches the lowest and
+    highest price seen. A rise of a step off the low, made at a new high,
+    starts an UP run ("climbing"); each further step at a new high rings
+    "still climbing". A fall of `giveback` off the run's high ends it
+    ("giving it back") and starts a DOWN run measured from that high, so
+    a fade that keeps going keeps ringing ("still falling"). The mirror
+    holds: a bounce of `giveback` off a falling run's low says so and
+    starts an up run from that low.
+
+    Anything smaller than `giveback` against the run is silent. That is
+    the point: a 0.3% dip in a 2% climb is the zig of a zigzag, and the
+    speed alarm already reports it if it was fast.
+    """
+
+    step: float = TREND_STEP
+    giveback: Optional[float] = TREND_GIVEBACK
+    mode: Optional[str] = None          # None, "up" or "down"
+    base: float = 0.0                   # where the run started
+    base_at: Optional[datetime] = None
+    ext: float = 0.0                    # the run's extreme so far
+    ext_at: Optional[datetime] = None
+    rungs: int = 0                      # steps already rung for this run
+    lo: float = 0.0                     # before any run: lowest and highest
+    lo_at: Optional[datetime] = None
+    hi: float = 0.0
+    hi_at: Optional[datetime] = None
+
+    @property
+    def back(self) -> float:
+        return self.step if self.giveback is None else self.giveback
+
+    def _steps(self, pct: float) -> int:
+        return int(pct / self.step + 1e-9)
+
+    def _start(self, mode: str, base: float, base_at: datetime,
+               price: float, at: datetime) -> float:
+        self.mode, self.base, self.base_at = mode, base, base_at
+        self.ext, self.ext_at = price, at
+        moved = abs(price - base) / base * 100.0
+        self.rungs = self._steps(moved)
+        return moved
+
+    def update(self, at: datetime, price: float) -> Optional[Tuple[str, str]]:
+        """("up" or "down", message) when this price earns a ring."""
+        if self.step <= 0 or price <= 0:
+            return None
+        if self.mode is None:
+            if self.base_at is None:            # very first reading
+                self.lo, self.lo_at = price, at
+                self.hi, self.hi_at = price, at
+                self.base_at = at
+                return None
+            if price < self.lo:
+                self.lo, self.lo_at = price, at
+            if price > self.hi:
+                self.hi, self.hi_at = price, at
+            if price >= self.hi and (price - self.lo) / self.lo * 100 >= self.step:
+                rise = self._start("up", self.lo, self.lo_at, price, at)
+                return "up", (f"climbing: +{rise:.2f}% from the "
+                              f"{self.base_at:%H:%M} low "
+                              f"({self.base:.2f} → {price:.2f})")
+            if price <= self.lo and (self.hi - price) / self.hi * 100 >= self.step:
+                drop = self._start("down", self.hi, self.hi_at, price, at)
+                return "down", (f"falling: -{drop:.2f}% from the "
+                                f"{self.base_at:%H:%M} high "
+                                f"({self.base:.2f} → {price:.2f})")
+            return None
+
+        if self.mode == "up":
+            if price > self.ext:
+                self.ext, self.ext_at = price, at
+                rise = (price - self.base) / self.base * 100
+                if self._steps(rise) > self.rungs:
+                    self.rungs = self._steps(rise)
+                    return "up", (f"still climbing: +{rise:.2f}% from the "
+                                  f"{self.base_at:%H:%M} low "
+                                  f"({self.base:.2f} → {price:.2f}), new high")
+                return None
+            off = (self.ext - price) / self.ext * 100
+            if off >= self.back:
+                high, high_at = self.ext, self.ext_at
+                self._start("down", high, high_at, price, at)
+                return "down", (f"giving it back: -{off:.2f}% from the "
+                                f"{high_at:%H:%M} high ({high:.2f} → {price:.2f})")
+            return None
+
+        # mode == "down"
+        if price < self.ext:
+            self.ext, self.ext_at = price, at
+            drop = (self.base - price) / self.base * 100
+            if self._steps(drop) > self.rungs:
+                self.rungs = self._steps(drop)
+                return "down", (f"still falling: -{drop:.2f}% from the "
+                                f"{self.base_at:%H:%M} high "
+                                f"({self.base:.2f} → {price:.2f}), new low")
+            return None
+        off = (price - self.ext) / self.ext * 100
+        if off >= self.back:
+            low, low_at = self.ext, self.ext_at
+            self._start("up", low, low_at, price, at)
+            return "up", (f"bouncing: +{off:.2f}% off the {low_at:%H:%M} low "
+                          f"({low:.2f} → {price:.2f})")
+        return None
+
+
+@dataclass
+class MarketAlarm:
+    """Rings when the S&P 500 is down `drop`% from yesterday's close, and
+    again every `step`% further. Back above the line re-arms it, so a
+    market that recovers and then breaks down again is heard again."""
+
+    drop: float = MARKET_DROP
+    step: float = MARKET_STEP
+    rung: int = 0
+
+    def update(self, change_pct: Optional[float]) -> Optional[str]:
+        if change_pct is None or self.drop <= 0:
+            return None
+        down = -change_pct
+        if down < self.drop:
+            self.rung = 0
+            return None
+        reached = 1 + (int((down - self.drop) / self.step + 1e-9) if self.step > 0 else 0)
+        if reached <= self.rung:
+            return None
+        further = self.rung > 0
+        self.rung = reached
+        return (f"MARKET: S&P 500 {'further, ' if further else ''}down "
+                f"{down:.2f}% from yesterday's close")
+
+
 def replay_alarms(alarms: "Alarms", minutes: pd.DataFrame,
                   minute_base: Dict[time, float],
-                  prev_close: Optional[float]) -> List[Tuple[datetime, str, str, float]]:
-    """(time, direction, why, price) for every minute that would have rung.
+                  prev_close: Optional[float],
+                  trend: Optional["Trend"] = None,
+                  ) -> List[Tuple[datetime, str, str, float]]:
+    """(time, kind, why, price) for every minute that would have rung.
 
-    The same per-minute judgement run_live makes -- the same candle, lean
-    and day built the same way, minutes with no trades skipped as live
-    skips them, the same should_ring -- so a threshold chosen here is a
+    kind is "buy"/"sell" for the price alarms and "up"/"down" for the
+    trend alarm. The same per-minute judgement run_live makes -- the same
+    candle, lean and day built the same way, minutes with no trades
+    skipped as live skips them, the same should_ring, the trend fed the
+    same closes in the same order -- so a threshold chosen here is a
     threshold that behaves this way on the phone.
     """
     rings = []
@@ -1407,9 +1575,29 @@ def replay_alarms(alarms: "Alarms", minutes: pd.DataFrame,
         upto = minutes[minutes.index <= stamp]
         call = alarms.reason(minute, read_lean(upto, baseline=minute_base),
                              read_day(upto, prev_close))
+        moved = trend.update(stamp, minute.close) if trend is not None else None
+        if moved:
+            rings.append((stamp, moved[0], moved[1], minute.close))
         if alarms.should_ring(call, stamp):
             rings.append((stamp, call[0], call[1], minute.close))
     return rings
+
+
+def replay_market(alarm: "MarketAlarm", frame: pd.DataFrame,
+                  prev_close: Optional[float]) -> List[Tuple[datetime, str]]:
+    """(time, why) for every minute the market alarm would have rung."""
+    if not prev_close or frame is None or frame.empty:
+        return []
+    rings = []
+    for stamp, close in frame["close"].items():
+        why = alarm.update(100.0 * (float(close) - prev_close) / prev_close)
+        if why:
+            rings.append((stamp, why))
+    return rings
+
+
+#: How each kind of ring is labelled in a replay listing.
+RING_LABEL = {"buy": "BUY  ", "sell": "SELL ", "up": "CLIMB", "down": "FALL "}
 
 
 def alarm_policy(alarms: "Alarms") -> str:
@@ -1429,7 +1617,9 @@ def alarm_policy(alarms: "Alarms") -> str:
 def run_replay(symbol: str, day: date, start: time, end: time,
                dry_run: bool, db: sqlite3.Connection,
                multiple: float = VOLUME_ALERT_MULTIPLE,
-               alarms: Optional["Alarms"] = None) -> int:
+               alarms: Optional["Alarms"] = None,
+               trend: Optional["Trend"] = None,
+               market_alarm: Optional["MarketAlarm"] = None) -> int:
     """Read a past morning. Always the full tape -- history is free on SIP."""
     minutes = fetch_minutes(
         symbol,
@@ -1475,12 +1665,32 @@ def run_replay(symbol: str, day: date, start: time, end: time,
     # counted only volume spikes, so --move-percent's own help ("tune it
     # with --replay") pointed at a replay that could not answer it.
     alarms = alarms if alarms is not None else Alarms()
-    rings = replay_alarms(alarms, minutes, minute_base, prev_close)
+    rings = replay_alarms(alarms, minutes, minute_base, prev_close, trend)
     print("-" * 56)
-    print(f"  Price alarms ({alarm_policy(alarms)}): {len(rings)} would have rung")
+    trend_note = (f"; trend every {trend.step:.2f}%, over at "
+                  f"{trend.back:.2f}% back" if trend is not None and trend.step > 0
+                  else "; trend alarm off")
+    print(f"  Price alarms ({alarm_policy(alarms)}{trend_note}): "
+          f"{len(rings)} would have rung")
     for at, side, why, price in rings:
-        print(f"    {at:%H:%M}  {'BUY ' if side == 'buy' else 'SELL'}  "
+        print(f"    {at:%H:%M}  {RING_LABEL.get(side, side)}  "
               f"{price:8.2f}  {why}")
+    if market_alarm is not None and market_alarm.drop > 0:
+        try:
+            spy = fetch_minutes(BENCHMARK, datetime.combine(day, start, tzinfo=ET),
+                                datetime.combine(day, end, tzinfo=ET),
+                                force_sip=True)
+            market_rings = replay_market(market_alarm, spy,
+                                         previous_close(BENCHMARK, day))
+        except Exception as exc:  # noqa: BLE001 -- context, never a blocker
+            market_rings = None
+            print(f"  Market alarm: S&P 500 unavailable ({type(exc).__name__})")
+        if market_rings is not None:
+            print(f"  Market alarm (S&P 500 down {market_alarm.drop:.2f}%, then "
+                  f"every {market_alarm.step:.2f}%): {len(market_rings)} would "
+                  f"have rung")
+            for at, why in market_rings:
+                print(f"    {at:%H:%M}  MKT    {why}")
     if (end > REGULAR_CLOSE and not alarms.anchor_price
             and read_day(minutes, prev_close) is None):
         print("    note: no regular-hours bars in this window, so the "
@@ -1509,7 +1719,14 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
              up_only: bool = False,
              from_price: Optional[float] = None,
              ah_percent: Optional[float] = AH_PERCENT,
-             level_step: Optional[float] = LEVEL_STEP) -> int:
+             level_step: Optional[float] = LEVEL_STEP,
+             trend_step: float = TREND_STEP,
+             trend_giveback: Optional[float] = TREND_GIVEBACK,
+             climb_sound: str = SOUND_CLIMB,
+             falling_sound: str = SOUND_FALLING,
+             market_drop: float = MARKET_DROP,
+             market_step: float = MARKET_STEP,
+             market_sound: str = SOUND_MARKET) -> int:
     """Follow the session: full detail early, then only the unusual."""
     today = datetime.now(ET).date()
     window_start = datetime.combine(today, start, tzinfo=ET)
@@ -1570,6 +1787,19 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                     anchor_price=from_price, ah_percent=ah_percent,
                     level_step=level_step)
     print(f"  alarm bands: {alarm_policy(alarms)}\n")
+    trend = Trend(step=trend_step, giveback=trend_giveback)
+    if trend_step > 0:
+        print(f"  trend alarm: a ring every {trend_step:.2f}% a run extends, "
+              f"and when it gives back {trend.back:.2f}% -- "
+              f"{climb_sound} up, {falling_sound} down\n")
+    else:
+        print("  trend alarm: off\n")
+    market_alarm = MarketAlarm(drop=market_drop, step=market_step)
+    if market_drop > 0:
+        print(f"  market alarm: S&P 500 down {market_drop:.2f}% from yesterday's "
+              f"close, then every {market_step:.2f}% further -- {market_sound}\n")
+    else:
+        print("  market alarm: off\n")
     # Say which anchor the level alarm will use. Printing the policy is
     # the cheap half; the warning below is the half that matters, because
     # an alarm that cannot arm is indistinguishable from a quiet tape.
@@ -1616,6 +1846,16 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
             # minute: several minutes can arrive together after a slow
             # fetch, and they all happened under the same S&P reading.
             market = market_move(market_prev, window_start, min(now, window_end))
+            # The whole market, once per pass. Its own sound and its own
+            # message: it is not a reading of this stock and must not be
+            # mistaken for one.
+            market_call = market_alarm.update(market)
+            if market_call:
+                body = market_line(market) or market_call
+                status = deliver(body + f"\nRings again at every {market_step:.2f}% "
+                                 f"further.", market_call, PRIORITY_SUMMARY,
+                                 dry_run, sound=market_sound)
+                print(f"  {now:%H:%M}  ** {market_call} **  [{status}]\n")
 
             # --- the quiet per-minute update ---------------------------
             for stamp, row in done_minutes.iterrows():
@@ -1646,12 +1886,22 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
 
                 call = alarms.reason(minute, lean, day)
                 ringing = alarms.should_ring(call, stamp)
+                # The run, fed every traded minute in order -- replay feeds
+                # it the same way, so a replayed ring is a live ring.
+                moved = trend.update(stamp, minute.close)
                 # Past the detail window only the unusual leaves the machine.
-                push = reaches_phone(stamp.time(), spiked, detail_until) or ringing
+                push = (reaches_phone(stamp.time(), spiked, detail_until)
+                        or ringing or moved is not None)
                 message = describe(symbol, minute, day, lean, multiple, market)
                 fresh = remember_minute(db, symbol, minute, lean,
                                         sent=push and not dry_run)
-                if ringing:
+                if moved:
+                    # One notification, one sound. The trend speaks for the
+                    # minute; a speed alarm in the same minute rides along
+                    # in the title rather than ringing on top of it.
+                    title = (f"{symbol} {stamp:%H:%M} — {moved[1]}"
+                             + (f" · {call[1]}" if ringing else ""))
+                elif ringing:
                     title = f"{symbol} {stamp:%H:%M} — {call[1]}"
                 elif spiked:
                     title = f"{symbol} {stamp:%H:%M} volume {minute.vol_ratio:.1f}x"
@@ -1662,7 +1912,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 # every spike it went out 70 times in a session of 75
                 # messages -- a chart nobody opens, on a phone, for a
                 # reading that did not even ring.
-                if ringing and pdf_every:
+                if (ringing or moved) and pdf_every:
                     chart = rebuild_report(symbol, today, start, end,
                                            db_path, pdf_path)
                     last_pdf = datetime.now(ET)
@@ -1671,12 +1921,16 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 elif not push:
                     status = "logged, quiet after " + f"{detail_until:%H:%M}"
                 else:
+                    if moved:
+                        sound = climb_sound if moved[0] == "up" else falling_sound
+                    elif ringing:
+                        sound = alarms.sound_for(call[0], buy_sound, sell_sound)
+                    else:
+                        sound = None
                     status = deliver(
                         message, title,
-                        PRIORITY_SUMMARY if ringing else PRIORITY_UPDATE,
-                        dry_run, attachment=chart,
-                        sound=alarms.sound_for(call[0], buy_sound, sell_sound)
-                        if ringing else None)
+                        PRIORITY_SUMMARY if (ringing or moved) else PRIORITY_UPDATE,
+                        dry_run, attachment=chart, sound=sound)
                 print(message)
                 print(f"  [{status}]\n")
 
@@ -2328,6 +2582,93 @@ def self_test() -> int:
     if "0.30% outside 09:30-16:00" not in alarm_policy(Alarms(ah_percent=0.3)):
         failures.append("the policy line must name the evening band")
 
+    # --- 14 Oct: the trend alarm -------------------------------------------
+    # A zigzag climb: up, dip, up, dip, higher each time, then a real
+    # giveback and a further slide. The speed alarm hears buy/sell/buy;
+    # the trend must hear climbing, still climbing, still climbing,
+    # giving it back, still falling -- and stay silent on every dip
+    # smaller than the giveback.
+    t0 = datetime.combine(date(2026, 10, 14), time(10, 0), tzinfo=ET)
+    zig = (100.00, 100.30, 100.10, 100.55, 100.30, 101.10, 100.80, 101.60,
+           101.00, 100.70, 100.40)
+    run = Trend(step=0.5)
+    heard = [(m, r) for m, r in ((m, run.update(t0 + timedelta(minutes=m), px))
+                                 for m, px in enumerate(zig)) if r]
+    words = [r[1].split(":")[0] for _, r in heard]
+    if words != ["climbing", "still climbing", "still climbing",
+                 "giving it back", "still falling"]:
+        failures.append(f"a zigzag climb then a slide must read climbing, still "
+                        f"climbing x2, giving it back, still falling: {heard!r}")
+    elif [m for m, _ in heard] != [3, 5, 7, 8, 10]:
+        failures.append(f"each ring belongs on its own minute (3,5,7,8,10), and "
+                        f"every dip smaller than the giveback is silent: "
+                        f"{[m for m, _ in heard]}")
+    elif [r[0] for _, r in heard] != ["up", "up", "up", "down", "down"]:
+        failures.append("climbing rings up, giving back and falling ring down")
+    elif "from the 10:00 low" not in heard[0][1][1] or \
+            "from the 10:07 high" not in heard[3][1][1]:
+        failures.append(f"a ring must name where the run started or peaked: "
+                        f"{heard[0][1][1]!r} / {heard[3][1][1]!r}")
+
+    # Chop smaller than a step in both directions is never a trend.
+    chop = Trend(step=0.5)
+    if any(chop.update(t0 + timedelta(minutes=m), px) for m, px in
+           enumerate((100.0, 100.3, 100.0, 100.35, 99.9, 100.2, 99.85, 100.1))):
+        failures.append("chop inside +/-0.4% must never ring the trend alarm")
+
+    # A falling run that bounces by the giveback says so, upward.
+    dip = Trend(step=0.5)
+    said_dip = [r for r in (dip.update(t0 + timedelta(minutes=m), px)
+                            for m, px in enumerate((100.0, 99.4, 99.0, 99.6)))
+                if r]
+    if [r[0] for r in said_dip] != ["down", "down", "up"] or \
+            not said_dip[-1][1].startswith("bouncing"):
+        failures.append(f"a slide to -1.0% that bounces 0.6% off its low must "
+                        f"ring falling, still falling, then bouncing: "
+                        f"{said_dip!r}")
+
+    # A wider giveback tolerates a bigger dip; step 0 is off entirely.
+    wide = Trend(step=0.5, giveback=1.0)
+    wide_said = [r for r in (wide.update(t0 + timedelta(minutes=m), px)
+                             for m, px in enumerate((100.0, 100.6, 100.0)))
+                 if r]
+    if len(wide_said) != 1:
+        failures.append(f"with a 1.0 giveback a 0.6% dip is still the same run: "
+                        f"{wide_said!r}")
+    off = Trend(step=0)
+    if any(off.update(t0 + timedelta(minutes=m), px)
+           for m, px in enumerate((100.0, 103.0, 99.0))):
+        failures.append("--trend-step 0 must turn the trend alarm off")
+
+    # --- 14 Oct: the market alarm ------------------------------------------
+    mkt = MarketAlarm()
+    tape = (-0.50, -1.02, -1.20, -1.55, -0.80, -1.10, None, -2.20)
+    calls = [mkt.update(c) for c in tape]
+    rang_at = [i for i, c in enumerate(calls) if c]
+    if rang_at != [1, 3, 5, 7]:
+        failures.append(f"the market alarm must ring crossing -1%, again at "
+                        f"-1.5%, re-arm above -1% and ring again, and ring at "
+                        f"a new further step: rang at {rang_at} of {tape}")
+    elif "further" not in calls[3] or "further" in calls[5]:
+        failures.append(f"a deeper step says further; a fresh crossing does "
+                        f"not: {calls!r}")
+    if MarketAlarm(drop=0).update(-5.0) is not None:
+        failures.append("--market-drop 0 must turn the market alarm off")
+    spy_stamps = pd.date_range(datetime(2026, 10, 14, 10, 0), periods=3,
+                               freq="1min", tz=ET)
+    spy = pd.DataFrame({"close": [99.5, 98.9, 98.4]}, index=spy_stamps)
+    if [at for at, _ in replay_market(MarketAlarm(), spy, 100.0)] != \
+            list(spy_stamps[1:]):
+        failures.append("replaying the S&P must ring at -1.1% and again at -1.6%")
+
+    # Replay feeds the trend the same minutes live does: the drift to
+    # -1.1% after the close is a falling run as well as a level alarm.
+    with_trend = replay_alarms(Alarms(percent=0.5), frame, {}, 101.0,
+                               Trend(step=0.5))
+    if [k for _, k, _, _ in with_trend if k in ("up", "down")] != ["down", "down"]:
+        failures.append(f"replay must list the trend's own rings beside the "
+                        f"price alarms: {with_trend!r}")
+
     # ...but only while it is inside the window.
     stale = Alarms()
     bar, lean, dctx, when = reading(0.50, 2.0, price=150.5, at_minute=0)
@@ -2545,6 +2886,34 @@ def main() -> int:
                              "the anchor (default: the band itself, so 0.5 "
                              "rings at 0.5, 1.0, 1.5...). 0 rings once per "
                              "crossing")
+    parser.add_argument("--trend-step", type=float, default=TREND_STEP,
+                        metavar="PCT",
+                        help=f"Trend alarm: ring each time a run extends PCT "
+                             f"further from where it started, at a new high or "
+                             f"low (default {TREND_STEP}; 0 turns it off)")
+    parser.add_argument("--trend-giveback", type=float, default=TREND_GIVEBACK,
+                        metavar="PCT",
+                        help="Trend alarm: how far a run must reverse off its "
+                             "extreme to count as over -- 'giving it back' "
+                             "(default: the same as --trend-step)")
+    parser.add_argument("--climb-sound", default=SOUND_CLIMB, metavar="NAME",
+                        help=f"Pushover sound for a trend ring upward "
+                             f"(default {SOUND_CLIMB})")
+    parser.add_argument("--falling-sound", default=SOUND_FALLING, metavar="NAME",
+                        help=f"Pushover sound for a trend ring downward "
+                             f"(default {SOUND_FALLING})")
+    parser.add_argument("--market-drop", type=float, default=MARKET_DROP,
+                        metavar="PCT",
+                        help=f"Ring when the S&P 500 is down PCT from "
+                             f"yesterday's close (default {MARKET_DROP}; 0 turns "
+                             f"it off)")
+    parser.add_argument("--market-step", type=float, default=MARKET_STEP,
+                        metavar="PCT",
+                        help=f"...and again every PCT further (default "
+                             f"{MARKET_STEP})")
+    parser.add_argument("--market-sound", default=SOUND_MARKET, metavar="NAME",
+                        help=f"Pushover sound for the market alarm "
+                             f"(default {SOUND_MARKET})")
     parser.add_argument("--from-price", type=float, default=None,
                         metavar="PRICE",
                         help="Anchor the after-hours level alarm on this "
@@ -2588,6 +2957,14 @@ def main() -> int:
         raise SystemExit("--ah-percent must be above 0")
     if args.level_step is not None and args.level_step < 0:
         raise SystemExit("--level-step must be 0 or more")
+    for flag, value in (("--trend-step", args.trend_step),
+                        ("--market-drop", args.market_drop)):
+        if value < 0:
+            raise SystemExit(f"{flag} must be 0 (off) or more")
+    for flag, value in (("--trend-giveback", args.trend_giveback),
+                        ("--market-step", args.market_step)):
+        if value is not None and value <= 0:
+            raise SystemExit(f"{flag} must be above 0")
 
     if args.self_test:
         return self_test()
@@ -2600,7 +2977,10 @@ def main() -> int:
     if args.list_sounds:
         return list_sounds()
     if args.test_push:
-        return test_push(args.buy_sound, args.sell_sound)
+        return test_push(args.buy_sound, args.sell_sound,
+                         climb_sound=args.climb_sound,
+                         falling_sound=args.falling_sound,
+                         market_sound=args.market_sound)
 
     start, end = parse_clock(args.start), parse_clock(args.end)
     if start >= end:
@@ -2624,13 +3004,20 @@ def main() -> int:
                                  up_only=args.up_only,
                                  anchor_price=args.from_price,
                                  ah_percent=args.ah_percent,
-                                 level_step=args.level_step))
+                                 level_step=args.level_step),
+                          Trend(step=args.trend_step,
+                                giveback=args.trend_giveback),
+                          MarketAlarm(drop=args.market_drop,
+                                      step=args.market_step))
     return run_live(symbol, start, end, args.dry_run, db, args.push_empty,
                     args.volume_alert, args.pdf_every, args.db, detail,
                     args.buy_sound, args.sell_sound,
                     args.move_percent, args.move_minutes,
                     args.alarm_volume, args.up_only, args.from_price,
-                    args.ah_percent, args.level_step)
+                    args.ah_percent, args.level_step,
+                    args.trend_step, args.trend_giveback,
+                    args.climb_sound, args.falling_sound,
+                    args.market_drop, args.market_step, args.market_sound)
 
 
 if __name__ == "__main__":
