@@ -113,6 +113,10 @@ WINDOW_END = time(16, 0)
 #: an after-hours alarm possible at all.
 REGULAR_CLOSE = time(16, 0)
 
+#: When regular trading hours start. Before it, like after the close, the
+#: stock drifts rather than jumps, which is what --ah-percent is for.
+REGULAR_OPEN = time(9, 30)
+
 # Up to here the phone gets everything: a quiet line each minute and an
 # alarm each candle. After it, only the unusual -- a volume spike -- is
 # worth an interruption at a desk job. The readings keep being computed,
@@ -333,6 +337,21 @@ ALARM_VOLUME = VOLUME_ALERT_MULTIPLE
 #: sell, because a rising tape rarely presses hard enough to cross the
 #: band.
 MOVE_PERCENT, MOVE_MINUTES = 0.50, 5
+
+#: A second threshold for outside 09:30-16:00, or None to use MOVE_PERCENT
+#: there too. After hours the stock drifts: a move worth acting on can
+#: take an hour to reach a size that takes five minutes at midday, so a
+#: band calibrated on the session is late in the evening. None by default
+#: because no evening number has been measured yet -- pick it with
+#: --replay against your own evenings, not by ear.
+AH_PERCENT: Optional[float] = None
+
+#: After the level alarm's first ring, ring again each time price gets
+#: this much further from the anchor, or None to step by the band itself
+#: (0.5 rings at 0.5, 1.0, 1.5...). 0 rings once per crossing, which was
+#: the only behaviour before 14 Oct -- and meant a +3% evening was
+#: reported once, at +0.5%, and then never again.
+LEVEL_STEP: Optional[float] = None
 
 #: One event, one ring. Without this, a state that stays true rings every
 #: minute it stays true. Time-based rather than reset-on-lapse: a reading
@@ -729,9 +748,30 @@ class Alarms:
     #: reasoning as the scanner's dedupe: a lapsed setup that returns has
     #: to be able to alert again, or it is silenced forever.
     beyond: Optional[str] = None
+    #: The band used outside 09:30-16:00 by BOTH alarms, or None to use
+    #: `percent` all day. See AH_PERCENT.
+    ah_percent: Optional[float] = AH_PERCENT
+    #: How much further from the anchor earns the level alarm another
+    #: ring. None steps by the band; 0 rings once per crossing. See
+    #: LEVEL_STEP.
+    level_step: Optional[float] = LEVEL_STEP
+    #: How many steps past the band this crossing has already rung for.
+    #: Only a NEW furthest step rings, so price that sags back a step and
+    #: returns does not ring twice for the same ground.
+    rung: int = 0
+    #: Whether the last reason() came from the level alarm, and whether
+    #: that was a further step of a crossing that had already rung.
+    from_level: bool = False
+    stepped: bool = False
     fired: Dict[str, datetime] = field(default_factory=dict)
     above_vwap: Optional[bool] = None
     recent: List[Tuple[datetime, float]] = field(default_factory=list)
+
+    def threshold(self, at: datetime) -> float:
+        """The band for a reading at `at`: the evening one outside regular
+        hours when one was given, the session one otherwise."""
+        outside = at.time() < REGULAR_OPEN or at.time() >= REGULAR_CLOSE
+        return self.ah_percent if (self.ah_percent and outside) else self.percent
 
     def _cross(self, day: Optional[Day]) -> Optional[str]:
         """Which way price just crossed VWAP, if it did. Updates state."""
@@ -773,23 +813,35 @@ class Alarms:
         Regular hours are left alone: inside the session the speed alarm
         is the one that has been calibrated, and a level alarm on top of
         it would ring all afternoon on any trending day.
+
+        Once outside the band it rings again at each further step (see
+        LEVEL_STEP), so an evening that keeps going is reported as it
+        goes rather than once at the start. Only a new furthest step
+        rings: sagging back a step and returning covers no new ground.
         """
+        self.stepped = False
         if candle.at.time() < REGULAR_CLOSE:
-            self.beyond = None
+            self.beyond, self.rung = None, 0
             return None
         anchor = self.anchor_for(day)
         if not anchor:
             return None
         percent = 100.0 * (candle.close - anchor) / anchor
-        if self.up_only and percent <= 0:
-            return None
-        if abs(percent) < self.percent:
-            self.beyond = None          # back inside the band: re-arm
+        limit = self.threshold(candle.at)
+        if abs(percent) < limit or (self.up_only and percent <= 0):
+            # Back inside the band -- or, watching run-ups only, on the
+            # wrong side of it -- re-arms. Returning early for up_only
+            # BEFORE this reset used to leave a buy crossing armed through
+            # a dip, so the next run-up never rang.
+            self.beyond, self.rung = None, 0
             return None
         side = "buy" if percent > 0 else "sell"
-        if self.beyond == side:
-            return None                 # this crossing already rang
-        self.beyond = side
+        step = limit if self.level_step is None else self.level_step
+        reached = 1 + (int((abs(percent) - limit) / step + 1e-9) if step > 0 else 0)
+        if self.beyond == side and reached <= self.rung:
+            return None                 # this ground already rang
+        self.stepped = self.beyond == side
+        self.beyond, self.rung = side, reached
         return side, percent, anchor
 
     def _move(self, candle: Candle) -> Optional[Tuple[str, float, float]]:
@@ -811,7 +863,7 @@ class Alarms:
         percent = 100.0 * (candle.close - then) / then
         if self.up_only and percent <= 0:
             return None
-        if abs(percent) < self.percent:
+        if abs(percent) < self.threshold(candle.at):
             return None
         return ("buy" if percent > 0 else "sell", percent,
                 (candle.at - then_at).total_seconds() / 60)
@@ -827,6 +879,7 @@ class Alarms:
         be the move since the last thing that happened to be interesting.
         """
         self._cross(day)
+        self.from_level = False
         # Both sides see every bar, fired or not: _move's window and
         # _level's crossing state are only correct if nothing is skipped.
         moved = self._move(candle)
@@ -836,9 +889,11 @@ class Alarms:
         # speaks first when both have something to say.
         if level is not None:
             side, percent, anchor = level
+            self.from_level = True
             whence = ("your price" if self.anchor_price
                       else f"the {REGULAR_CLOSE:%H:%M} close")
-            return side, (f"{'up' if percent > 0 else 'down'} "
+            return side, (f"{'further: ' if self.stepped else ''}"
+                          f"{'up' if percent > 0 else 'down'} "
                           f"{abs(percent):.2f}% from {whence} "
                           f"({anchor:.2f} \u2192 {candle.close:.2f})")
 
@@ -870,6 +925,22 @@ class Alarms:
             return False
         self.fired[direction] = at
         return True
+
+    def should_ring(self, call: Optional[Tuple[str, str]], at: datetime) -> bool:
+        """Whether reason()'s verdict reaches the phone as a noise.
+
+        A level ring skips the cooldown. Each one is a new step from the
+        anchor, already deduplicated by _level, and a run that climbs two
+        steps in ten minutes is exactly the run that must not be held
+        back for fifteen. It still stamps the cooldown, so the speed alarm
+        does not echo it a minute later.
+        """
+        if call is None:
+            return False
+        if self.from_level:
+            self.fired[call[0]] = at
+            return True
+        return self.should_sound(call[0], at)
 
     def sound_for(self, direction: str, buy: str = SOUND_BUY,
                   sell: str = SOUND_SELL) -> str:
@@ -1318,9 +1389,47 @@ def rebuild_report(symbol: str, day: date, start: time, end: time,
         return None
 
 
+def replay_alarms(alarms: "Alarms", minutes: pd.DataFrame,
+                  minute_base: Dict[time, float],
+                  prev_close: Optional[float]) -> List[Tuple[datetime, str, str, float]]:
+    """(time, direction, why, price) for every minute that would have rung.
+
+    The same per-minute judgement run_live makes -- the same candle, lean
+    and day built the same way, minutes with no trades skipped as live
+    skips them, the same should_ring -- so a threshold chosen here is a
+    threshold that behaves this way on the phone.
+    """
+    rings = []
+    for stamp in minutes.index:
+        minute = to_candles(minutes.loc[[stamp]], minute_base)[0]
+        if minute.volume <= 0:
+            continue
+        upto = minutes[minutes.index <= stamp]
+        call = alarms.reason(minute, read_lean(upto, baseline=minute_base),
+                             read_day(upto, prev_close))
+        if alarms.should_ring(call, stamp):
+            rings.append((stamp, call[0], call[1], minute.close))
+    return rings
+
+
+def alarm_policy(alarms: "Alarms") -> str:
+    """One line saying which bands a run or replay is judging by."""
+    text = f"{alarms.percent:.2f}% in {alarms.minutes} min"
+    if alarms.ah_percent:
+        text += f", {alarms.ah_percent:.2f}% outside 09:30-16:00"
+    step = alarms.level_step
+    text += ("; level alarm once per crossing" if step == 0 else
+             "; level alarm steps by the band" if step is None else
+             f"; level alarm steps every {step:.2f}%")
+    if alarms.up_only:
+        text += "; run-ups only"
+    return text
+
+
 def run_replay(symbol: str, day: date, start: time, end: time,
                dry_run: bool, db: sqlite3.Connection,
-               multiple: float = VOLUME_ALERT_MULTIPLE) -> int:
+               multiple: float = VOLUME_ALERT_MULTIPLE,
+               alarms: Optional["Alarms"] = None) -> int:
     """Read a past morning. Always the full tape -- history is free on SIP."""
     minutes = fetch_minutes(
         symbol,
@@ -1361,6 +1470,22 @@ def run_replay(symbol: str, day: date, start: time, end: time,
         if busiest is not None and not spikes:
             print(f"    busiest was {busiest.at:%H:%M} at {busiest.vol_ratio:.1f}x "
                   f"-- lower the threshold to catch it")
+
+    # The price alarms -- the ones that make a NOISE. Until 14 Oct replay
+    # counted only volume spikes, so --move-percent's own help ("tune it
+    # with --replay") pointed at a replay that could not answer it.
+    alarms = alarms if alarms is not None else Alarms()
+    rings = replay_alarms(alarms, minutes, minute_base, prev_close)
+    print("-" * 56)
+    print(f"  Price alarms ({alarm_policy(alarms)}): {len(rings)} would have rung")
+    for at, side, why, price in rings:
+        print(f"    {at:%H:%M}  {'BUY ' if side == 'buy' else 'SELL'}  "
+              f"{price:8.2f}  {why}")
+    if (end > REGULAR_CLOSE and not alarms.anchor_price
+            and read_day(minutes, prev_close) is None):
+        print("    note: no regular-hours bars in this window, so the "
+              "after-hours level alarm had no close to measure from. Start "
+              "--from at 15:59 or earlier, or pass --from-price.")
     print("=" * 56)
     text = summarise(symbol, candles)
     print(text)
@@ -1382,7 +1507,9 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
              move_minutes: int = MOVE_MINUTES,
              alarm_volume: float = ALARM_VOLUME,
              up_only: bool = False,
-             from_price: Optional[float] = None) -> int:
+             from_price: Optional[float] = None,
+             ah_percent: Optional[float] = AH_PERCENT,
+             level_step: Optional[float] = LEVEL_STEP) -> int:
     """Follow the session: full detail early, then only the unusual."""
     today = datetime.now(ET).date()
     window_start = datetime.combine(today, start, tzinfo=ET)
@@ -1440,15 +1567,18 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
     # phone. None is survivable: the day's move is the line that goes.
     alarms = Alarms(percent=move_percent, minutes=move_minutes,
                     volume=alarm_volume, up_only=up_only,
-                    anchor_price=from_price)
+                    anchor_price=from_price, ah_percent=ah_percent,
+                    level_step=level_step)
+    print(f"  alarm bands: {alarm_policy(alarms)}\n")
     # Say which anchor the level alarm will use. Printing the policy is
     # the cheap half; the warning below is the half that matters, because
     # an alarm that cannot arm is indistinguishable from a quiet tape.
+    level_band = ah_percent or move_percent
     if from_price:
-        print(f"After-hours level alarm: {move_percent:.2f}% from "
+        print(f"After-hours level alarm: {level_band:.2f}% from "
               f"{from_price:.2f} (your price).\n")
     else:
-        print(f"After-hours level alarm: {move_percent:.2f}% from today's "
+        print(f"After-hours level alarm: {level_band:.2f}% from today's "
               f"{REGULAR_CLOSE:%H:%M} close, once there is one.\n")
     warned_no_anchor = False
 
@@ -1515,7 +1645,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                           "to arm it. **")
 
                 call = alarms.reason(minute, lean, day)
-                ringing = call is not None and alarms.should_sound(call[0], stamp)
+                ringing = alarms.should_ring(call, stamp)
                 # Past the detail window only the unusual leaves the machine.
                 push = reaches_phone(stamp.time(), spiked, detail_until) or ringing
                 message = describe(symbol, minute, day, lean, multiple, market)
@@ -2104,6 +2234,100 @@ def self_test() -> int:
         failures.append(f"with --from-price the message must name the anchor "
                         f"as yours, not the close: {said[1]!r}")
 
+    # --- 14 Oct: an evening that keeps going is reported as it goes ------
+    # A slide to -1.4% from the close, band 0.5: the old alarm rang once,
+    # at -0.5%, and said nothing about the next 0.9%. Stepping by the band
+    # it must ring at -0.5 and again at -1.0, and the second must say it
+    # is further, not a fresh crossing.
+    deep = [close_at_four * (1 - 0.014 * m / 59) for m in range(60)]
+    stepper = Alarms(percent=0.5)
+    steps = [r for r in (stepper.reason(*evening(px, m))
+                         for m, px in enumerate(deep)) if r is not None]
+    if len(steps) != 2:
+        failures.append(f"a slide to -1.4% with a 0.5 band must ring at -0.5 "
+                        f"and -1.0, twice, not {len(steps)}x: {steps!r}")
+    elif not steps[1][1].startswith("further: ") or steps[0][1].startswith("further"):
+        failures.append(f"the second ring is a further step and must say so; "
+                        f"the first must not: {steps!r}")
+    once = Alarms(percent=0.5, level_step=0)
+    if sum(once.reason(*evening(px, m)) is not None
+           for m, px in enumerate(deep)) != 1:
+        failures.append("--level-step 0 must keep the old once-per-crossing "
+                        "behaviour")
+
+    # Sagging back a step and returning covers no new ground: silent. A
+    # NEW furthest step rings. Asserted on _level, like the re-arm above:
+    # a bounce from -1.4% to -0.8% in a minute is a genuine speed move,
+    # and reason() would report THAT, hiding whatever _level decided.
+    sag = Alarms(percent=0.5)
+    for m, px in enumerate(deep):
+        sag.reason(*evening(px, m))                 # rung for -0.5 and -1.0
+    back_and_forth = [close_at_four * (1 + d) for d in (-0.008, -0.011, -0.016)]
+    again2 = [sag._level(evening(px, 60 + m)[0], evening(px, 60 + m)[2])
+              for m, px in enumerate(back_and_forth)]
+    if again2[0] is not None or again2[1] is not None:
+        failures.append(f"back to -0.8% then -1.1% revisits ground that "
+                        f"already rang and must be silent: {again2[:2]!r}")
+    if again2[2] is None:
+        failures.append("-1.6% is a new furthest step and must ring")
+
+    # A further step is new information and skips the cooldown; a speed
+    # alarm a minute later does not.
+    hurry = Alarms(percent=0.5)
+    sounded = []
+    for m, px in enumerate([close_at_four * (1 + d) for d in
+                            (0, -0.0052, -0.0060, -0.0103)]):
+        bar, lean, dctx = evening(px, m)
+        if hurry.should_ring(hurry.reason(bar, lean, dctx), bar.at):
+            sounded.append(m)
+    if sounded != [1, 3]:
+        failures.append(f"level steps 2 minutes apart must both reach the "
+                        f"phone despite the cooldown, nothing else: "
+                        f"rang at minutes {sounded}")
+
+    # Watching run-ups only, a dip below the close re-arms the buy side.
+    # It used to return before the reset, so the second run-up was silent.
+    ups = Alarms(percent=0.5, up_only=True)
+    ups_said = [ups.reason(*evening(close_at_four * (1 + d), m)) is not None
+                for m, d in enumerate((0.006, -0.006, 0.006))]
+    if ups_said != [True, False, True]:
+        failures.append(f"--up-only: up, dip, up again must ring, stay "
+                        f"silent, ring -- got {ups_said}")
+
+    # The evening band. A 0.35% move inside five minutes at 16:30 rings on
+    # a 0.30 after-hours band and not on the 0.50 session band; the same
+    # move at 10:30 is judged by the session band whatever the evening one.
+    def fast(hour, minute, price):
+        when = datetime.combine(date(2026, 10, 9), time(hour, minute), tzinfo=ET)
+        return Candle(at=when, open=price, high=price, low=price, close=price,
+                      volume=9_000, usual_volume=None)
+    for band, hour, want in ((0.30, 16, True), (None, 16, False), (0.30, 10, False)):
+        a = Alarms(percent=0.5, ah_percent=band)
+        a._move(fast(hour, 30, 100.0))
+        hit = a._move(fast(hour, 33, 100.35)) is not None
+        if hit != want:
+            failures.append(f"a 0.35% move at {hour}:33 with --ah-percent "
+                            f"{band} should {'ring' if want else 'stay silent'}")
+
+    # Replay judges the same way the live loop does. A synthetic evening:
+    # regular session closes at 100.00, then drifts to 98.90 by 16:40.
+    stamps = pd.date_range(datetime(2026, 10, 9, 15, 50), periods=51,
+                           freq="1min", tz=ET)
+    closes = [100.0] * 10 + [100.0 - 1.1 * m / 40 for m in range(41)]
+    frame = pd.DataFrame({"open": closes, "high": closes, "low": closes,
+                          "close": closes, "volume": 500.0}, index=stamps)
+    # No trades in the very minute the first ring would come (-0.52%):
+    # live skips such a minute, so replay must ring a minute later.
+    frame.loc[stamps[29], "volume"] = 0.0
+    replayed = replay_alarms(Alarms(percent=0.5), frame, {}, 101.0)
+    if [side for _, side, _, _ in replayed] != ["sell", "sell"]:
+        failures.append(f"replaying a drift to -1.1% after the close must show "
+                        f"two sell rings (-0.5, -1.0): {replayed!r}")
+    elif any(at == stamps[29] for at, _, _, _ in replayed):
+        failures.append("replay must skip a minute with no trades, as live does")
+    if "0.30% outside 09:30-16:00" not in alarm_policy(Alarms(ah_percent=0.3)):
+        failures.append("the policy line must name the evening band")
+
     # ...but only while it is inside the window.
     stale = Alarms()
     bar, lean, dctx, when = reading(0.50, 2.0, price=150.5, at_minute=0)
@@ -2307,6 +2531,20 @@ def main() -> int:
                              f"(default {MOVE_PERCENT}%%). Tune it with "
                              f"--replay against a past session rather than "
                              f"by ear")
+    parser.add_argument("--ah-percent", type=float, default=AH_PERCENT,
+                        metavar="PCT",
+                        help="A separate band for outside 09:30-16:00, used "
+                             "by both the speed and the level alarm (default: "
+                             "the same as --move-percent). After hours the "
+                             "stock drifts, so a smaller band rings sooner; "
+                             "choose it with --replay on your own evenings")
+    parser.add_argument("--level-step", type=float, default=LEVEL_STEP,
+                        metavar="PCT",
+                        help="After the after-hours level alarm rings, ring "
+                             "again each time price gets PCT further from "
+                             "the anchor (default: the band itself, so 0.5 "
+                             "rings at 0.5, 1.0, 1.5...). 0 rings once per "
+                             "crossing")
     parser.add_argument("--from-price", type=float, default=None,
                         metavar="PRICE",
                         help="Anchor the after-hours level alarm on this "
@@ -2346,6 +2584,10 @@ def main() -> int:
                         help="Ask Pushover which sound names this app can use")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
+    if args.ah_percent is not None and args.ah_percent <= 0:
+        raise SystemExit("--ah-percent must be above 0")
+    if args.level_step is not None and args.level_step < 0:
+        raise SystemExit("--level-step must be 0 or more")
 
     if args.self_test:
         return self_test()
@@ -2375,12 +2617,20 @@ def main() -> int:
     if args.replay:
         day = datetime.strptime(args.replay, "%Y-%m-%d").date()
         return run_replay(symbol, day, start, end, args.dry_run, db,
-                          args.volume_alert)
+                          args.volume_alert,
+                          Alarms(percent=args.move_percent,
+                                 minutes=args.move_minutes,
+                                 volume=args.alarm_volume,
+                                 up_only=args.up_only,
+                                 anchor_price=args.from_price,
+                                 ah_percent=args.ah_percent,
+                                 level_step=args.level_step))
     return run_live(symbol, start, end, args.dry_run, db, args.push_empty,
                     args.volume_alert, args.pdf_every, args.db, detail,
                     args.buy_sound, args.sell_sound,
                     args.move_percent, args.move_minutes,
-                    args.alarm_volume, args.up_only, args.from_price)
+                    args.alarm_volume, args.up_only, args.from_price,
+                    args.ah_percent, args.level_step)
 
 
 if __name__ == "__main__":
