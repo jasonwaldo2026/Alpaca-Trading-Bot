@@ -62,7 +62,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from feed_check import (
@@ -133,6 +133,21 @@ PUSHOVER_VALIDATE_URL = "https://api.pushover.net/1/users/validate.json"
 #: or vibration; 1 sounds through a focus mode.
 PRIORITY_UPDATE = -1
 PRIORITY_SUMMARY = 1
+
+#: Pushover's emergency priority: the alarm repeats until it is tapped
+#: Acknowledge in the app. Pushover refuses one that does not say how
+#: often to repeat (30 s at the least) and when to give up (3 h at the
+#: most), so those travel with it. Used for the S&P 500 at -2%.
+PRIORITY_EMERGENCY = 2
+EMERGENCY_RETRY = 60
+EMERGENCY_EXPIRE = 1800
+
+
+def emergency_fields(priority: int) -> Dict[str, str]:
+    """The extra fields an emergency alarm needs, or none for any other."""
+    if priority < PRIORITY_EMERGENCY:
+        return {}
+    return {"retry": str(EMERGENCY_RETRY), "expire": str(EMERGENCY_EXPIRE)}
 
 #: The uploaded sound this alert rings with. It lives HERE rather than in
 #: open_candles because open_candles imports this module and the reverse
@@ -340,6 +355,8 @@ def send_pushover(message: str, title: str = "SPCX setup",
     tray to be glanced at. 0 is a normal notification. 1 is an alarm that
     sounds through a focus mode. A stream of routine updates belongs at
     -1, or the phone becomes unusable and the alarms get ignored with it.
+    2 is an emergency: it repeats every EMERGENCY_RETRY seconds until
+    acknowledged, for at most EMERGENCY_EXPIRE.
 
     `sound` names one of Pushover's built-in sounds, or a custom sound
     uploaded to the account that owns the app token. It only matters at
@@ -357,6 +374,7 @@ def send_pushover(message: str, title: str = "SPCX setup",
         # default for this application. Naming one overrides it, which is
         # the point: the sound is carrying the direction.
         fields["sound"] = sound
+    fields.update(emergency_fields(priority))
 
     usable = (attachment and os.path.exists(attachment)
               and os.path.getsize(attachment) <= MAX_ATTACHMENT_BYTES)
@@ -910,6 +928,16 @@ def self_test() -> int:
     print("  Duplicate bar rejected         : yes")
     print("  Forming bar dropped            : yes")
     print("  Trading client in this file    : none")
+
+    # An emergency Pushover cannot repeat is one Pushover refuses outright.
+    loud = emergency_fields(PRIORITY_EMERGENCY)
+    if loud != {"retry": "60", "expire": "1800"}:
+        failures.append(f"an emergency must say how to repeat: {loud!r}")
+    if emergency_fields(PRIORITY_SUMMARY) or emergency_fields(PRIORITY_UPDATE):
+        failures.append("only an emergency carries retry and expire")
+    if not 30 <= EMERGENCY_RETRY or not EMERGENCY_EXPIRE <= 10800:
+        failures.append("Pushover's limits: retry 30 s or more, expire 3 h "
+                        "or less")
 
     if failures:
         print("\nFAILED:")

@@ -96,6 +96,10 @@ from spcx_alert import (
     registered_devices,
     send_pushover,
 )
+try:
+    from spcx_alert import PRIORITY_EMERGENCY
+except ImportError:      # an older spcx_alert.py: stale_sender() refuses it
+    PRIORITY_EMERGENCY = None
 
 SYMBOL = "SPCX"
 BAR_MINUTES = 5
@@ -389,8 +393,14 @@ SOUND_CLIMB, SOUND_FALLING = "climb", "falling"
 #: hears. This rings once the market is down MARKET_DROP percent from
 #: yesterday's close, and again every MARKET_STEP further, with a sound
 #: that means "the whole market", not "this stock".
-MARKET_DROP: float = 1.00
+#:
+#: 15 Oct: from -0.5% rather than -1%, and every ring at MARKET_EXTENDED
+#: or deeper goes out as a Pushover emergency -- it repeats every minute
+#: until tapped Acknowledge, for up to 30 minutes (spcx_alert.py holds
+#: those two numbers). 0 turns the extended alarm off.
+MARKET_DROP: float = 0.50
 MARKET_STEP: float = 0.50
+MARKET_EXTENDED: float = 2.00
 SOUND_MARKET = "siren"
 
 #: The slider's track. Eleven cells so there is an exact middle, and two
@@ -1285,12 +1295,19 @@ def sounds_supported() -> bool:
 
 def stale_sender() -> Optional[str]:
     """One line naming the problem and the fix, or None when all is well."""
-    if sounds_supported():
-        return None
-    return (f"spcx_alert.py is out of date: its send_pushover() takes no "
-            f"sound, so no alarm could play one.\n"
-            f"  Re-download it from {SOUNDS_FROM_COMMIT} or later, into the "
-            f"same folder as this file.")
+    if not sounds_supported():
+        return (f"spcx_alert.py is out of date: its send_pushover() takes no "
+                f"sound, so no alarm could play one.\n"
+                f"  Re-download it from {SOUNDS_FROM_COMMIT} or later, into the "
+                f"same folder as this file.")
+    if PRIORITY_EMERGENCY is None:
+        # Pushover refuses an emergency that does not say how to repeat,
+        # so an old sender would fail at -2% -- the ring that matters most.
+        return ("spcx_alert.py is out of date: it cannot send an emergency "
+                "alarm, so the S&P 500's extended alarm would be refused.\n"
+                "  Re-download it from the same branch as this file, into "
+                "the same folder.")
+    return None
 
 
 def test_push(buy_sound: str = SOUND_BUY, sell_sound: str = SOUND_SELL,
@@ -1386,10 +1403,21 @@ def test_push(buy_sound: str = SOUND_BUY, sell_sound: str = SOUND_SELL,
         noise = sound or "silent"
         print(f"  {label:<20} priority {priority:<3} {noise:<16} {outcome}")
 
-    print("\nThree should have arrived. The first without a sound, then the")
-    print("buy, then the sell. If a sound played that you did not choose, the")
-    print("name does not match the account — that is the failure this cannot")
-    print("detect from here.\n")
+    # The extended alarm, so its first real use is not its first hearing.
+    time_mod.sleep(pause)
+    drill = MarketAlarm()
+    why = drill.update(-MARKET_EXTENDED - 0.03)
+    body, priority = market_push(drill, why, -MARKET_EXTENDED - 0.03)
+    outcome = send_pushover(body, title=f"TEST — {why}", priority=priority,
+                            sound=market_sound) or "sent"
+    print(f"  {'the extended alarm':<20} priority {priority:<3} "
+          f"{market_sound:<16} {outcome}")
+
+    print("\nFour should have arrived. The first without a sound, then the")
+    print("buy, then the sell, then the S&P 500 extended alarm -- which keeps")
+    print("ringing every minute until you open it and tap Acknowledge. If a")
+    print("sound played that you did not choose, the name does not match the")
+    print("account — that is the failure this cannot detect from here.\n")
     return 0
 
 
@@ -1531,13 +1559,19 @@ class Trend:
 class MarketAlarm:
     """Rings when the S&P 500 is down `drop`% from yesterday's close, and
     again every `step`% further. Back above the line re-arms it, so a
-    market that recovers and then breaks down again is heard again."""
+    market that recovers and then breaks down again is heard again.
+
+    `urgent` says whether the ring just returned is at or past `extended`,
+    the depth that goes out as an emergency rather than a single sound."""
 
     drop: float = MARKET_DROP
     step: float = MARKET_STEP
+    extended: float = MARKET_EXTENDED
     rung: int = 0
+    urgent: bool = False
 
     def update(self, change_pct: Optional[float]) -> Optional[str]:
+        self.urgent = False
         if change_pct is None or self.drop <= 0:
             return None
         down = -change_pct
@@ -1549,8 +1583,30 @@ class MarketAlarm:
             return None
         further = self.rung > 0
         self.rung = reached
-        return (f"MARKET: S&P 500 {'further, ' if further else ''}down "
+        self.urgent = self.extended > 0 and down + 1e-9 >= self.extended
+        return (f"MARKET{' ALARM' if self.urgent else ''}: S&P 500 "
+                f"{'further, ' if further else ''}down "
                 f"{down:.2f}% from yesterday's close")
+
+
+def market_push(alarm: "MarketAlarm", why: str, change_pct: Optional[float]
+                ) -> Tuple[str, int]:
+    """The body and priority for a market ring the alarm just returned."""
+    body = (market_line(change_pct) or why) + (
+        f"\nRings again at every {alarm.step:.2f}% further.")
+    if alarm.urgent:
+        return (body + "\nRepeats every minute until you tap Acknowledge.",
+                PRIORITY_EMERGENCY)
+    return body, PRIORITY_SUMMARY
+
+
+def market_policy(alarm: "MarketAlarm") -> str:
+    """One line saying when the market alarm rings, and how loudly."""
+    text = (f"S&P 500 down {alarm.drop:.2f}% from yesterday's close, then "
+            f"every {alarm.step:.2f}% further")
+    if alarm.extended > 0:
+        text += f"; extended (repeats until acknowledged) from {alarm.extended:.2f}%"
+    return text
 
 
 def replay_alarms(alarms: "Alarms", minutes: pd.DataFrame,
@@ -1686,9 +1742,8 @@ def run_replay(symbol: str, day: date, start: time, end: time,
             market_rings = None
             print(f"  Market alarm: S&P 500 unavailable ({type(exc).__name__})")
         if market_rings is not None:
-            print(f"  Market alarm (S&P 500 down {market_alarm.drop:.2f}%, then "
-                  f"every {market_alarm.step:.2f}%): {len(market_rings)} would "
-                  f"have rung")
+            print(f"  Market alarm ({market_policy(market_alarm)}): "
+                  f"{len(market_rings)} would have rung")
             for at, why in market_rings:
                 print(f"    {at:%H:%M}  MKT    {why}")
     if (end > REGULAR_CLOSE and not alarms.anchor_price
@@ -1726,7 +1781,8 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
              falling_sound: str = SOUND_FALLING,
              market_drop: float = MARKET_DROP,
              market_step: float = MARKET_STEP,
-             market_sound: str = SOUND_MARKET) -> int:
+             market_sound: str = SOUND_MARKET,
+             market_extended: float = MARKET_EXTENDED) -> int:
     """Follow the session: full detail early, then only the unusual."""
     today = datetime.now(ET).date()
     window_start = datetime.combine(today, start, tzinfo=ET)
@@ -1794,10 +1850,11 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
               f"{climb_sound} up, {falling_sound} down\n")
     else:
         print("  trend alarm: off\n")
-    market_alarm = MarketAlarm(drop=market_drop, step=market_step)
+    market_alarm = MarketAlarm(drop=market_drop, step=market_step,
+                               extended=market_extended)
     if market_drop > 0:
-        print(f"  market alarm: S&P 500 down {market_drop:.2f}% from yesterday's "
-              f"close, then every {market_step:.2f}% further -- {market_sound}\n")
+        print(f"  market alarm: {market_policy(market_alarm)} -- "
+              f"{market_sound}\n")
     else:
         print("  market alarm: off\n")
     # Say which anchor the level alarm will use. Printing the policy is
@@ -1851,10 +1908,9 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
             # mistaken for one.
             market_call = market_alarm.update(market)
             if market_call:
-                body = market_line(market) or market_call
-                status = deliver(body + f"\nRings again at every {market_step:.2f}% "
-                                 f"further.", market_call, PRIORITY_SUMMARY,
-                                 dry_run, sound=market_sound)
+                body, priority = market_push(market_alarm, market_call, market)
+                status = deliver(body, market_call, priority, dry_run,
+                                 sound=market_sound)
                 print(f"  {now:%H:%M}  ** {market_call} **  [{status}]\n")
 
             # --- the quiet per-minute update ---------------------------
@@ -2155,6 +2211,16 @@ def self_test() -> int:
                             "stale sender")
     finally:
         _self.send_pushover = kept
+
+    kept_emergency = _self.PRIORITY_EMERGENCY
+    _self.PRIORITY_EMERGENCY = None
+    try:
+        note = stale_sender()
+        if not note or "emergency" not in note or "spcx_alert.py" not in note:
+            failures.append(f"a sender with no emergency priority must be "
+                            f"refused by name: {note!r}")
+    finally:
+        _self.PRIORITY_EMERGENCY = kept_emergency
 
     # A wrapper that takes **kwargs passes a sound through untouched and
     # must not be mistaken for an old file.
@@ -2641,7 +2707,7 @@ def self_test() -> int:
         failures.append("--trend-step 0 must turn the trend alarm off")
 
     # --- 14 Oct: the market alarm ------------------------------------------
-    mkt = MarketAlarm()
+    mkt = MarketAlarm(drop=1.0, extended=0)
     tape = (-0.50, -1.02, -1.20, -1.55, -0.80, -1.10, None, -2.20)
     calls = [mkt.update(c) for c in tape]
     rang_at = [i for i, c in enumerate(calls) if c]
@@ -2657,9 +2723,45 @@ def self_test() -> int:
     spy_stamps = pd.date_range(datetime(2026, 10, 14, 10, 0), periods=3,
                                freq="1min", tz=ET)
     spy = pd.DataFrame({"close": [99.5, 98.9, 98.4]}, index=spy_stamps)
-    if [at for at, _ in replay_market(MarketAlarm(), spy, 100.0)] != \
+    if [at for at, _ in replay_market(MarketAlarm(drop=1.0), spy, 100.0)] != \
             list(spy_stamps[1:]):
         failures.append("replaying the S&P must ring at -1.1% and again at -1.6%")
+
+    # --- 15 Oct: from -0.5%, and an emergency from -2% ---------------------
+    tape = (-0.30, -0.52, -0.80, -1.01, -1.60, -1.99, -2.05, -2.30, -2.60,
+            -0.40, -0.60)
+    mkt, rang_at, loud = MarketAlarm(), [], []
+    for i, c in enumerate(tape):
+        if mkt.update(c):
+            rang_at.append(i)
+            if mkt.urgent:
+                loud.append(i)
+    if rang_at != [1, 3, 4, 6, 8, 10]:
+        failures.append(f"the market alarm must ring at -0.5% and every 0.5% "
+                        f"further, and again after re-arming: rang at "
+                        f"{rang_at} of {tape}")
+    if loud != [6, 8]:
+        failures.append(f"only rings at -2% or deeper are extended: {loud} "
+                        f"of {tape}")
+    quiet = MarketAlarm()
+    quiet.update(-2.10)
+    if quiet.update(-2.20) is not None or quiet.urgent:
+        failures.append("a minute with no new ring must not read as urgent")
+    off = MarketAlarm(extended=0)
+    if not off.update(-3.0) or off.urgent:
+        failures.append("--market-extended 0 must ring without the emergency")
+    deep = MarketAlarm()
+    why = deep.update(-2.05)
+    body, priority = market_push(deep, why, -2.05)
+    if priority != PRIORITY_EMERGENCY or "Acknowledge" not in body \
+            or "ALARM" not in why:
+        failures.append(f"a -2% ring must go out as an emergency: "
+                        f"{priority} {why!r} {body!r}")
+    shallow = MarketAlarm()
+    why = shallow.update(-0.55)
+    body, priority = market_push(shallow, why, -0.55)
+    if priority != PRIORITY_SUMMARY or "Acknowledge" in body:
+        failures.append(f"a -0.5% ring is a single sound: {priority} {body!r}")
 
     # Replay feeds the trend the same minutes live does: the drift to
     # -1.1% after the close is a falling run as well as a level alarm.
@@ -2911,6 +3013,12 @@ def main() -> int:
                         metavar="PCT",
                         help=f"...and again every PCT further (default "
                              f"{MARKET_STEP})")
+    parser.add_argument("--market-extended", type=float,
+                        default=MARKET_EXTENDED, metavar="PCT",
+                        help=f"From PCT down, each market ring is a Pushover "
+                             f"emergency that repeats every minute until "
+                             f"acknowledged (default {MARKET_EXTENDED}; 0 "
+                             f"turns it off)")
     parser.add_argument("--market-sound", default=SOUND_MARKET, metavar="NAME",
                         help=f"Pushover sound for the market alarm "
                              f"(default {SOUND_MARKET})")
@@ -2958,7 +3066,8 @@ def main() -> int:
     if args.level_step is not None and args.level_step < 0:
         raise SystemExit("--level-step must be 0 or more")
     for flag, value in (("--trend-step", args.trend_step),
-                        ("--market-drop", args.market_drop)):
+                        ("--market-drop", args.market_drop),
+                        ("--market-extended", args.market_extended)):
         if value < 0:
             raise SystemExit(f"{flag} must be 0 (off) or more")
     for flag, value in (("--trend-giveback", args.trend_giveback),
@@ -3008,7 +3117,8 @@ def main() -> int:
                           Trend(step=args.trend_step,
                                 giveback=args.trend_giveback),
                           MarketAlarm(drop=args.market_drop,
-                                      step=args.market_step))
+                                      step=args.market_step,
+                                      extended=args.market_extended))
     return run_live(symbol, start, end, args.dry_run, db, args.push_empty,
                     args.volume_alert, args.pdf_every, args.db, detail,
                     args.buy_sound, args.sell_sound,
@@ -3017,7 +3127,8 @@ def main() -> int:
                     args.ah_percent, args.level_step,
                     args.trend_step, args.trend_giveback,
                     args.climb_sound, args.falling_sound,
-                    args.market_drop, args.market_step, args.market_sound)
+                    args.market_drop, args.market_step, args.market_sound,
+                    args.market_extended)
 
 
 if __name__ == "__main__":
