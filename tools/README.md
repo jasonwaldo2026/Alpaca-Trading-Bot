@@ -27,6 +27,7 @@ all. Trades are placed by hand, in DAS.
 | `swing_study.py` | Does the signal mark anything worth acting on, and with what bracket | research |
 | `benchmark_report.py` | The stock against the market, with share unlocks marked | research |
 | `screener.py` | Which other symbols are worth the same attention | research |
+| `darkpool_study.py` | Do big dark pool prints mark price levels that hold, against random prices | research |
 | `session_clock.py` | The trading day as a clock face — where movement is, where signals fire | research |
 | `bracket.py` | The stop, target and share count to type, from an entry and a risk budget | **before entering** |
 | `lockups.py` + `lockups.json` | The share-unlock calendar | read by the others |
@@ -136,12 +137,13 @@ python spcx_alert.py --self-test
 python swing_study.py --self-test
 python benchmark_report.py --self-test
 python screener.py --self-test
+python darkpool_study.py --self-test
 python launches.py --self-test
 python session_clock.py --self-test
 python lockups.py
 ```
 
-All ten should pass before you rely on anything.
+All eleven should pass before you rely on anything.
 
 ---
 
@@ -183,6 +185,7 @@ python benchmark_report.py
 python session_clock.py
 python session_clock.py --today
 python screener.py --symbols TSLA,NVDA,COIN --pdf
+python darkpool_study.py --days 20
 python launches.py
 python lockups.py
 ```

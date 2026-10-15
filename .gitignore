@@ -64,4 +64,7 @@ tools/*statement*
 tools/*confirmation*
 # Generated reports carry positions and P&L in the header.
 tools/*.pdf
+# darkpool_study.py's download cache: SIP market data, which is licensed
+# for personal use and is not ours to publish.
+tools/darkpool_cache/
 !tools/primer/SPCX_primer.pdf
