@@ -44,7 +44,12 @@ Usage
     python darkpool_study.py                       # SPCX, last 20 days
     python darkpool_study.py --days 40
     python darkpool_study.py --min-notional 20000000
+    python darkpool_study.py --flowalgo export.csv # FlowAlgo's prints instead
     python darkpool_study.py --self-test           # no network
+
+--flowalgo reads a CSV from FlowAlgo's Equity Exporter and tests ITS
+prints the same way, against Alpaca's bars. The file is FlowAlgo's data,
+licensed to you alone: keep it on your own machine, never in this repo.
 
 The first run downloads every trade of every day, which for a busy symbol
 takes minutes. The off-exchange part is kept in darkpool_cache/ beside
@@ -186,24 +191,26 @@ class Level:
 
 
 def at_market(price: float, at: datetime, bars: pd.DataFrame,
-              tolerance: float = 0.0005) -> bool:
-    """Was the market at this price in the minute the print was reported?
+              tolerance: float = 0.001) -> bool:
+    """Was the market at this price around the minute it was reported?
 
     Average-price and prior-reference prints arrive long after the deal,
     at a price the market has left; the bars, which such prints do not
-    update, show it.
+    update, show it. The minute either side counts too: a report can
+    trail its trade by seconds, across a minute boundary.
     """
     minute = pd.Timestamp(at).floor("1min")
-    if minute not in bars.index:
+    near = bars[(bars.index >= minute - pd.Timedelta(minutes=1))
+                & (bars.index <= minute + pd.Timedelta(minutes=1))]
+    if near.empty:
         return False
-    bar = bars.loc[minute]
     slack = price * tolerance
-    return bar["low"] - slack <= price <= bar["high"] + slack
+    return near["low"].min() - slack <= price <= near["high"].max() + slack
 
 
 def to_levels(prints: pd.DataFrame, day: date, bars: pd.DataFrame,
-              min_notional: float, merge: float = 0.0005
-              ) -> Tuple[List[Level], int]:
+              min_notional: float, merge: float = 0.0005,
+              check_market: bool = True) -> Tuple[List[Level], int]:
     """(levels, how many blocks were away from the market).
 
     Blocks within `merge` of an existing level that day join it rather
@@ -216,7 +223,7 @@ def to_levels(prints: pd.DataFrame, day: date, bars: pd.DataFrame,
     away = 0
     for stamp, row in blocks.sort_index().iterrows():
         price, size = float(row["price"]), int(row["size"])
-        if not at_market(price, stamp, bars):
+        if check_market and not at_market(price, stamp, bars):
             away += 1
             continue
         for level in levels:
@@ -358,16 +365,177 @@ def median(values: Sequence[float]) -> float:
 
 
 # --------------------------------------------------------------------------
+# A FlowAlgo export
+# --------------------------------------------------------------------------
+
+#: The prints FlowAlgo labels, and what they are. "Lit Pool" is a block on
+#: a public exchange -- seen by everyone as it printed, not dark at all.
+FLOW_KINDS = {"Dark Pool": "dark", "Lit Pool": "lit"}
+
+
+@dataclass
+class FlowFile:
+    prints: pd.DataFrame        # price, size, kind; indexed by ET time
+    rows: int                   # in the file
+    duplicates: int             # identical rows dropped
+    other: int                  # rows for other symbols, or unknown kinds
+
+
+def read_flowalgo(path: str, symbol: str) -> FlowFile:
+    """FlowAlgo's Equity Exporter CSV, cleaned.
+
+    Identical rows -- same second, size and price -- are dropped. The
+    export repeats some trades verbatim, and its own daily totals count
+    them twice; one trade is one trade.
+
+    Times are read as US/Eastern: the export's 16:00 prints sit at the
+    closing price, which only makes sense on the exchange's own clock.
+    """
+    raw = pd.read_csv(path, dtype=str)
+    rows = len(raw)
+    raw = raw.drop_duplicates(["Date", "Time", "Ticker", "Quantity", "Spot"])
+    duplicates = rows - len(raw)
+    keep = ((raw["Ticker"].str.upper() == symbol)
+            & raw["Type"].isin(FLOW_KINDS))
+    mine = raw[keep]
+    stamps = pd.to_datetime(mine["Date"] + " " + mine["Time"],
+                            format="%m/%d/%y %H:%M:%S.%f")
+    prints = pd.DataFrame({
+        "price": mine["Spot"].str.replace(",", "").astype(float).values,
+        "size": mine["Quantity"].str.replace(",", "").astype(int).values,
+        "kind": mine["Type"].map(FLOW_KINDS).values,
+    }, index=pd.DatetimeIndex(stamps).tz_localize(ET)).sort_index()
+    return FlowFile(prints, rows, duplicates, int((~keep).sum()))
+
+
+# --------------------------------------------------------------------------
+# Scoring
+# --------------------------------------------------------------------------
+
+@dataclass
+class Results:
+    printed: Tally
+    controlled: Tally
+    after_print: Dict[int, List[float]]
+    after_any: Dict[int, List[float]]
+
+
+def next_session(day: date, bars_for, tries: int = 5
+                 ) -> Tuple[Optional[date], pd.DataFrame]:
+    """The first later weekday that has bars, and its bars."""
+    for step in range(1, tries + 1):
+        later = day + timedelta(days=step)
+        if later.weekday() >= 5:
+            continue
+        bars = bars_for(later)
+        if not bars.empty:
+            return later, bars
+    return None, pd.DataFrame()
+
+
+def score(levels: Sequence[Level], bars_for, rng: random.Random,
+          overnight: bool = False) -> Results:
+    """The level test and the aftermath over `levels`.
+
+    `overnight` tests each level on the NEXT session instead of its own:
+    for prints at the close, nothing is left of the day to test on. The
+    aftermath is skipped for those -- fifteen minutes after a 16:05 print
+    is after-hours tape, not the market the print was priced in.
+    """
+    res = Results(Tally(), Tally(), {h: [] for h in HORIZONS},
+                  {h: [] for h in HORIZONS})
+    by_day: Dict[date, List[Level]] = {}
+    for level in levels:
+        by_day.setdefault(level.day, []).append(level)
+    for day in sorted(by_day):
+        todays = by_day[day]
+        if overnight:
+            _, bars = next_session(day, bars_for)
+        else:
+            bars = bars_for(day)
+        if bars.empty:
+            continue
+        for level in todays:
+            res.printed.add(first_test(bars, level.price, level.at))
+            for price in control_prices(level.price, CONTROLS, rng):
+                res.controlled.add(first_test(bars, price, level.at))
+            if not overnight:
+                for h in HORIZONS:
+                    move = move_after(bars, level.at, h)
+                    if move is not None:
+                        res.after_print[h].append(move)
+        if overnight:
+            continue
+        # The comparison for the aftermath: every minute of the hours the
+        # prints happened in, on days they happened.
+        hours = {lv.at.hour for lv in todays}
+        for stamp in bars.index:
+            if stamp.hour in hours:
+                for h in HORIZONS:
+                    move = move_after(bars, stamp, h)
+                    if move is not None:
+                        res.after_any[h].append(move)
+    return res
+
+
+def cached_bars(symbol: str):
+    """fetch_minutes, asked once per day however many groups need it."""
+    seen: Dict[date, pd.DataFrame] = {}
+
+    def bars_for(day: date) -> pd.DataFrame:
+        if day not in seen:
+            seen[day] = fetch_minutes(symbol, day)
+        return seen[day]
+    return bars_for
+
+
+# --------------------------------------------------------------------------
 # Report
 # --------------------------------------------------------------------------
 
+def print_largest(levels: Sequence[Level], count: int = 5) -> None:
+    for lv in sorted(levels, key=lambda lv: -lv.notional)[:count]:
+        print(f"      {lv.at:%Y-%m-%d %H:%M}  ${lv.price:,.2f}  "
+              f"{lv.prints} print(s)  {lv.shares:,} sh  "
+              f"${lv.notional / 1e6:,.0f}M")
+
+
+def print_results(title: str, levels: Sequence[Level], res: Results,
+                  overnight: bool = False) -> None:
+    print(f"\n  {title}: {len(levels)} level(s)")
+    if levels:
+        print("    largest:")
+        print_largest(levels)
+    where = "on the next session" if overnight else "after the print"
+    print(f"    LEVELS -- first return to the price {where}, then "
+          f"{REACT:.2f}% back or {REACT:.2f}% through within {WINDOW} min")
+    print(f"      print levels   held {res.printed.held:>4}  broke "
+          f"{res.printed.broke:>4}")
+    print(f"      random prices  held {res.controlled.held:>4}  broke "
+          f"{res.controlled.broke:>4}")
+    print(f"      -> {verdict(res.printed, res.controlled)}")
+    if overnight:
+        return
+    print("    AFTERMATH -- median move after a print, against every minute "
+          "of the same hours")
+    print(f"      {'':10}{'prints':>18}{'any minute':>18}")
+    for h in HORIZONS:
+        p, a = res.after_print[h], res.after_any[h]
+        if len(p) < MIN_SAMPLE:
+            print(f"      {h:>3} min    {'too few (' + str(len(p)) + ')':>18}")
+            continue
+        print(f"      {h:>3} min    {median(p):>+8.2f}% ±"
+              f"{median([abs(x) for x in p]):.2f}{median(a):>+11.2f}% ±"
+              f"{median([abs(x) for x in a]):.2f}")
+    print("      (first number: direction; ± number: typical size either "
+          "way)")
+
+
 def run(symbol: str, days: int, min_notional: float) -> int:
+    """The study on Alpaca's own off-exchange prints."""
     load_env()
     end = date.today() - timedelta(days=1)
-    rng = random.Random(SEED)
-    printed, controlled = Tally(), Tally()
-    after_print: Dict[int, List[float]] = {h: [] for h in HORIZONS}
-    after_any: Dict[int, List[float]] = {h: [] for h in HORIZONS}
+    bars_for = cached_bars(symbol)
     all_levels: List[Level] = []
     away_total = 0
 
@@ -379,64 +547,78 @@ def run(symbol: str, days: int, min_notional: float) -> int:
         if prints.empty:
             print("    no off-exchange prints (holiday, or nothing traded)")
             continue
-        bars = fetch_minutes(symbol, day)
+        bars = bars_for(day)
         if bars.empty:
             continue
         levels, away = to_levels(prints, day, bars, min_notional)
         away_total += away
         all_levels += levels
-        for level in levels:
-            printed.add(first_test(bars, level.price, level.at))
-            for price in control_prices(level.price, CONTROLS, rng):
-                controlled.add(first_test(bars, price, level.at))
-            for h in HORIZONS:
-                move = move_after(bars, level.at, h)
-                if move is not None:
-                    after_print[h].append(move)
-        # The comparison for the aftermath: every minute of the hours the
-        # prints happened in, on days they happened.
-        if levels:
-            hours = {lv.at.hour for lv in levels}
-            for stamp in bars.index:
-                if stamp.hour in hours:
-                    for h in HORIZONS:
-                        move = move_after(bars, stamp, h)
-                        if move is not None:
-                            after_any[h].append(move)
         print(f"    {len(levels)} level(s) from blocks"
               + (f", {away} block(s) away from market" if away else ""))
 
     print("\n" + "=" * 64)
-    print(f"  {len(all_levels)} levels, {away_total} blocks away from the "
-          f"market (late or average-price reports, left out)")
-    if all_levels:
-        biggest = sorted(all_levels, key=lambda lv: -lv.notional)[:5]
-        print("  largest:")
-        for lv in biggest:
-            print(f"    {lv.at:%Y-%m-%d %H:%M}  ${lv.price:,.2f}  "
-                  f"{lv.prints} print(s)  {lv.shares:,} sh  "
-                  f"${lv.notional / 1e6:,.0f}M")
+    print(f"  {away_total} blocks away from the market (late or average-price "
+          f"reports, left out)")
+    res = score(all_levels, bars_for, random.Random(SEED))
+    print_results("Off-exchange blocks", all_levels, res)
+    print("=" * 64)
+    return 0
 
-    print(f"\n  1. LEVELS -- first return to the price, then {REACT:.2f}% "
-          f"back or {REACT:.2f}% through within {WINDOW} min")
-    print(f"     print levels   held {printed.held:>4}  broke "
-          f"{printed.broke:>4}")
-    print(f"     random prices  held {controlled.held:>4}  broke "
-          f"{controlled.broke:>4}")
-    print(f"     -> {verdict(printed, controlled)}")
 
-    print("\n  2. AFTERMATH -- median move after a print, against every "
-          "minute of the same hours")
-    print(f"     {'':10}{'prints':>18}{'any minute':>18}")
-    for h in HORIZONS:
-        p, a = after_print[h], after_any[h]
-        if len(p) < MIN_SAMPLE:
-            print(f"     {h:>3} min    {'too few (' + str(len(p)) + ')':>18}")
+def run_flowalgo(path: str, symbol: str) -> int:
+    """The same study on the prints in a FlowAlgo export.
+
+    Three groups, never pooled: dark pool prints during the session, lit
+    (exchange) blocks during the session, and prints after 16:00, which
+    are mostly one price per day -- the close -- and so are tested on the
+    following session as that day's closing price.
+    """
+    load_env()
+    flow = read_flowalgo(path, symbol)
+    prints = flow.prints
+    print(f"FlowAlgo export: {flow.rows} rows, {flow.duplicates} identical "
+          f"duplicate(s) dropped, {flow.other} for other symbols or kinds")
+    if prints.empty:
+        print(f"No {symbol} prints in the file.")
+        return 1
+    after = prints.index.time >= time(16, 0)
+    print(f"{symbol}: {len(prints)} prints, {prints.index[0]:%Y-%m-%d} to "
+          f"{prints.index[-1]:%Y-%m-%d} -- dark {int((prints.kind == 'dark').sum())},"
+          f" lit {int((prints.kind == 'lit').sum())}, after 16:00 "
+          f"{int(after.sum())}\n")
+
+    bars_for = cached_bars(symbol)
+    groups = {"dark": [], "lit": [], "close": []}
+    away_total = 0
+    for day in sorted(set(prints.index.date)):
+        print(f"  {day}")
+        todays = prints[prints.index.date == day]
+        late = todays.index.time >= time(16, 0)
+        bars = bars_for(day)
+        if bars.empty:
+            print("    no bars for this day")
             continue
-        print(f"     {h:>3} min    {median(p):>+8.2f}% ±{median(map(abs, p)):.2f}"
-              f"{median(a):>+11.2f}% ±{median(map(abs, a)):.2f}")
-    print("     (first number: direction; ± number: typical size either "
-          "way)")
+        for kind in ("dark", "lit"):
+            levels, away = to_levels(todays[~late & (todays.kind == kind)],
+                                     day, bars, 0)
+            groups[kind] += levels
+            away_total += away
+        # The close is the close: no point asking whether the after-hours
+        # tape was at it.
+        levels, _ = to_levels(todays[late], day, bars, 0, check_market=False)
+        groups["close"] += levels
+
+    print("\n" + "=" * 64)
+    print(f"  {away_total} session print(s) away from the market (late or "
+          f"average-price reports, left out)")
+    rng = random.Random(SEED)
+    print_results("Dark pool, during the session", groups["dark"],
+                  score(groups["dark"], bars_for, rng))
+    print_results("Lit (exchange) blocks, during the session", groups["lit"],
+                  score(groups["lit"], bars_for, rng))
+    print_results("After 16:00 (mostly at the closing price)", groups["close"],
+                  score(groups["close"], bars_for, rng, overnight=True),
+                  overnight=True)
     print("=" * 64)
     return 0
 
@@ -535,12 +717,63 @@ def self_test() -> int:
     if "MORE" not in verdict(Tally(80, 20), Tally(250, 250)):
         failures.append("80% against 50% on 100 tests is a difference")
 
+    # A FlowAlgo export: duplicates dropped, other symbols and kinds left
+    # out, times on the exchange's clock.
+    import os
+    import tempfile
+    sample = (
+        '"Date","Time","Ticker","Quantity","Spot","$MM","Notional Val","Type"\n'
+        '"10/13/26","16:27:00.076","SPCX","749,363","156.54","$117M","$117,305,284","Dark Pool"\n'
+        '"10/13/26","13:39:51.680","SPCX","472,500","157.20","$74M","$74,277,000","Dark Pool"\n'
+        '"10/13/26","13:39:51.680","SPCX","472,500","157.20","$74M","$74,277,000","Dark Pool"\n'
+        '"10/9/26","09:42:09.439","SPCX","198,794","164.55","$33M","$32,711,553","Lit Pool"\n'
+        '"10/9/26","09:42:09.439","NVDA","198,794","164.55","$33M","$32,711,553","Dark Pool"\n')
+    handle, path = tempfile.mkstemp(suffix=".csv")
+    with os.fdopen(handle, "w") as out:
+        out.write(sample)
+    try:
+        flow = read_flowalgo(path, "SPCX")
+    finally:
+        os.remove(path)
+    p = flow.prints
+    if (flow.rows, flow.duplicates, flow.other, len(p)) != (5, 1, 1, 3):
+        failures.append(f"export: 5 rows, 1 duplicate, 1 other symbol, 3 "
+                        f"kept: {(flow.rows, flow.duplicates, flow.other, len(p))}")
+    elif (p.index[0] != pd.Timestamp("2026-10-09 09:42:09.439", tz=ET)
+          or list(p.kind) != ["lit", "dark", "dark"]
+          or p["size"].iloc[-1] != 749_363 or p["price"].iloc[-1] != 156.54):
+        failures.append(f"export rows misread: {p!r}")
+
+    # A print at the close is tested on the next session, skipping the
+    # weekend and any day without bars.
+    friday = date(2026, 10, 9)
+    tuesday_bars = _bars([(100.3, 100.5, 100.4), (99.95, 100.2, 100.1),
+                          (100.1, 100.4, 100.35)],
+                         datetime(2026, 10, 13, 9, 30, tzinfo=ET))
+    asked = []
+
+    def fake_bars(day):
+        asked.append(day)
+        return tuesday_bars if day == date(2026, 10, 13) else pd.DataFrame()
+    found, _ = next_session(friday, fake_bars)
+    if found != date(2026, 10, 13) or date(2026, 10, 10) in asked:
+        failures.append(f"next session after a Friday with Monday empty is "
+                        f"Tuesday, never Saturday: {found} asked {asked}")
+    close = Level(friday, datetime(2026, 10, 9, 16, 5, tzinfo=ET), 100.0, 1,
+                  1, 1.0)
+    res = score([close], fake_bars, random.Random(1), overnight=True)
+    if (res.printed.held, res.printed.broke) != (1, 0) or res.after_print[15]:
+        failures.append(f"a closing print is tested on the next session, "
+                        f"with no aftermath: {res}")
+
     print(f"  Level test (held/broke/both/undecided) : "
           f"{'ok' if not failures else 'see below'}")
     print("  No look-ahead past the print           : checked")
     print("  Prints clustered into levels           : checked")
     print("  Late prints kept out                   : checked")
     print("  Horizons by clock, not bar count       : checked")
+    print("  FlowAlgo export read, duplicates out   : checked")
+    print("  Closing prints tested next session     : checked")
     print("  Trading client in this file            : none")
     if failures:
         print("\nFAILED:")
@@ -559,12 +792,17 @@ def main() -> int:
                         metavar="DOLLARS",
                         help=f"smallest print counted as a block (default "
                              f"{MIN_NOTIONAL:,})")
+    parser.add_argument("--flowalgo", metavar="FILE",
+                        help="test the prints in a FlowAlgo Equity Exporter "
+                             "CSV instead of Alpaca's")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
     if args.days < 1 or args.min_notional <= 0:
         raise SystemExit("--days and --min-notional must be above 0")
+    if args.flowalgo:
+        return run_flowalgo(args.flowalgo, args.symbol.upper())
     return run(args.symbol.upper(), args.days, args.min_notional)
 
 
