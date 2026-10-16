@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import sqlite3
 import statistics
 import time as time_mod
@@ -3099,7 +3100,26 @@ def self_test() -> int:
 
 # --------------------------------------------------------------------------
 
+def utf8_output() -> None:
+    """Print ▲, → and ± whatever Windows does with the output.
+
+    Into a console Python writes Unicode. Piped (`| Select-Object`) or
+    redirected -- as a scheduled task's output is -- Windows hands it
+    cp1252, which has no ▲, and the first candle line raised
+    UnicodeEncodeError. Run that way the watcher would have died at its
+    first print, silently, in the background. Unencodable characters are
+    replaced rather than fatal; a stream that cannot be reconfigured is
+    left alone.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main() -> int:
+    utf8_output()
     load_env()
     parser = argparse.ArgumentParser(description="Read the morning's tape to your phone.")
     parser.add_argument("--symbol", default=SYMBOL)
