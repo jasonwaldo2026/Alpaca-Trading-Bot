@@ -41,6 +41,8 @@ echo     1   Start the morning      candles from 08:55, MACD from 09:40
 echo     2   Candles only           08:55 to 10:00
 echo     3   MACD alerts only       logs from 09:30, alerts from 09:40
 echo.
+echo     A   SPCX alarms            04:00 to 20:00, up and down, TO YOUR PHONE
+echo.
 echo     4   Test my phone          one quiet, one alarm
 echo     5   Replay a past day      full tape, costs nothing
 echo.
@@ -56,6 +58,7 @@ set /p "choice=  Choose: "
 if "%choice%"=="1" goto both
 if "%choice%"=="2" goto candles
 if "%choice%"=="3" goto alerts
+if /i "%choice%"=="A" goto alarms
 if "%choice%"=="4" goto testpush
 if "%choice%"=="5" goto replay
 if "%choice%"=="6" goto recent
@@ -81,6 +84,13 @@ goto menu
 
 :alerts
 start "SPCX MACD" cmd /k python spcx_alert.py --watch
+goto menu
+
+:alarms
+rem The one option that SENDS. Alarms only (no quiet updates), up and
+rem down alike; the first ring of a new move repeats on the phone until
+rem it is acknowledged. Started late, it sends nothing from before it began.
+start "SPCX alarms" cmd /k python open_candles.py --from 04:00 --until 20:00 --rings-only --persist 30
 goto menu
 
 :testpush

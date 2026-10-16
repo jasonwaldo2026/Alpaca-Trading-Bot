@@ -38,6 +38,10 @@ THE MENU
   1  Start the morning    both programs, two windows
   2  Candles only         08:55 to 10:00
   3  MACD alerts only     logs from 09:30, alerts from 09:40
+  A  SPCX alarms          04:00 to 20:00, up and down, sent to your phone.
+                          The first ring of a new move repeats until you tap
+                          Acknowledge. Add it to an older menu with
+                          python add_alarms_option.py
 
   4  Test my phone        one quiet notification, one alarm
   5  Replay a past day    full SIP tape, costs nothing

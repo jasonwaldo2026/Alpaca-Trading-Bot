@@ -403,6 +403,21 @@ MARKET_STEP: float = 0.50
 MARKET_EXTENDED: float = 2.00
 SOUND_MARKET = "siren"
 
+#: PERSISTENT ALARMS (16 Oct). The first ring of a new move -- the first
+#: one in that direction for PERSIST_GAP minutes -- goes out as a Pushover
+#: emergency, repeating until it is tapped Acknowledge; every later step
+#: of the same move rings once. Up and down are treated alike: a drop
+#: after hours, when no stop is working, matters as much as a climb.
+#: 0 is off, the default; the "SPCX alarms" launcher option turns it on.
+PERSIST_GAP: int = 0
+
+#: Started late -- at 10:00 with --from 04:00, say -- the first pass reads
+#: six hours of minutes. They still feed every alarm, so each knows where
+#: price has been, but only minutes from the last LIVE_GRACE before start
+#: onwards reach the phone: a ring about 06:40 arriving at 10:00 is not
+#: news, and as an emergency it would be a false one.
+LIVE_GRACE: int = 3
+
 #: The slider's track. Eleven cells so there is an exact middle, and two
 #: hues plus a neutral centre rather than a red-orange-yellow-green ramp:
 #: a hue at the midpoint would colour "balanced" as though it meant
@@ -819,7 +834,8 @@ class Alarms:
             return None
         return "buy" if now_above else "sell"
 
-    def anchor_for(self, day: Optional[Day]) -> Optional[float]:
+    def anchor_for(self, day: Optional[Day],
+                   premarket: bool = False) -> Optional[float]:
         """The price the level alarm measures from, or None if there is
         none yet.
 
@@ -832,6 +848,10 @@ class Alarms:
         """
         if self.anchor_price:
             return self.anchor_price
+        if premarket:
+            # Before the bell the close that matters is yesterday's -- the
+            # number every pre-market quote is shown against.
+            return day.prev_close if day is not None else None
         return day.last if day is not None else None
 
     def _level(self, candle: Candle,
@@ -855,10 +875,14 @@ class Alarms:
         rings: sagging back a step and returning covers no new ground.
         """
         self.stepped = False
-        if candle.at.time() < REGULAR_CLOSE:
+        t = candle.at.time()
+        if REGULAR_OPEN <= t < REGULAR_CLOSE:
             self.beyond, self.rung = None, 0
             return None
-        anchor = self.anchor_for(day)
+        # 16 Oct: pre-market too, measured from yesterday's close. The
+        # speed alarm alone missed slow pre-market drifts the same way it
+        # missed slow evenings.
+        anchor = self.anchor_for(day, premarket=t < REGULAR_OPEN)
         if not anchor:
             return None
         percent = 100.0 * (candle.close - anchor) / anchor
@@ -926,6 +950,8 @@ class Alarms:
             side, percent, anchor = level
             self.from_level = True
             whence = ("your price" if self.anchor_price
+                      else "yesterday's close"
+                      if candle.at.time() < REGULAR_OPEN
                       else f"the {REGULAR_CLOSE:%H:%M} close")
             return side, (f"{'further: ' if self.stepped else ''}"
                           f"{'up' if percent > 0 else 'down'} "
@@ -942,16 +968,18 @@ class Alarms:
         # rings then, and the message says the confirmation is missing
         # so the reading is never mistaken for a confirmed one.
         loud = candle.vol_ratio is not None and candle.vol_ratio >= self.volume
-        after_hours = candle.at.time() >= REGULAR_CLOSE
-        if not (loud or after_hours):
+        t = candle.at.time()
+        outside = not (REGULAR_OPEN <= t < REGULAR_CLOSE)
+        if not (loud or outside):
             return None
 
         why = (f"{'up' if percent > 0 else 'down'} "
                f"{abs(percent):.2f}% in {over:.0f} min")
         if candle.vol_ratio is not None:
             why += f" on {candle.vol_ratio:.1f}x volume"
-        if after_hours and not loud:
-            why += " \u00b7 after hours, no volume confirmation"
+        if outside and not loud:
+            why += (f" \u00b7 {'pre-market' if t < REGULAR_OPEN else 'after hours'}"
+                    f", no volume confirmation")
         return direction, why
 
     def should_sound(self, direction: str, at: datetime) -> bool:
@@ -1176,6 +1204,53 @@ def reaches_phone(at: time, spiked: bool, detail_until: time) -> bool:
     must never disagree about it: two copies of a rule is two rules.
     """
     return spiked or at < detail_until
+
+
+@dataclass
+class Persist:
+    """Which rings are the FIRST of a new move, and so persistent.
+
+    A ring is urgent when nothing has rung in its direction for `gap`
+    minutes. Every ring updates the clock, so a move that keeps stepping
+    stays one emergency followed by ordinary rings, and up and down are
+    tracked apart: a climb that turns into a drop alarms on the drop too.
+    """
+
+    gap: int = PERSIST_GAP
+    last: Dict[str, datetime] = field(default_factory=dict)
+
+    def urgent(self, direction: str, at: datetime) -> bool:
+        if self.gap <= 0:
+            return False
+        prev = self.last.get(direction)
+        self.last[direction] = at
+        return prev is None or (at - prev) >= timedelta(minutes=self.gap)
+
+
+def ring_direction(moved: Optional[Tuple[str, str]],
+                   call: Optional[Tuple[str, str]]) -> str:
+    """'up' or 'down' for a ring, whichever alarm made it."""
+    if moved:
+        return moved[0]
+    return "up" if call and call[0] == "buy" else "down"
+
+
+PERSIST_NOTE = "Repeats every minute until you tap Acknowledge."
+
+
+def before_start(stamp: datetime, started: datetime) -> bool:
+    """A minute that closed before the watcher was running."""
+    return stamp < started - timedelta(minutes=LIVE_GRACE)
+
+
+def to_phone(rings_only: bool, at: time, spiked: bool, detail_until: time,
+             ringing: bool) -> bool:
+    """Whether a minute's message leaves the machine. With rings_only only
+    an alarm does -- no quiet updates, no volume-spike notes -- so a phone
+    left on a desk all day hears from this watcher only when it should."""
+    if rings_only:
+        return ringing
+    return reaches_phone(at, spiked, detail_until) or ringing
 
 
 def deliver(message: str, title: str, priority: int, dry_run: bool,
@@ -1782,7 +1857,9 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
              market_drop: float = MARKET_DROP,
              market_step: float = MARKET_STEP,
              market_sound: str = SOUND_MARKET,
-             market_extended: float = MARKET_EXTENDED) -> int:
+             market_extended: float = MARKET_EXTENDED,
+             persist_gap: int = PERSIST_GAP,
+             rings_only: bool = False) -> int:
     """Follow the session: full detail early, then only the unusual."""
     today = datetime.now(ET).date()
     window_start = datetime.combine(today, start, tzinfo=ET)
@@ -1852,6 +1929,14 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
         print("  trend alarm: off\n")
     market_alarm = MarketAlarm(drop=market_drop, step=market_step,
                                extended=market_extended)
+    persist = Persist(gap=persist_gap)
+    started = datetime.now(ET)
+    if persist_gap > 0:
+        print(f"  persistent: the first ring of a new move, up or down "
+              f"(none that way for {persist_gap} min), repeats until "
+              f"acknowledged\n")
+    if rings_only:
+        print("  rings only: nothing reaches the phone but an alarm\n")
     if market_drop > 0:
         print(f"  market alarm: {market_policy(market_alarm)} -- "
               f"{market_sound}\n")
@@ -1946,8 +2031,10 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 # it the same way, so a replayed ring is a live ring.
                 moved = trend.update(stamp, minute.close)
                 # Past the detail window only the unusual leaves the machine.
-                push = (reaches_phone(stamp.time(), spiked, detail_until)
-                        or ringing or moved is not None)
+                backlog = before_start(stamp, started)
+                push = (not backlog) and to_phone(
+                    rings_only, stamp.time(), spiked, detail_until,
+                    ringing or moved is not None)
                 message = describe(symbol, minute, day, lean, multiple, market)
                 fresh = remember_minute(db, symbol, minute, lean,
                                         sent=push and not dry_run)
@@ -1975,7 +2062,9 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 if not fresh:
                     status = "already recorded"
                 elif not push:
-                    status = "logged, quiet after " + f"{detail_until:%H:%M}"
+                    status = ("before start - not sent" if backlog else
+                              "logged (rings only)" if rings_only else
+                              "logged, quiet after " + f"{detail_until:%H:%M}")
                 else:
                     if moved:
                         sound = climb_sound if moved[0] == "up" else falling_sound
@@ -1983,10 +2072,13 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                         sound = alarms.sound_for(call[0], buy_sound, sell_sound)
                     else:
                         sound = None
-                    status = deliver(
-                        message, title,
-                        PRIORITY_SUMMARY if (ringing or moved) else PRIORITY_UPDATE,
-                        dry_run, attachment=chart, sound=sound)
+                    priority = PRIORITY_SUMMARY if (ringing or moved) else PRIORITY_UPDATE
+                    if (ringing or moved) and persist.urgent(
+                            ring_direction(moved, call if ringing else None), stamp):
+                        priority = PRIORITY_EMERGENCY
+                        message = message + "\n" + PERSIST_NOTE
+                    status = deliver(message, title, priority, dry_run,
+                                     attachment=chart, sound=sound)
                 print(message)
                 print(f"  [{status}]\n")
 
@@ -2003,8 +2095,10 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                                    read_lean(upto, baseline=minute_base),
                                    multiple)
                 candle_spike = is_spike(candle, multiple)
-                push = reaches_phone(candle.at.time(), candle_spike,
-                                     detail_until)
+                push = (not rings_only
+                        and not before_start(candle.at + timedelta(minutes=BAR_MINUTES),
+                                             started)
+                        and reaches_phone(candle.at.time(), candle_spike, detail_until))
                 fresh = remember(db, symbol, candle, sent=push and not dry_run)
                 title = (f"{symbol} {candle.at:%H:%M} volume {candle.vol_ratio:.1f}x"
                          if candle_spike else f"{symbol} candle {candle.at:%H:%M}")
@@ -2042,8 +2136,9 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
         text = summarise(symbol, collected)
         print("=" * 56)
         print(text)
-        print("\n[summary push: "
-              f"{deliver(text, f'{symbol} morning', PRIORITY_SUMMARY, dry_run)}]")
+        if not rings_only:
+            print("\n[summary push: "
+                  f"{deliver(text, f'{symbol} morning', PRIORITY_SUMMARY, dry_run)}]")
     else:
         print("No candles collected.")
     return 0
@@ -2763,6 +2858,62 @@ def self_test() -> int:
     if priority != PRIORITY_SUMMARY or "Acknowledge" in body:
         failures.append(f"a -0.5% ring is a single sound: {priority} {body!r}")
 
+    # --- 16 Oct: pre-market alarms, persistence, rings only ---------------
+    pm_day = Day(last=101.0, high=101.0, low=100.0, prev_close=100.0)
+    pm = Alarms(percent=0.5)
+
+    def bar(hh, mm, close, usual=None):
+        return Candle(at=datetime(2026, 10, 16, hh, mm, tzinfo=ET), open=close,
+                      high=close, low=close, close=close, volume=1000,
+                      usual_volume=usual)
+    said = pm.reason(bar(8, 0, 101.0), None, pm_day)
+    if not said or said[0] != "buy" or "yesterday's close" not in said[1]:
+        failures.append(f"pre-market: 1% over yesterday's close must ring, "
+                        f"measured from it: {said!r}")
+    if pm.reason(bar(10, 0, 101.0), None, pm_day) is not None:
+        failures.append("the level alarm stays silent in regular hours")
+    pm_down = Alarms(percent=0.5)
+    said = pm_down.reason(bar(7, 30, 98.9), None, pm_day)
+    if not said or said[0] != "sell":
+        failures.append(f"a pre-market drop rings as well: {said!r}")
+    fast = Alarms(percent=0.5)
+    fast.reason(bar(7, 0, 100.0), None, None)
+    said = fast.reason(bar(7, 3, 100.8), None, None)
+    if not said or "pre-market, no volume confirmation" not in said[1]:
+        failures.append(f"a fast pre-market move rings on price alone, and "
+                        f"says so: {said!r}")
+    slow = Alarms(percent=0.5)
+    slow.reason(bar(10, 0, 100.0), None, None)
+    if slow.reason(bar(10, 3, 100.8), None, None) is not None:
+        failures.append("regular hours still need the volume")
+
+    keen = Persist(gap=30)
+    t9 = datetime(2026, 10, 16, 9, 0, tzinfo=ET)
+    marks = [keen.urgent("up", t9), keen.urgent("up", t9 + timedelta(minutes=5)),
+             keen.urgent("down", t9 + timedelta(minutes=6)),
+             keen.urgent("up", t9 + timedelta(minutes=34)),
+             keen.urgent("up", t9 + timedelta(minutes=70))]
+    if marks != [True, False, True, False, True]:
+        failures.append(f"persistent: first ring each way, again only after "
+                        f"30 quiet minutes that way: {marks}")
+    if Persist(gap=0).urgent("up", t9):
+        failures.append("--persist 0 must never send an emergency")
+    if ring_direction(None, ("sell", "x")) != "down" or \
+            ring_direction(("up", "x"), ("sell", "y")) != "up":
+        failures.append("a ring's direction comes from the trend first, then "
+                        "the price alarm")
+    began = datetime(2026, 10, 16, 10, 0, tzinfo=ET)
+    if not before_start(datetime(2026, 10, 16, 6, 40, tzinfo=ET), began) or \
+            before_start(began - timedelta(minutes=2), began):
+        failures.append("a late start sends nothing from before it started, "
+                        "but keeps the last couple of minutes")
+    t10 = time(10, 30)
+    if to_phone(True, t10, True, time(10, 0), False) or \
+            not to_phone(True, t10, False, time(10, 0), True) or \
+            not to_phone(False, t10, True, time(10, 0), False):
+        failures.append("rings only: alarms reach the phone, spikes do not; "
+                        "without it spikes still do")
+
     # Replay feeds the trend the same minutes live does: the drift to
     # -1.1% after the close is a falling run as well as a level alarm.
     with_trend = replay_alarms(Alarms(percent=0.5), frame, {}, 101.0,
@@ -3027,6 +3178,15 @@ def main() -> int:
                         help="Anchor the after-hours level alarm on this "
                              "price -- your entry, say -- instead of today's "
                              "regular-session close")
+    parser.add_argument("--persist", type=int, default=PERSIST_GAP,
+                        metavar="MIN",
+                        help="The first ring of a new move, up or down -- none "
+                             "that way for MIN minutes -- is a Pushover "
+                             "emergency that repeats until acknowledged "
+                             f"(default {PERSIST_GAP}: off)")
+    parser.add_argument("--rings-only", action="store_true",
+                        help="Send the phone alarms only: no quiet minute "
+                             "updates, no volume-spike notes, no summary")
     parser.add_argument("--up-only", action="store_true",
                         help="Ring on run-ups only; stay silent on declines. "
                              "For a day spent flat, watching for a reason to "
@@ -3128,7 +3288,7 @@ def main() -> int:
                     args.trend_step, args.trend_giveback,
                     args.climb_sound, args.falling_sound,
                     args.market_drop, args.market_step, args.market_sound,
-                    args.market_extended)
+                    args.market_extended, args.persist, args.rings_only)
 
 
 if __name__ == "__main__":
