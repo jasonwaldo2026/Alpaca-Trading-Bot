@@ -7,6 +7,8 @@
  *   enter   the "L2 only" button in the Level 2 tile's title bar, or an
  *           address ending in ?l2only (or ?l2only=TSLA)
  *   leave   the "Full app" button
+ *   float   the "Pop out" button (2026-10-19): Level 2 in a small window
+ *           that stays on top of every other window, for a work desk.
  *
  * It is remembered: a home-screen app has no address bar, so the choice
  * lives in localStorage and reopening the app goes straight back to it.
@@ -16,8 +18,18 @@
  * data, polling and IBKR depth are exactly what the Focus page does.
  * Display only: like the rest of Scanner Studio, nothing here trades.
  *
+ * POP OUT. Chrome and Edge can float a small window above everything else
+ * (Document Picture-in-Picture). The floating window holds a second copy
+ * of this same page, in L2-only view, in a frame -- so it polls and draws
+ * on its own and keeps going while the window that opened it sits
+ * minimised. Two rules come from the browser, not from here: it opens
+ * only on a click, and only on a secure page. Scanner Studio over
+ * Tailscale is plain http, so the browser must be told to trust its
+ * address (see the "Pop out" title text). Without that, the button opens
+ * an ordinary small window instead, which other windows can cover.
+ *
  * Install: save beside focus.js and add, after focus.js's script tag,
- *   <script src="l2only.js?v=1"></script>
+ *   <script src="l2only.js?v=2"></script>
  */
 (function () {
   'use strict';
@@ -60,6 +72,7 @@ html.l2only #l2o {
 }
 .l2o-enter { margin-left: auto; }
 html.l2only .l2o-enter { display: none; }
+html.l2o-popped .l2o-exit, html.l2o-popped .l2o-pop { display: none; }
 `;
 
   const params = new URLSearchParams(location.search);
@@ -72,6 +85,9 @@ html.l2only .l2o-enter { display: none; }
   const on = !!(saved && saved.on);
   // Before the app paints, so the full layout never flashes up first.
   if (on) document.documentElement.classList.add('l2only');
+  // The copy inside a pop-out window: no way out of L2, no second pop-out.
+  const popped = params.has('popped');
+  if (popped) document.documentElement.classList.add('l2o-popped');
 
   function currentSymbol() {
     const input = document.querySelector('.fx-head input');
@@ -97,7 +113,16 @@ html.l2only .l2o-enter { display: none; }
     exit.textContent = '\u2715 Full app';
     exit.title = 'Back to the whole of Scanner Studio';
     exit.onclick = leave;
-    bar.append(exit);
+    const pop = document.createElement('button');
+    pop.type = 'button';
+    pop.className = 'l2o-btn l2o-pop';
+    pop.textContent = '\u29C9 Pop out';
+    pop.title = 'Level 2 in a small window that stays on top of other windows. ' +
+      'Over Tailscale the browser first has to trust this address: in ' +
+      'chrome://flags (or edge://flags), "Insecure origins treated as secure", ' +
+      'add ' + location.origin + ', Enabled, Relaunch.';
+    pop.onclick = popOut;
+    bar.append(exit, pop);
     waiting = document.createElement('div');
     waiting.className = 'l2o-wait';
     waiting.textContent = 'Opening Level 2\u2026';
@@ -131,6 +156,38 @@ html.l2only .l2o-enter { display: none; }
       b.onclick = enter;
       header.append(b);
     });
+  }
+
+  /* The address of this page in L2-only view, marked as the popped copy.
+     It keeps everything already in the address, the access code included. */
+  function popUrl() {
+    const url = new URL(location.href);
+    url.searchParams.set('l2only', currentSymbol());
+    url.searchParams.set('popped', '1');
+    return url.toString();
+  }
+
+  let floating = null;
+
+  async function popOut() {
+    if (floating && !floating.closed) { floating.focus(); return; }
+    const api = window.documentPictureInPicture;
+    if (!api) {
+      // Not a secure page, or an older browser: a plain small window.
+      floating = window.open(popUrl(), 'ss-l2-pop', 'popup,width=340,height=640');
+      return;
+    }
+    const win = await api.requestWindow({ width: 340, height: 640 });
+    floating = win;
+    const st = win.document.createElement('style');
+    st.textContent = 'html,body{margin:0;height:100%;background:#2B3648;overflow:hidden}' +
+                     'iframe{border:0;width:100%;height:100%;display:block}';
+    win.document.head.append(st);
+    win.document.title = 'Level 2';
+    const frame = win.document.createElement('iframe');
+    frame.src = popUrl();
+    win.document.body.append(frame);
+    win.addEventListener('pagehide', () => { floating = null; });
   }
 
   function enter() {
