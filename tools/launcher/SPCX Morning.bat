@@ -41,7 +41,7 @@ echo     1   Start the morning      candles from 08:55, MACD from 09:40
 echo     2   Candles only           08:55 to 10:00
 echo     3   MACD alerts only       logs from 09:30, alerts from 09:40
 echo.
-echo     A   SPCX alarms            04:00 to 20:00, up and down, TO YOUR PHONE
+echo     A   SPCX alarms            day and night, up and down, TO YOUR PHONE
 echo.
 echo     4   Test my phone          one quiet, one alarm
 echo     5   Replay a past day      full tape, costs nothing
@@ -90,7 +90,9 @@ goto menu
 rem The one option that SENDS. Alarms only (no quiet updates), up and
 rem down alike; the first ring of a new move repeats on the phone until
 rem it is acknowledged. Started late, it sends nothing from before it began.
-start "SPCX alarms" cmd /k python open_candles.py --from 04:00 --until 20:00 --rings-only --persist 30
+rem --overnight: 20:00-03:50, Sunday to Thursday nights, from IB Gateway.
+rem Keep IB Gateway logged in; if it is not, the phone is told.
+start "SPCX alarms" cmd /k python open_candles.py --from 04:00 --until 20:00 --rings-only --persist 30 --overnight
 goto menu
 
 :testpush

@@ -71,7 +71,7 @@ import sqlite3
 import statistics
 import time as time_mod
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -419,6 +419,30 @@ PERSIST_GAP: int = 0
 #: news, and as an emergency it would be a false one.
 LIVE_GRACE: int = 3
 
+#: THE OVERNIGHT SESSION (18 Oct). Alpaca has nothing after 20:00, so the
+#: night is read from IB Gateway's OVERNIGHT route instead -- probed live
+#: on 18 Oct at 21:53: bid and ask, 15 prints a minute, and 1-minute
+#: history current to the minute (the SMART route's stopped at Friday
+#: 19:59). It trades Sunday to Thursday nights, 20:00 to 03:50.
+OVERNIGHT_START = time(20, 0)
+OVERNIGHT_END = time(3, 50)
+#: Sunday (6) and Monday to Thursday: the evenings a session OPENS on.
+OVERNIGHT_NIGHTS = (6, 0, 1, 2, 3)
+IBKR_HOST = os.environ.get("IBKR_HOST", "127.0.0.1")
+IBKR_PORT = int(os.environ.get("IBKR_PORT", "4001"))
+#: Its own client id: Scanner Studio holds 7701 and the probe 7702, and a
+#: second connection on a taken id is refused.
+IBKR_CLIENT_ID = int(os.environ.get("IBKR_ALARM_CLIENT_ID", "7703"))
+#: Minutes without an answer from IB Gateway before the phone is told the
+#: overnight alarms are blind. A quiet tape is not silence -- an empty
+#: answer is still an answer -- so this only counts failures.
+GATEWAY_BLIND_MINUTES = 10
+
+
+def overnight_hours(t: time) -> bool:
+    """Whether a clock time falls in the overnight session's hours."""
+    return t >= OVERNIGHT_START or t < OVERNIGHT_END
+
 #: The slider's track. Eleven cells so there is an exact middle, and two
 #: hues plus a neutral centre rather than a red-orange-yellow-green ramp:
 #: a hue at the midpoint would colour "balanced" as though it meant
@@ -651,6 +675,9 @@ class Day:
     low: float
     prev_close: Optional[float] = None
     vwap: Optional[float] = None
+    #: What the range line calls this stretch of trading. Overnight it is
+    #: the night's own range, and calling it the day's would be wrong.
+    label: str = "Day"
 
     #: Where in the day's range the price sits, low to high. Five bands,
     #: not a percentage: "68% of the range" invites arithmetic that the
@@ -698,7 +725,7 @@ class Day:
         return f"{size} {side} VWAP"
 
     def line(self) -> str:
-        parts = [f"Day {self.low:,.2f} – {self.high:,.2f}"]
+        parts = [f"{self.label} {self.low:,.2f} – {self.high:,.2f}"]
         if self.place:
             parts[0] += f", {self.place}"
         gap = self.vwap_gap()
@@ -951,6 +978,8 @@ class Alarms:
             side, percent, anchor = level
             self.from_level = True
             whence = ("your price" if self.anchor_price
+                      else f"the {REGULAR_CLOSE:%H:%M} close"
+                      if overnight_hours(candle.at.time())
                       else "yesterday's close"
                       if candle.at.time() < REGULAR_OPEN
                       else f"the {REGULAR_CLOSE:%H:%M} close")
@@ -979,7 +1008,9 @@ class Alarms:
         if candle.vol_ratio is not None:
             why += f" on {candle.vol_ratio:.1f}x volume"
         if outside and not loud:
-            why += (f" \u00b7 {'pre-market' if t < REGULAR_OPEN else 'after hours'}"
+            when = ("overnight" if overnight_hours(t)
+                    else "pre-market" if t < REGULAR_OPEN else "after hours")
+            why += (f" \u00b7 {when}"
                     f", no volume confirmation")
         return direction, why
 
@@ -1096,8 +1127,14 @@ def describe(symbol: str, candle: Candle, day: Optional[Day] = None,
         change = day.change_pct
         if change is not None:
             arrow = "\u25b2" if change >= 0 else "\u25bc"
-            head += f"  {arrow} {change:+.2f}% today"
-    if candle.at.time() < time(9, 30):
+            # Overnight the session's own close is the reference, the one
+            # a 24-hour quote screen shows the night's move against.
+            since = ("since the close" if overnight_hours(candle.at.time())
+                     else "today")
+            head += f"  {arrow} {change:+.2f}% {since}"
+    if overnight_hours(candle.at.time()):
+        head += "  (overnight)"
+    elif candle.at.time() < time(9, 30):
         head += "  (pre-market)"
     lines.append(head)
 
@@ -2039,14 +2076,8 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 message = describe(symbol, minute, day, lean, multiple, market)
                 fresh = remember_minute(db, symbol, minute, lean,
                                         sent=push and not dry_run)
-                if moved:
-                    # One notification, one sound. The trend speaks for the
-                    # minute; a speed alarm in the same minute rides along
-                    # in the title rather than ringing on top of it.
-                    title = (f"{symbol} {stamp:%H:%M} — {moved[1]}"
-                             + (f" · {call[1]}" if ringing else ""))
-                elif ringing:
-                    title = f"{symbol} {stamp:%H:%M} — {call[1]}"
+                if moved or ringing:
+                    title = ring_title(symbol, stamp, moved, call, ringing)
                 elif spiked:
                     title = f"{symbol} {stamp:%H:%M} volume {minute.vol_ratio:.1f}x"
                 else:
@@ -2067,17 +2098,9 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                               "logged (rings only)" if rings_only else
                               "logged, quiet after " + f"{detail_until:%H:%M}")
                 else:
-                    if moved:
-                        sound = climb_sound if moved[0] == "up" else falling_sound
-                    elif ringing:
-                        sound = alarms.sound_for(call[0], buy_sound, sell_sound)
-                    else:
-                        sound = None
-                    priority = PRIORITY_SUMMARY if (ringing or moved) else PRIORITY_UPDATE
-                    if (ringing or moved) and persist.urgent(
-                            ring_direction(moved, call if ringing else None), stamp):
-                        priority = PRIORITY_EMERGENCY
-                        message = message + "\n" + PERSIST_NOTE
+                    sound, priority, message = ring_out(
+                        moved, call, ringing, alarms, persist, stamp, message,
+                        (buy_sound, sell_sound, climb_sound, falling_sound))
                     status = deliver(message, title, priority, dry_run,
                                      attachment=chart, sound=sound)
                 print(message)
@@ -2146,7 +2169,589 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
 
 
 # --------------------------------------------------------------------------
+# Overnight: 20:00-03:50 through IB Gateway
+# --------------------------------------------------------------------------
+
+def overnight_window(now: datetime) -> Optional[Tuple[datetime, datetime]]:
+    """The overnight session `now` falls inside, as (start, end), or None.
+
+    A session belongs to the evening it opens on: Sunday's runs into
+    Monday 03:50, Thursday's into Friday. Friday and Saturday evenings
+    have none.
+    """
+    t = now.time()
+    if t >= OVERNIGHT_START:
+        opened = now.date()
+    elif t < OVERNIGHT_END:
+        opened = now.date() - timedelta(days=1)
+    else:
+        return None
+    if opened.weekday() not in OVERNIGHT_NIGHTS:
+        return None
+    return (datetime.combine(opened, OVERNIGHT_START, tzinfo=ET),
+            datetime.combine(opened + timedelta(days=1), OVERNIGHT_END, tzinfo=ET))
+
+
+def next_session(now: datetime, start: time,
+                 end: time) -> Tuple[str, datetime, datetime]:
+    """("day" or "night", start, end): the session under way, or the next.
+
+    Days are weekdays from `start` to `end` on Alpaca; nights are the IBKR
+    overnight session. A day still counts as under way for one candle
+    past `end`, the time run_live spends closing its last one.
+    """
+    night = overnight_window(now)
+    if night:
+        return ("night",) + night
+    for ahead in range(8):
+        on = now.date() + timedelta(days=ahead)
+        found = []
+        if on.weekday() < 5:
+            s = datetime.combine(on, start, tzinfo=ET)
+            e = datetime.combine(on, end, tzinfo=ET)
+            if e + timedelta(minutes=BAR_MINUTES) > now:
+                found.append(("day", s, e))
+        if on.weekday() in OVERNIGHT_NIGHTS:
+            s = datetime.combine(on, OVERNIGHT_START, tzinfo=ET)
+            if s > now:
+                found.append(("night", s, datetime.combine(
+                    on + timedelta(days=1), OVERNIGHT_END, tzinfo=ET)))
+        if found:
+            return min(found, key=lambda f: f[1])
+    raise RuntimeError("no session within a week")
+
+
+def bars_frame(bars, start: datetime) -> pd.DataFrame:
+    """IB Gateway's bars as the same frame Alpaca's minutes arrive in."""
+    rows = []
+    for bar in bars:
+        at = pd.Timestamp(bar.date)
+        at = at.tz_localize("UTC") if at.tzinfo is None else at
+        rows.append((at.tz_convert(ET), float(bar.open), float(bar.high),
+                     float(bar.low), float(bar.close), max(0.0, float(bar.volume)),
+                     float(getattr(bar, "barCount", 0) or 0)))
+    frame = pd.DataFrame(rows, columns=["at", "open", "high", "low", "close",
+                                        "volume", "trade_count"])
+    if frame.empty:
+        return pd.DataFrame()
+    frame = frame.set_index("at").sort_index()
+    frame.index = pd.DatetimeIndex(frame.index)
+    return frame[frame.index >= start]
+
+
+class Gateway:
+    """IB Gateway, read-only: one-minute bars on the OVERNIGHT route.
+
+    Opened with readonly=True and its own client id. Nothing here can
+    place an order: it asks for history and nothing else.
+    """
+
+    #: Status chatter, not failures: data farms connecting, and so on.
+    QUIET = (300, 2104, 2106, 2107, 2108, 2119, 2158)
+    TIMEOUT = 30
+
+    def __init__(self, symbol: str):
+        self.symbol = symbol
+        self.ib = None
+        self.contract = None
+        self.errors: List[str] = []
+
+    def _on_error(self, req_id, code, message, contract=None) -> None:
+        if code in self.QUIET:
+            return
+        # Asked at 20:00:30 there is nothing yet. That is an answer.
+        if code == 162 and "no data" in str(message).lower():
+            return
+        self.errors.append(f"{code}: {message}"[:160])
+
+    def _connect(self) -> None:
+        from ib_async import IB, Stock
+
+        ib = IB()
+        ib.errorEvent += self._on_error
+        ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID, timeout=10,
+                   readonly=True)
+        contract = Stock(self.symbol, "OVERNIGHT", "USD")
+        if not ib.qualifyContracts(contract):
+            ib.disconnect()
+            raise RuntimeError(f"IBKR has no {self.symbol} on the OVERNIGHT route")
+        self.ib, self.contract = ib, contract
+
+    def minutes(self, start: datetime, now: datetime) -> pd.DataFrame:
+        if self.ib is None or not self.ib.isConnected():
+            self.close()
+            self._connect()
+        self.errors = []
+        seconds = min(86400, int((now - start).total_seconds()) + 120)
+        began = time_mod.monotonic()
+        bars = self.ib.reqHistoricalData(
+            self.contract, endDateTime="", durationStr=f"{seconds} S",
+            barSizeSetting="1 min", whatToShow="TRADES", useRTH=False,
+            formatDate=2, timeout=self.TIMEOUT)
+        if self.errors:
+            raise RuntimeError(self.errors[-1])
+        if not bars and time_mod.monotonic() - began >= self.TIMEOUT - 1:
+            raise TimeoutError(f"no answer in {self.TIMEOUT}s")
+        return bars_frame(bars, start)
+
+    def close(self) -> None:
+        if self.ib is not None:
+            try:
+                self.ib.disconnect()
+            except Exception:  # noqa: BLE001 -- closing a dead link is not news
+                pass
+        self.ib = None
+
+
+def overnight_reference(symbol: str, night_start: datetime) -> Optional[Day]:
+    """The regular session before this night, as the Day the alarms read.
+
+    Its 16:00 close is the night's anchor. It stands in as the previous
+    close too: after midnight the level alarm asks for "yesterday's
+    close", and the close a night is measured against is still this one.
+    Full tape (SIP), which the free plan serves once it is 15 minutes old.
+    """
+    for on in reversed(trading_days(night_start.date(), 5)):
+        try:
+            frame = fetch_minutes(symbol,
+                                  datetime.combine(on, REGULAR_OPEN, tzinfo=ET),
+                                  datetime.combine(on, REGULAR_CLOSE, tzinfo=ET),
+                                  force_sip=True)
+        except Exception:  # noqa: BLE001 -- try the session before
+            continue
+        day = read_day(frame)
+        if day is not None:
+            day.prev_close = day.last
+            return day
+    return None
+
+
+def ring_title(symbol: str, stamp: datetime, moved: Optional[Tuple[str, str]],
+               call: Optional[Tuple[str, str]], ringing: bool) -> str:
+    """The notification title for a minute that rings. One notification,
+    one sound: the trend speaks for the minute and a speed alarm in the
+    same minute rides along in the title rather than ringing on top."""
+    if moved:
+        return (f"{symbol} {stamp:%H:%M} — {moved[1]}"
+                + (f" · {call[1]}" if ringing else ""))
+    return f"{symbol} {stamp:%H:%M} — {call[1]}"
+
+
+def ring_out(moved: Optional[Tuple[str, str]], call: Optional[Tuple[str, str]],
+             ringing: bool, alarms: "Alarms", persist: "Persist",
+             stamp: datetime, message: str,
+             sounds: Tuple[str, str, str, str]) -> Tuple[Optional[str], int, str]:
+    """(sound, priority, message) for a minute that reaches the phone.
+
+    The first ring of a new move is an emergency (see Persist); the
+    message says so, because a phone repeating itself every minute needs
+    to say how to make it stop. Shared by day and night, so the two can
+    never disagree about what a ring sounds like.
+    """
+    buy_sound, sell_sound, climb_sound, falling_sound = sounds
+    if moved:
+        sound = climb_sound if moved[0] == "up" else falling_sound
+    elif ringing:
+        sound = alarms.sound_for(call[0], buy_sound, sell_sound)
+    else:
+        sound = None
+    priority = PRIORITY_SUMMARY if (ringing or moved) else PRIORITY_UPDATE
+    if (ringing or moved) and persist.urgent(
+            ring_direction(moved, call if ringing else None), stamp):
+        priority = PRIORITY_EMERGENCY
+        message = message + "\n" + PERSIST_NOTE
+    return sound, priority, message
+
+
+def run_overnight(symbol: str, night_start: datetime, night_end: datetime,
+                  dry_run: bool, db: sqlite3.Connection, alarms: "Alarms",
+                  trend: "Trend", persist: "Persist",
+                  sounds: Tuple[str, str, str, str], started: datetime,
+                  gateway=None, reference: Optional[Day] = None,
+                  clock=None, sleep=None, send=None) -> int:
+    """One overnight session, read from IB Gateway, rung like the day.
+
+    Every minute goes through the same Alarms, Trend and Persist the day
+    uses, and a ring goes out on the first bar that earns it. Only rings
+    leave the machine overnight: a stream of quiet updates at 2 AM is
+    noise. No volume gate -- Alarms drops it outside regular hours -- and
+    no market alarm, because the S&P does not trade overnight.
+
+    If IB Gateway stops answering for GATEWAY_BLIND_MINUTES the phone is
+    told once that the alarms are blind, and again when they can see.
+    """
+    clock = clock or (lambda: datetime.now(ET))
+    sleep = sleep or time_mod.sleep
+    send = send or deliver
+    gateway = gateway or Gateway(symbol)
+    day = reference if reference is not None else overnight_reference(symbol, night_start)
+
+    print(f"\n{symbol} OVERNIGHT · {night_start:%a %H:%M} – {night_end:%a %H:%M} ET "
+          f"· IB Gateway {IBKR_HOST}:{IBKR_PORT}, client {IBKR_CLIENT_ID}, read-only")
+    print(f"  alarm bands: {alarm_policy(alarms)}")
+    if day is not None:
+        print(f"  measured from the {REGULAR_CLOSE:%H:%M} close, {money(day.last)}")
+    else:
+        print(f"  ** no {REGULAR_CLOSE:%H:%M} close to measure from: the level "
+              f"alarm is off tonight; speed and trend still ring **")
+    print("  only rings reach the phone overnight\n")
+
+    seen = set()
+    last_ok = clock()
+    blind = False
+    try:
+        while True:
+            now = clock()
+            if now >= night_end + timedelta(minutes=1):
+                break
+            if now < night_start:
+                sleep(min(30, max(1, (night_start - now).total_seconds())))
+                continue
+
+            try:
+                frame = gateway.minutes(night_start, min(now, night_end))
+                last_ok = now
+                if blind:
+                    blind = False
+                    status = send(f"IB Gateway is answering again. Overnight "
+                                  f"{symbol} alarms are back on.",
+                                  f"{symbol} overnight", 0, dry_run)
+                    print(f"  {now:%H:%M}  gateway back  [{status}]")
+            except Exception as exc:  # noqa: BLE001 -- one bad pass is not the night
+                reason = f"{type(exc).__name__}: {str(exc)[:100]}"
+                print(f"  {now:%H:%M}  IB Gateway: {reason}")
+                frame = pd.DataFrame()
+                if not blind and now - last_ok >= timedelta(minutes=GATEWAY_BLIND_MINUTES):
+                    blind = True
+                    status = send(
+                        f"IB Gateway has not answered for {GATEWAY_BLIND_MINUTES} "
+                        f"minutes ({reason}). Overnight {symbol} alarms are BLIND "
+                        f"until it does. Log IB Gateway back in. A login to IBKR "
+                        f"on the phone or in DAS with the same username logs it out.",
+                        f"{symbol} overnight BLIND", PRIORITY_SUMMARY, dry_run)
+                    print(f"  {now:%H:%M}  ** overnight alarms blind **  [{status}]")
+
+            done = drop_forming(frame, now, 1)
+            for stamp in done.index:
+                if stamp in seen:
+                    continue
+                seen.add(stamp)
+                minute = to_candles(done.loc[[stamp]], {})[0]
+                upto = done[done.index <= stamp]
+                lean = read_lean(upto)
+                call = alarms.reason(minute, lean, day)
+                ringing = alarms.should_ring(call, stamp)
+                moved = trend.update(stamp, minute.close)
+                backlog = before_start(stamp, started)
+                push = not backlog and (ringing or moved is not None)
+                # The alarms measure from the 16:00 close; the message shows
+                # where the night stands -- its move since that close and
+                # its own range. The regular session's range and VWAP are
+                # yesterday's news by now.
+                shown = Day(last=minute.close, high=float(upto["high"].max()),
+                            low=float(upto["low"].min()),
+                            prev_close=day.last if day is not None else None,
+                            label="Night")
+                message = describe(symbol, minute, shown, lean)
+                fresh = remember_minute(db, symbol, minute, lean,
+                                        sent=push and not dry_run)
+                if not fresh:
+                    status = "already recorded"
+                elif not push:
+                    status = "before start - not sent" if backlog else "logged"
+                else:
+                    sound, priority, message = ring_out(
+                        moved, call, ringing, alarms, persist, stamp, message, sounds)
+                    status = send(message, ring_title(symbol, stamp, moved, call, ringing),
+                                  priority, dry_run, sound=sound)
+                print(message)
+                print(f"  [{status}]\n")
+
+            sleep(max(5, 62 - clock().second))
+    except KeyboardInterrupt:
+        print("\nStopped early.")
+        raise
+    finally:
+        gateway.close()
+    return 0
+
+
+def run_around_the_clock(start: time, end: time, day_run, night_run,
+                         clock=None, sleep=None, sessions: Optional[int] = None) -> int:
+    """Day on Alpaca, night on IB Gateway, for as long as it is left running.
+
+    `day_run()` runs one day window; `night_run(start, end, started)` one
+    overnight session. Between them it waits -- Friday 20:00 to Sunday
+    20:00 there is nothing to watch. A night it joins already under way
+    is a late start, and the backlog guard keeps its old minutes off the
+    phone; a night that follows straight on from the day is not, so the
+    first minutes after 20:00 can ring.
+    """
+    clock = clock or (lambda: datetime.now(ET))
+    sleep = sleep or time_mod.sleep
+    first = True
+    ran = 0
+    while sessions is None or ran < sessions:
+        now = clock()
+        kind, s, e = next_session(now, start, end)
+        if s - now > timedelta(minutes=1):
+            print(f"\nNext: the {kind} session at {s:%a %H:%M} ET. Waiting.")
+            while s - clock() > timedelta(minutes=1):
+                sleep(min(300, max(1, (s - clock()).total_seconds() - 60)))
+            first = False
+            continue
+        if kind == "day":
+            day_run()
+            if clock() < e:
+                # run_live only comes back early when it was stopped by
+                # hand (it catches Ctrl+C itself). Stopped means stopped,
+                # not "on to the night".
+                return 0
+        else:
+            night_run(s, e, now if first else s)
+        first = False
+        ran += 1
+    return 0
+
+
+# --------------------------------------------------------------------------
 # Self-test
+# --------------------------------------------------------------------------
+
+def overnight_checks() -> List[str]:
+    """The overnight session, offline: a fake IB Gateway and a fake clock
+    run whole nights in a fraction of a second."""
+    import contextlib
+    import io
+    from types import SimpleNamespace
+
+    failures: List[str] = []
+
+    def at(y, mo, d, h, mi, s=0):
+        return datetime(y, mo, d, h, mi, s, tzinfo=ET)
+
+    # 18 Oct 2026 is a Sunday.
+    sun = (2026, 10, 18)
+    windows = [
+        (at(*sun, 21, 0), (at(*sun, 20, 0), at(2026, 10, 19, 3, 50)), "Sunday evening"),
+        (at(2026, 10, 19, 2, 0), (at(*sun, 20, 0), at(2026, 10, 19, 3, 50)), "Monday 02:00"),
+        (at(2026, 10, 19, 3, 55), None, "Monday 03:55, after the close"),
+        (at(2026, 10, 22, 23, 0), (at(2026, 10, 22, 20, 0), at(2026, 10, 23, 3, 50)), "Thursday night"),
+        (at(2026, 10, 23, 2, 0), (at(2026, 10, 22, 20, 0), at(2026, 10, 23, 3, 50)), "Friday 02:00"),
+        (at(2026, 10, 23, 21, 0), None, "Friday evening"),
+        (at(2026, 10, 24, 1, 0), None, "Saturday 01:00"),
+        (at(*sun, 19, 59), None, "Sunday before 20:00"),
+    ]
+    for now, want, what in windows:
+        if overnight_window(now) != want:
+            failures.append(f"overnight window on {what}: {overnight_window(now)}")
+
+    four, eight = time(4, 0), time(20, 0)
+    plans = [
+        (at(2026, 10, 23, 20, 30), ("night", at(2026, 10, 25, 20, 0)), "Friday 20:30 waits for Sunday"),
+        (at(2026, 10, 24, 12, 0), ("night", at(2026, 10, 25, 20, 0)), "Saturday noon waits for Sunday"),
+        (at(2026, 10, 19, 3, 52), ("day", at(2026, 10, 19, 4, 0)), "Monday 03:52 waits for the day"),
+        (at(2026, 10, 21, 12, 0), ("day", at(2026, 10, 21, 4, 0)), "Wednesday noon is in the day"),
+        (at(2026, 10, 21, 20, 2), ("night", at(2026, 10, 21, 20, 0)), "Wednesday 20:02 is in the night"),
+        (at(2026, 10, 23, 20, 2), ("day", at(2026, 10, 23, 4, 0)), "Friday 20:02 is the day's last candle"),
+    ]
+    for now, (kind, start), what in plans:
+        got = next_session(now, four, eight)
+        if (got[0], got[1]) != (kind, start):
+            failures.append(f"{what}: got {got[0]} at {got[1]:%a %H:%M}")
+
+    # IB's bars become the frame Alpaca's minutes arrive in.
+    bars = [SimpleNamespace(date=datetime(2026, 10, 19, 0, m, tzinfo=timezone.utc),
+                            open=147.0, high=147.2, low=146.9, close=147.1,
+                            volume=v, barCount=3) for m, v in ((0, 5), (1, -1))]
+    frame = bars_frame(bars, at(*sun, 20, 0))
+    if (list(frame.index) != [at(*sun, 20, 0), at(*sun, 20, 1)]
+            or list(frame["volume"]) != [5.0, 0.0]):
+        failures.append(f"IB bars converted wrong: {frame}")
+    if not bars_frame([], at(*sun, 20, 0)).empty:
+        failures.append("no bars should be an empty frame")
+
+    class Clock:
+        def __init__(self, now):
+            self.now = now
+
+        def __call__(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += timedelta(seconds=seconds)
+
+    close = 146.03
+    reference = Day(last=close, high=147.0, low=145.0, prev_close=close, vwap=146.0)
+
+    def tape(start, prices):
+        index = pd.DatetimeIndex([start + timedelta(minutes=i) for i in range(len(prices))])
+        return pd.DataFrame({"open": prices, "high": prices, "low": prices,
+                             "close": prices, "volume": [100.0] * len(prices),
+                             "trade_count": [4.0] * len(prices)}, index=index)
+
+    class FakeGateway:
+        def __init__(self, frame, clock, down=(), forming=None):
+            self.frame, self.clock, self.down = frame, clock, down
+            self.forming = forming
+            self.closed = False
+
+        def minutes(self, start, now):
+            if any(a <= self.clock() < b for a, b in self.down):
+                raise ConnectionRefusedError("refused")
+            frame = self.frame[self.frame.index <= now].copy()
+            # IB includes the bar still being built. With `forming` set it
+            # shows a price the finished bar will not keep.
+            building = now.replace(second=0, microsecond=0)
+            if self.forming and building in frame.index:
+                frame.loc[building, "close"] = self.forming
+            return frame
+
+        def close(self):
+            self.closed = True
+
+    def night(prices, started_at, start=None, end_minutes=30, down=(), anchor=reference,
+              forming=None):
+        start = start or at(*sun, 20, 0)
+        clock = Clock(start)
+        sent = []
+
+        def send(message, title, priority, dry_run, attachment=None, sound=None):
+            sent.append(SimpleNamespace(at=clock(), title=title, priority=priority,
+                                        message=message, sound=sound))
+            return "captured"
+
+        db = sqlite3.connect(":memory:")
+        ensure_schema(db)
+        gateway = FakeGateway(tape(start, prices), clock, down, forming)
+        with contextlib.redirect_stdout(io.StringIO()):
+            run_overnight("SPCX", start, start + timedelta(minutes=end_minutes), True, db,
+                          Alarms(), Trend(), Persist(gap=30),
+                          ("buy", "sell", "climb", "falling"), started_at,
+                          gateway=gateway, reference=anchor, clock=clock,
+                          sleep=clock.sleep, send=send)
+        if not gateway.closed:
+            failures.append("the gateway connection should be closed at the end")
+        return sent
+
+    # Flat at the close, +0.5% at 20:05, flat, then -0.6% below the close
+    # at 20:15. Each first ring of a direction is an emergency, rung on the
+    # first bar that earns it.
+    prices = ([close] * 5 + [146.80] * 10 + [145.15] * 10)
+    sent = night(prices, started_at=at(*sun, 20, 0))
+    rings = [(s.title[5:10], s.priority) for s in sent]
+    if not sent or sent[0].title[5:10] != "20:05" or sent[0].priority != PRIORITY_EMERGENCY:
+        failures.append(f"a +0.5% first bar overnight should ring an emergency at 20:05: {rings}")
+    else:
+        first = sent[0]
+        for words in ("(overnight)", "+0.53% since the close", "Night 146.03",
+                      PERSIST_NOTE):
+            if words not in first.message:
+                failures.append(f"the overnight ring should say {words!r}: {first.message}")
+        if "the 16:00 close" not in first.title:
+            failures.append(f"the overnight ring should be measured from the 16:00 close: "
+                            f"{first.title}")
+    downs = [s for s in sent if s.title[5:10] == "20:15"]
+    if not downs or downs[0].priority != PRIORITY_EMERGENCY:
+        failures.append(f"the first drop below the close should be an emergency too: {rings}")
+    if any(s.title[5:10] < "20:05" for s in sent):
+        failures.append(f"nothing should ring before the move: {rings}")
+
+    # A bar still being built is never read: its spike may not last.
+    if night([close] * 20, started_at=at(*sun, 20, 0), forming=close * 1.02):
+        failures.append("a forming bar's price must not ring")
+
+    # The anchor is the last regular session's close, found from the
+    # night's own date: Sunday's night is measured from Friday.
+    asked = []
+
+    def fake_fetch(symbol, start, end, force_sip=False):
+        asked.append(start.date())
+        if start.date() != date(2026, 10, 16):
+            return pd.DataFrame()
+        return tape(start, [145.0, 146.5, 146.03])
+
+    real_fetch = globals()["fetch_minutes"]
+    globals()["fetch_minutes"] = fake_fetch
+    try:
+        ref = overnight_reference("SPCX", at(*sun, 20, 0))
+    finally:
+        globals()["fetch_minutes"] = real_fetch
+    if ref is None or ref.last != 146.03 or ref.prev_close != 146.03 or asked[0] != date(2026, 10, 16):
+        failures.append(f"Sunday's night should be anchored on Friday's close, as both the "
+                        f"close and the previous close: {ref}, asked {asked}")
+
+    # Joined late, the same night stays quiet about what it missed.
+    if night(prices, started_at=at(*sun, 20, 20)):
+        failures.append("a late start must not ring for minutes that closed before it")
+
+    # After midnight the anchor is still the 16:00 close.
+    late = at(2026, 10, 19, 0, 30)
+    sent = night([close] * 3 + [146.90] * 5, started_at=late, start=late, end_minutes=8)
+    if not sent or "the 16:00 close" not in sent[0].title:
+        failures.append(f"after midnight the ring should still measure from the 16:00 "
+                        f"close: {[s.title for s in sent]}")
+
+    # IB Gateway down from 20:00 to 20:25: one loud BLIND after ten
+    # minutes, one note when it answers again, nothing in between.
+    sent = night([close] * 30, started_at=at(*sun, 20, 0),
+                 down=[(at(*sun, 20, 0), at(*sun, 20, 25))])
+    notes = [(s.at.strftime("%H:%M"), s.priority, "BLIND" in s.title) for s in sent]
+    if (len(sent) != 2 or not notes[0][2] or notes[0][1] != PRIORITY_SUMMARY
+            or not (at(*sun, 20, 10) <= sent[0].at < at(*sun, 20, 12))
+            or "again" not in sent[1].message):
+        failures.append(f"gateway down should be one BLIND alarm at ~20:10 and one "
+                        f"recovery note: {notes}")
+
+    # Around the clock: wait out the weekend, run the night, then the day,
+    # then the next night -- which follows on, so it is not a late start.
+    clock = Clock(at(2026, 10, 23, 21, 0))
+    calls = []
+
+    def day_run():
+        calls.append(("day", clock()))
+        clock.now = clock().replace(hour=20, minute=5)
+        return 0
+
+    def night_run(s, e, started):
+        calls.append(("night", s, started))
+        clock.now = e + timedelta(minutes=1)
+        return 0
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        run_around_the_clock(four, eight, day_run, night_run, clock=clock,
+                             sleep=clock.sleep, sessions=3)
+    want = [("night", at(2026, 10, 25, 20, 0), at(2026, 10, 25, 20, 0)),
+            ("day", None), ("night", at(2026, 10, 26, 20, 0), at(2026, 10, 26, 20, 0))]
+    got = [c if c[0] == "night" else ("day", None) for c in calls]
+    if got != want or calls[1][1].date() != date(2026, 10, 26):
+        failures.append(f"around the clock ran {calls}")
+
+    # Started in the middle of a night: that night is a late start.
+    clock = Clock(at(2026, 10, 20, 1, 0))
+    calls.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        run_around_the_clock(four, eight, day_run, night_run, clock=clock,
+                             sleep=clock.sleep, sessions=1)
+    if calls != [("night", at(2026, 10, 19, 20, 0), at(2026, 10, 20, 1, 0))]:
+        failures.append(f"a mid-night start should join that night late: {calls}")
+
+    # A day stopped by hand stops everything.
+    clock = Clock(at(2026, 10, 21, 12, 0))
+    calls.clear()
+
+    def stopped_day():
+        calls.append(("day", clock()))
+        return 0                       # back at 12:00: Ctrl+C
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        run_around_the_clock(four, eight, stopped_day, night_run, clock=clock,
+                             sleep=clock.sleep, sessions=3)
+    if len(calls) != 1:
+        failures.append(f"Ctrl+C in the day should not go on to the night: {calls}")
+    return failures
+
+
 # --------------------------------------------------------------------------
 
 def self_test() -> int:
@@ -3061,6 +3666,8 @@ def self_test() -> int:
     if not (WINDOW_START < DETAIL_UNTIL <= WINDOW_END):
         failures.append("the detail window should sit inside the session window")
 
+    failures += overnight_checks()
+
     print("-" * 56)
     print(alarm)
     print("-" * 56)
@@ -3087,6 +3694,8 @@ def self_test() -> int:
           "checked first")
     print("  Half-updated folder            : refused at startup, not at "
           "the first alarm")
+    print("  Overnight, IB Gateway          : rings on the first bar, from "
+          "the 16:00 close; blind after 10 min says so")
     print("  Trading client in this file    : none")
 
     if failures:
@@ -3232,6 +3841,11 @@ def main() -> int:
                         help=f"Minute updates and candle summaries reach the "
                              f"phone until this time; after it only volume "
                              f"spikes do (default {DETAIL_UNTIL:%H:%M})")
+    parser.add_argument("--overnight", action="store_true",
+                        help="Also watch the overnight session (20:00-03:50, "
+                             "Sunday to Thursday nights) through IB Gateway, "
+                             "and keep running day and night. Needs IB Gateway "
+                             "logged in on port 4001 and ib_async installed")
     parser.add_argument("--dry-run", action="store_true", help="Print, do not send")
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--test-push", action="store_true",
@@ -3299,16 +3913,53 @@ def main() -> int:
                           MarketAlarm(drop=args.market_drop,
                                       step=args.market_step,
                                       extended=args.market_extended))
-    return run_live(symbol, start, end, args.dry_run, db, args.push_empty,
-                    args.volume_alert, args.pdf_every, args.db, detail,
-                    args.buy_sound, args.sell_sound,
-                    args.move_percent, args.move_minutes,
-                    args.alarm_volume, args.up_only, args.from_price,
-                    args.ah_percent, args.level_step,
-                    args.trend_step, args.trend_giveback,
-                    args.climb_sound, args.falling_sound,
-                    args.market_drop, args.market_step, args.market_sound,
-                    args.market_extended, args.persist, args.rings_only)
+
+    def day_run() -> int:
+        return run_live(symbol, start, end, args.dry_run, db, args.push_empty,
+                        args.volume_alert, args.pdf_every, args.db, detail,
+                        args.buy_sound, args.sell_sound,
+                        args.move_percent, args.move_minutes,
+                        args.alarm_volume, args.up_only, args.from_price,
+                        args.ah_percent, args.level_step,
+                        args.trend_step, args.trend_giveback,
+                        args.climb_sound, args.falling_sound,
+                        args.market_drop, args.market_step, args.market_sound,
+                        args.market_extended, args.persist, args.rings_only)
+
+    if not args.overnight:
+        return day_run()
+    if start < OVERNIGHT_END or end > OVERNIGHT_START:
+        raise SystemExit(f"--overnight needs the day inside "
+                         f"{OVERNIGHT_END:%H:%M}-{OVERNIGHT_START:%H:%M}; "
+                         f"got {start:%H:%M}-{end:%H:%M}")
+    try:
+        import ib_async  # noqa: F401 -- only the night needs it
+    except ImportError:
+        raise SystemExit("--overnight reads IB Gateway through ib_async, which "
+                         "is not installed for this Python. Install it with:\n"
+                         "    python -m pip install ib_async")
+
+    def night_run(night_start: datetime, night_end: datetime,
+                  started: datetime) -> int:
+        return run_overnight(
+            symbol, night_start, night_end, args.dry_run, db,
+            Alarms(percent=args.move_percent, minutes=args.move_minutes,
+                   volume=args.alarm_volume, up_only=args.up_only,
+                   anchor_price=args.from_price, ah_percent=args.ah_percent,
+                   level_step=args.level_step),
+            Trend(step=args.trend_step, giveback=args.trend_giveback),
+            Persist(gap=args.persist),
+            (args.buy_sound, args.sell_sound, args.climb_sound,
+             args.falling_sound),
+            started)
+
+    print("Around the clock: the day on Alpaca, the overnight session on "
+          "IB Gateway.")
+    try:
+        return run_around_the_clock(start, end, day_run, night_run)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 0
 
 
 if __name__ == "__main__":

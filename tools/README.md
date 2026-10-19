@@ -21,7 +21,7 @@ all. Trades are placed by hand, in DAS.
 | File | What it does | Run during the session? |
 |---|---|---|
 | `feed_check.py` | IEX against the full SIP tape; the shared indicator and condition code everything else imports | no |
-| `open_candles.py` | **The watcher.** Reads the tape to your phone, rebuilds the PDF, decides what makes a sound | **yes, all day** |
+| `open_candles.py` | **The watcher.** Reads the tape to your phone, rebuilds the PDF, decides what makes a sound. With `--overnight` it carries on through IBKR's 20:00–03:50 session from IB Gateway | **yes, all day** (and night) |
 | `daily_report.py` | The session as a one-page PDF | rebuilt by the watcher |
 | `spcx_alert.py` | The MACD alert, 09:40–11:00, and the Pushover sender everything uses | optional |
 | `swing_study.py` | Does the signal mark anything worth acting on, and with what bracket | research |
@@ -176,6 +176,7 @@ Useful flags:
 | `--detail-until 10:30` | how long the per-minute stream keeps reaching the phone |
 | `--pdf-every 0` | stop rebuilding the PDF |
 | `--volume-alert 2.0` | require more volume before a bar counts as a spike |
+| `--overnight` | after the day, watch IBKR's overnight session (20:00–03:50, Sun–Thu nights) through IB Gateway, and keep going day and night; rings only, from the 16:00 close; tells the phone if IB Gateway stops answering for 10 minutes |
 
 ### The research tools, run when you want them
 
