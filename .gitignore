@@ -67,4 +67,7 @@ tools/*.pdf
 # darkpool_study.py's download cache: SIP market data, which is licensed
 # for personal use and is not ours to publish.
 tools/darkpool_cache/
+# merger_watch.py's memory and log: local to the PC that runs it.
+tools/merger_watch_state.json*
+tools/merger_watch.log
 !tools/primer/SPCX_primer.pdf
