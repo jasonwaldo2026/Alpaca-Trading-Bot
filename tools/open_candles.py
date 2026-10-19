@@ -1113,12 +1113,11 @@ OPEN_CALL_AT = time(9, 31)
 OPEN_CALL_LATEST = time(9, 40)
 
 
-def opening_move(prev_close: Optional[float], day: date) -> Optional[float]:
-    """The S&P 500's first regular minute against yesterday's close, in
-    percent, or None. The 09:30 bar's close: the price once the opening
-    auction has printed and the first minute has settled."""
-    if prev_close is None or prev_close <= 0:
-        return None
+def opening_price(day: date) -> Optional[float]:
+    """The S&P 500's (SPY's) price after its first regular minute, or None:
+    the 09:30 bar's close, once the opening auction has printed and the
+    first minute has settled. The opening call reads it against yesterday's
+    close, and the market alarm measures falls from it."""
     at = datetime.combine(day, REGULAR_OPEN, tzinfo=ET)
     try:
         frame = fetch_minutes(BENCHMARK, at, at + timedelta(minutes=1))
@@ -1127,7 +1126,7 @@ def opening_move(prev_close: Optional[float], day: date) -> Optional[float]:
         first = frame[frame.index == at]
         if first.empty:
             return None
-        return 100.0 * (float(first["close"].iloc[0]) - prev_close) / prev_close
+        return float(first["close"].iloc[0])
     except Exception:      # noqa: BLE001 -- a missing call is not a missing alarm
         return None
 
@@ -1716,19 +1715,30 @@ class MarketAlarm:
     market that recovers and then breaks down again is heard again.
 
     `urgent` says whether the ring just returned is at or past `extended`,
-    the depth that goes out as an emergency rather than a single sound."""
+    the depth that goes out as an emergency rather than a single sound.
+
+    19 Oct: from the open too. Given the move since the 09:30 price as
+    well, it measures whichever fall is DEEPER -- so a day that opens up
+    1% and then gives back 1.3% rings, though it is only -0.3% on the
+    close. One alarm, not two: the same fall never rings twice, and
+    `measured` says which reference the ring was against."""
 
     drop: float = MARKET_DROP
     step: float = MARKET_STEP
     extended: float = MARKET_EXTENDED
     rung: int = 0
     urgent: bool = False
+    measured: str = "yesterday's close"
 
-    def update(self, change_pct: Optional[float]) -> Optional[str]:
+    def update(self, change_pct: Optional[float],
+               from_open_pct: Optional[float] = None) -> Optional[str]:
         self.urgent = False
         if change_pct is None or self.drop <= 0:
             return None
         down = -change_pct
+        self.measured = "yesterday's close"
+        if from_open_pct is not None and -from_open_pct > down:
+            down, self.measured = -from_open_pct, f"its {REGULAR_OPEN:%H:%M} price"
         if down < self.drop:
             self.rung = 0
             return None
@@ -1740,14 +1750,20 @@ class MarketAlarm:
         self.urgent = self.extended > 0 and down + 1e-9 >= self.extended
         return (f"MARKET{' ALARM' if self.urgent else ''}: S&P 500 "
                 f"{'further, ' if further else ''}down "
-                f"{down:.2f}% from yesterday's close")
+                f"{down:.2f}% from {self.measured}")
 
 
 def market_push(alarm: "MarketAlarm", why: str, change_pct: Optional[float]
                 ) -> Tuple[str, int]:
     """The body and priority for a market ring the alarm just returned."""
-    body = (market_line(change_pct) or why) + (
-        f"\nRings again at every {alarm.step:.2f}% further.")
+    line = market_line(change_pct)
+    if alarm.measured == "yesterday's close":
+        head = line or why
+    else:
+        # Measured from the open, the day's change alone would read as no
+        # reason to ring. Say what was measured, then the day as context.
+        head = why + (f"\n{line} on the day" if line else "")
+    body = head + f"\nRings again at every {alarm.step:.2f}% further."
     if alarm.urgent:
         return (body + "\nRepeats every minute until you tap Acknowledge.",
                 PRIORITY_EMERGENCY)
@@ -1756,8 +1772,9 @@ def market_push(alarm: "MarketAlarm", why: str, change_pct: Optional[float]
 
 def market_policy(alarm: "MarketAlarm") -> str:
     """One line saying when the market alarm rings, and how loudly."""
-    text = (f"S&P 500 down {alarm.drop:.2f}% from yesterday's close, then "
-            f"every {alarm.step:.2f}% further")
+    text = (f"S&P 500 down {alarm.drop:.2f}% from yesterday's close or its "
+            f"{REGULAR_OPEN:%H:%M} price, whichever is deeper, then every "
+            f"{alarm.step:.2f}% further")
     if alarm.extended > 0:
         text += f"; extended (repeats until acknowledged) from {alarm.extended:.2f}%"
     return text
@@ -1799,8 +1816,13 @@ def replay_market(alarm: "MarketAlarm", frame: pd.DataFrame,
     if not prev_close or frame is None or frame.empty:
         return []
     rings = []
+    opened = frame[frame.index.time == REGULAR_OPEN]["close"]
+    open_price = float(opened.iloc[0]) if len(opened) else None
     for stamp, close in frame["close"].items():
-        why = alarm.update(100.0 * (float(close) - prev_close) / prev_close)
+        from_open = (100.0 * (float(close) - open_price) / open_price
+                     if open_price and stamp.time() > REGULAR_OPEN else None)
+        why = alarm.update(100.0 * (float(close) - prev_close) / prev_close,
+                           from_open)
         if why:
             rings.append((stamp, why))
     return rings
@@ -2047,6 +2069,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
     chart: Optional[str] = None
     last_pdf = datetime.now(ET) - timedelta(minutes=pdf_every or 0)
     open_called = False
+    market_open: Optional[float] = None
     try:
         while True:
             now = datetime.now(ET)
@@ -2068,10 +2091,19 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
             # minute: several minutes can arrive together after a slow
             # fetch, and they all happened under the same S&P reading.
             market = market_move(market_prev, window_start, min(now, window_end))
+            # The 09:30 price, once it exists: the opening call reads it,
+            # and the market alarm measures falls from it as well.
+            if (market_open is None and market_prev
+                    and OPEN_CALL_AT <= now.time() < REGULAR_CLOSE):
+                market_open = opening_price(today)
+            from_open = None
+            if market_open and market is not None and now.time() >= OPEN_CALL_AT:
+                spy_now = market_prev * (1 + market / 100.0)
+                from_open = 100.0 * (spy_now - market_open) / market_open
             # The whole market, once per pass. Its own sound and its own
             # message: it is not a reading of this stock and must not be
             # mistaken for one.
-            market_call = market_alarm.update(market)
+            market_call = market_alarm.update(market, from_open)
             if market_call:
                 body, priority = market_push(market_alarm, market_call, market)
                 status = deliver(body, market_call, priority, dry_run,
@@ -2080,10 +2112,9 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
 
             # Which way the market opened, once a day. See OPEN_CALL_AT.
             if open_call_due(now, open_called):
-                opened = opening_move(market_prev, today)
-                if opened is not None:
+                if market_open:
                     open_called = True
-                    text = opening_call(opened)
+                    text = opening_call(100.0 * (market_open - market_prev) / market_prev)
                     status = deliver(text, "S&P 500 open", 0, dry_run)
                     print(f"  {now:%H:%M}  {text}  [{status}]\n")
             elif not open_called and now.time() > OPEN_CALL_LATEST:
@@ -3744,12 +3775,37 @@ def self_test() -> int:
     real_fetch = globals()["fetch_minutes"]
     globals()["fetch_minutes"] = spy
     try:
-        move = opening_move(100.0, d)
-        none_without_close = opening_move(None, d)
+        price = opening_price(d)
     finally:
         globals()["fetch_minutes"] = real_fetch
-    if move is None or abs(move - 1.0) > 1e-9 or none_without_close is not None:
-        failures.append(f"the opening move is the 09:30 bar against the close: {move}")
+    if price != 101.0:
+        failures.append(f"the opening price is the 09:30 bar's close: {price}")
+
+    # --- 19 Oct: the market alarm measures from the open too --------------
+    # Opened +1.0%, then gave back 1.3%: only -0.3% on the close, but a
+    # 1.3% fall from the open, which is the move worth hearing about.
+    mkt = MarketAlarm(drop=1.25)
+    why = mkt.update(-0.30, from_open_pct=-1.29)
+    body, priority = market_push(mkt, why, -0.30)
+    if not why or "from its 09:30 price" not in why or "1.29%" not in why \
+            or "-0.30%" not in body or priority != PRIORITY_SUMMARY:
+        failures.append(f"a 1.29% fall from the open should ring, saying so: {why!r} {body!r}")
+    if mkt.update(-1.31, from_open_pct=-1.40) is not None:
+        failures.append("the same fall must not ring twice from two references")
+    deeper = mkt.update(-1.00, from_open_pct=-2.30)
+    if not deeper or not mkt.urgent:
+        failures.append(f"2.25% below the open is the emergency too: {deeper!r}")
+    closed = MarketAlarm(drop=1.25)
+    if closed.update(-1.30, from_open_pct=+0.20) is None or closed.measured != "yesterday's close":
+        failures.append("a fall from the close still rings, measured from the close")
+    if MarketAlarm(drop=1.25).update(-0.30, from_open_pct=-0.90) is not None:
+        failures.append("under 1.25% from both references stays quiet")
+    stamps = pd.DatetimeIndex([datetime(2026, 10, 19, 9, 30, tzinfo=ET),
+                               datetime(2026, 10, 19, 10, 0, tzinfo=ET)])
+    rings = replay_market(MarketAlarm(drop=1.25),
+                          pd.DataFrame({"close": [101.0, 99.7]}, index=stamps), 100.0)
+    if [at for at, _ in rings] != [stamps[1]]:
+        failures.append(f"a replay measures from the 09:30 price too: {rings}")
 
     print("-" * 56)
     print(alarm)
