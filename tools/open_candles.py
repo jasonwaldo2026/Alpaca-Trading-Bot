@@ -3788,7 +3788,8 @@ def self_test() -> int:
     why = mkt.update(-0.30, from_open_pct=-1.29)
     body, priority = market_push(mkt, why, -0.30)
     if not why or "from its 09:30 price" not in why or "1.29%" not in why \
-            or "-0.30%" not in body or priority != PRIORITY_SUMMARY:
+            or "-0.30%" not in body or "from its 09:30 price" not in body \
+            or priority != PRIORITY_SUMMARY:
         failures.append(f"a 1.29% fall from the open should ring, saying so: {why!r} {body!r}")
     if mkt.update(-1.31, from_open_pct=-1.40) is not None:
         failures.append("the same fall must not ring twice from two references")
