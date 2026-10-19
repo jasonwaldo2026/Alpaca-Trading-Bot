@@ -1103,6 +1103,47 @@ def market_move(prev_close: Optional[float], start: datetime,
         return None
 
 
+#: THE OPENING CALL (19 Oct). Once the first regular minute has closed,
+#: one message a day says which way the S&P 500 opened against yesterday's
+#: close. Information, not an alarm: a normal notification with the
+#: phone's default sound, sent even with --rings-only. Until
+#: OPEN_CALL_LATEST it keeps trying if the bar is not in yet; after that
+#: the day's call is dropped rather than sent stale.
+OPEN_CALL_AT = time(9, 31)
+OPEN_CALL_LATEST = time(9, 40)
+
+
+def opening_move(prev_close: Optional[float], day: date) -> Optional[float]:
+    """The S&P 500's first regular minute against yesterday's close, in
+    percent, or None. The 09:30 bar's close: the price once the opening
+    auction has printed and the first minute has settled."""
+    if prev_close is None or prev_close <= 0:
+        return None
+    at = datetime.combine(day, REGULAR_OPEN, tzinfo=ET)
+    try:
+        frame = fetch_minutes(BENCHMARK, at, at + timedelta(minutes=1))
+        if frame is None or frame.empty:
+            return None
+        first = frame[frame.index == at]
+        if first.empty:
+            return None
+        return 100.0 * (float(first["close"].iloc[0]) - prev_close) / prev_close
+    except Exception:      # noqa: BLE001 -- a missing call is not a missing alarm
+        return None
+
+
+def open_call_due(now: datetime, done: bool) -> bool:
+    """Whether to try the opening call on this pass."""
+    return not done and OPEN_CALL_AT <= now.time() <= OPEN_CALL_LATEST
+
+
+def opening_call(change_pct: float) -> str:
+    """The opening call's text: direction first, so the lock screen says it."""
+    up = change_pct >= 0
+    return (f"S&P 500 OPEN {'▲ UP' if up else '▼ DOWN'} {change_pct:+.2f}% "
+            f"from yesterday's close")
+
+
 def describe(symbol: str, candle: Candle, day: Optional[Day] = None,
              lean: Optional[Lean] = None,
              multiple: float = VOLUME_ALERT_MULTIPLE,
@@ -2005,6 +2046,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
               "day's move\n")
     chart: Optional[str] = None
     last_pdf = datetime.now(ET) - timedelta(minutes=pdf_every or 0)
+    open_called = False
     try:
         while True:
             now = datetime.now(ET)
@@ -2035,6 +2077,20 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 status = deliver(body, market_call, priority, dry_run,
                                  sound=market_sound)
                 print(f"  {now:%H:%M}  ** {market_call} **  [{status}]\n")
+
+            # Which way the market opened, once a day. See OPEN_CALL_AT.
+            if open_call_due(now, open_called):
+                opened = opening_move(market_prev, today)
+                if opened is not None:
+                    open_called = True
+                    text = opening_call(opened)
+                    status = deliver(text, "S&P 500 open", 0, dry_run)
+                    print(f"  {now:%H:%M}  {text}  [{status}]\n")
+            elif not open_called and now.time() > OPEN_CALL_LATEST:
+                if now.time() < REGULAR_CLOSE and window_start.time() <= OPEN_CALL_AT:
+                    print(f"  {now:%H:%M}  S&P opening call skipped: no 09:30 "
+                          f"bar by {OPEN_CALL_LATEST:%H:%M}\n")
+                open_called = True
 
             # --- the quiet per-minute update ---------------------------
             for stamp, row in done_minutes.iterrows():
@@ -3668,6 +3724,33 @@ def self_test() -> int:
 
     failures += overnight_checks()
 
+    # --- the S&P opening call ---------------------------------------------
+    d = date(2026, 10, 19)
+    for hhmm, done, want in (((9, 30), False, False), ((9, 31), False, True),
+                             ((9, 40), False, True), ((9, 41), False, False),
+                             ((9, 35), True, False)):
+        if open_call_due(datetime.combine(d, time(*hhmm), tzinfo=ET), done) is not want:
+            failures.append(f"opening call due at {hhmm} (done={done}) should be {want}")
+    if opening_call(0.42) != "S&P 500 OPEN ▲ UP +0.42% from yesterday's close":
+        failures.append(f"opening call text: {opening_call(0.42)}")
+    if not opening_call(-0.65).startswith("S&P 500 OPEN ▼ DOWN -0.65%"):
+        failures.append(f"opening call text: {opening_call(-0.65)}")
+    opened_at = datetime.combine(d, REGULAR_OPEN, tzinfo=ET)
+
+    def spy(symbol, start, end, force_sip=False):
+        return pd.DataFrame({"close": [99.0, 101.0, 102.0]}, index=pd.DatetimeIndex(
+            [opened_at - timedelta(minutes=1), opened_at, opened_at + timedelta(minutes=1)]))
+
+    real_fetch = globals()["fetch_minutes"]
+    globals()["fetch_minutes"] = spy
+    try:
+        move = opening_move(100.0, d)
+        none_without_close = opening_move(None, d)
+    finally:
+        globals()["fetch_minutes"] = real_fetch
+    if move is None or abs(move - 1.0) > 1e-9 or none_without_close is not None:
+        failures.append(f"the opening move is the 09:30 bar against the close: {move}")
+
     print("-" * 56)
     print(alarm)
     print("-" * 56)
@@ -3694,6 +3777,8 @@ def self_test() -> int:
           "checked first")
     print("  Half-updated folder            : refused at startup, not at "
           "the first alarm")
+    print(f"  S&P opening call               : once a day at {OPEN_CALL_AT:%H:%M}, "
+          f"up or down from yesterday's close")
     print("  Overnight, IB Gateway          : rings on the first bar, from "
           "the 16:00 close; blind after 10 min says so")
     print("  Trading client in this file    : none")
