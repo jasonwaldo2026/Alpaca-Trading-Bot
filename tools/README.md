@@ -29,6 +29,7 @@ all. Trades are placed by hand, in DAS.
 | `screener.py` | Which other symbols are worth the same attention | research |
 | `darkpool_study.py` | Do big dark pool prints mark price levels that hold, against random prices | research |
 | `merger_watch.py` | Rings the phone on a Tesla–SpaceX merger: SEC filings, Nasdaq halts, Polymarket odds. Read-only | **yes, 24/7** (scheduled task) |
+| `heartbeat.py` | The SPCX alarms and the merger watch say they are alive, and each rings the phone if the other stops; also stops a second copy starting | imported by both |
 | `session_clock.py` | The trading day as a clock face — where movement is, where signals fire | research |
 | `bracket.py` | The stop, target and share count to type, from an entry and a risk budget | **before entering** |
 | `lockups.py` + `lockups.json` | The share-unlock calendar | read by the others |

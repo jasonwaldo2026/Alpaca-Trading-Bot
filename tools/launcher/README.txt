@@ -45,6 +45,9 @@ THE MENU
                           until you tap Acknowledge. Add it to an older menu
                           with python add_alarms_option.py, then make it run
                           overnight with python add_overnight_to_alarms.py
+                          Or let it start by itself at every logon, and come
+                          back within a minute if it stops: run
+                          install_spcx_alarms.ps1 once (admin PowerShell).
 
   4  Test my phone        one quiet notification, one alarm
   5  Replay a past day    full SIP tape, costs nothing

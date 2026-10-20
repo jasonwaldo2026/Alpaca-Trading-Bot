@@ -70,4 +70,6 @@ tools/darkpool_cache/
 # merger_watch.py's memory and log: local to the PC that runs it.
 tools/merger_watch_state.json*
 tools/merger_watch.log
+# heartbeat.py's "alive" files: which process, and when.
+tools/*.alive
 !tools/primer/SPCX_primer.pdf

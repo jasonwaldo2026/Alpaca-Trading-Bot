@@ -71,6 +71,7 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+import heartbeat
 from feed_check import ET, load_env
 from spcx_alert import (
     PRIORITY_EMERGENCY,
@@ -551,6 +552,14 @@ def watch(dry_run: bool, once: bool, state_path: str) -> int:
     enabled = ["halts", "polymarket"] + (["sec"] if contact else [])
     state = load_state(state_path)
     started = datetime.now(ET)
+    watch = None
+    if not dry_run and not once:
+        # One copy only, and an eye on the SPCX alarms. See heartbeat.py.
+        running = heartbeat.already_running(heartbeat.MERGER_WATCH, started)
+        if running:
+            log(running)
+            return 0
+        watch = heartbeat.Watch(heartbeat.MERGER_WATCH, heartbeat.SPCX_ALARMS, started)
     log(f"merger watch started{' (dry run)' if dry_run else ''}: "
         + ", ".join(SOURCE_NAMES[s] for s in enabled))
     if not contact:
@@ -571,6 +580,9 @@ def watch(dry_run: bool, once: bool, state_path: str) -> int:
                 alerts += check_source(source, state, now, contact)
             except Exception as exc:  # noqa: BLE001 -- one source failing must not stop the rest
                 log(f"{SOURCE_NAMES[source]}: {type(exc).__name__}: {str(exc)[:120]}")
+        if watch is not None:
+            alerts += [Alert(PRIORITY_LOUD if loud else PRIORITY_NORMAL, text)
+                       for loud, text in watch.beat(now)]
         if not once:
             alerts += blind_alerts(state, now, enabled, started)
             alerts += summary_alert(state, now, bool(contact))
@@ -800,6 +812,8 @@ def self_test() -> int:
             failures.append(f"this file must not mention {forbidden}")
 
     import inspect
+    if "watch.beat(" not in inspect.getsource(watch):
+        failures.append("the watch loop must beat the heartbeat")
     for fn in (main,):
         if "load_env()" not in inspect.getsource(fn):
             failures.append(f"{fn.__name__}() must load .env before reading a key")

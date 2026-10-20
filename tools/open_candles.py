@@ -90,6 +90,7 @@ try:
 except ImportError:            # noqa: F401 -- same contract as lockups
     launches = None
 from feed_check import ET, load_credentials, load_env, parse_clock, trading_days
+import heartbeat
 from spcx_alert import (
     PRIORITY_SUMMARY,
     PRIORITY_UPDATE,
@@ -437,6 +438,21 @@ IBKR_CLIENT_ID = int(os.environ.get("IBKR_ALARM_CLIENT_ID", "7703"))
 #: overnight alarms are blind. A quiet tape is not silence -- an empty
 #: answer is still an answer -- so this only counts failures.
 GATEWAY_BLIND_MINUTES = 10
+
+
+#: THE WATCHDOG (20 Oct). Set by main() for an around-the-clock run: this
+#: watcher's heartbeat, and its eye on the merger watch's. See heartbeat.py.
+_watch: Optional["heartbeat.Watch"] = None
+
+
+def pulse(now: Optional[datetime] = None) -> None:
+    """Say the alarms are alive, and ring if the merger watch is not.
+    Called from every loop that waits, so a quiet weekend still beats."""
+    if _watch is None:
+        return
+    for loud, text in _watch.beat(now or datetime.now(ET)):
+        status = deliver(text, "WATCHDOG", PRIORITY_SUMMARY if loud else 0, False)
+        print(f"  {datetime.now(ET):%H:%M}  WATCHDOG: {text}  [{status}]")
 
 
 def overnight_hours(t: time) -> bool:
@@ -2073,6 +2089,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
     try:
         while True:
             now = datetime.now(ET)
+            pulse(now)
             if now >= window_end + timedelta(minutes=BAR_MINUTES):
                 break
             if now < window_start:
@@ -2489,6 +2506,7 @@ def run_overnight(symbol: str, night_start: datetime, night_end: datetime,
     try:
         while True:
             now = clock()
+            pulse(now)
             if now >= night_end + timedelta(minutes=1):
                 break
             if now < night_start:
@@ -2584,7 +2602,8 @@ def run_around_the_clock(start: time, end: time, day_run, night_run,
         if s - now > timedelta(minutes=1):
             print(f"\nNext: the {kind} session at {s:%a %H:%M} ET. Waiting.")
             while s - clock() > timedelta(minutes=1):
-                sleep(min(300, max(1, (s - clock()).total_seconds() - 60)))
+                pulse(clock())
+                sleep(min(60, max(1, (s - clock()).total_seconds() - 60)))
             first = False
             continue
         if kind == "day":
@@ -3755,6 +3774,14 @@ def self_test() -> int:
 
     failures += overnight_checks()
 
+    # --- 20 Oct: the watchdog beats from every loop that waits -----------
+    import inspect
+    for fn in (run_live, run_overnight, run_around_the_clock):
+        if "pulse(" not in inspect.getsource(fn):
+            failures.append(f"{fn.__name__} must beat the heartbeat while it waits")
+    if heartbeat.self_test.__module__ != "heartbeat":
+        failures.append("heartbeat.py is missing")
+
     # --- the S&P opening call ---------------------------------------------
     d = date(2026, 10, 19)
     for hhmm, done, want in (((9, 30), False, False), ((9, 31), False, True),
@@ -4095,6 +4122,18 @@ def main() -> int:
              args.falling_sound),
             started)
 
+    if not args.dry_run:
+        # One copy only: two would ring every alarm twice. Then the
+        # heartbeat, and the eye on the merger watch. See heartbeat.py.
+        running = heartbeat.already_running(heartbeat.SPCX_ALARMS, datetime.now(ET))
+        if running:
+            print(running)
+            return 0
+        global _watch
+        _watch = heartbeat.Watch(heartbeat.SPCX_ALARMS, heartbeat.MERGER_WATCH,
+                                 started=datetime.now(ET))
+        _watch.beat(datetime.now(ET))
+        print("Watchdog: heartbeat on; the phone hears if the merger watch stops.")
     print("Around the clock: the day on Alpaca, the overnight session on "
           "IB Gateway.")
     try:
