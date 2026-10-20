@@ -422,6 +422,19 @@ PERSIST_GAP: int = 0
 #: can be the persistent first ring of a move. 0 makes every ring audible,
 #: as before. The S&P alarm is separate and unchanged.
 LOUD_PERCENT: float = 1.0
+#: ...and from the 16:00 close through the overnight session, a smaller
+#: move is loud enough (20 Oct). Measured over 54 evenings since 28 Jul:
+#: SPCX moved 0.5% on 56% of them, 1% on only 17%, and most of it in the
+#: first hour -- and after hours, with no stop working, is when hearing
+#: about it matters most. Pre-market keeps the day's LOUD_PERCENT.
+LOUD_PERCENT_EVENING: float = 0.5
+
+
+def loud_threshold(at: datetime, day: float = LOUD_PERCENT,
+                   evening: float = LOUD_PERCENT_EVENING) -> float:
+    """The move a ring at `at` must measure to make a sound."""
+    t = at.time()
+    return evening if (t >= REGULAR_CLOSE or t < OVERNIGHT_END) else day
 
 #: Started late -- at 10:00 with --from 04:00, say -- the first pass reads
 #: six hours of minutes. They still feed every alarm, so each knows where
@@ -1999,7 +2012,8 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
              market_extended: float = MARKET_EXTENDED,
              persist_gap: int = PERSIST_GAP,
              rings_only: bool = False,
-             loud_percent: float = LOUD_PERCENT) -> int:
+             loud_percent: float = LOUD_PERCENT,
+             loud_evening: float = LOUD_PERCENT_EVENING) -> int:
     """Follow the session: full detail early, then only the unusual."""
     today = datetime.now(ET).date()
     window_start = datetime.combine(today, start, tzinfo=ET)
@@ -2228,7 +2242,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                     sound, priority, message = ring_out(
                         moved, call, ringing, alarms, persist, stamp, message,
                         (buy_sound, sell_sound, climb_sound, falling_sound),
-                        trend, loud_percent)
+                        trend, loud_percent, loud_evening)
                     status = deliver(message, title, priority, dry_run,
                                      attachment=chart, sound=sound)
                 print(message)
@@ -2470,7 +2484,8 @@ def ring_out(moved: Optional[Tuple[str, str]], call: Optional[Tuple[str, str]],
              stamp: datetime, message: str,
              sounds: Tuple[str, str, str, str],
              trend: Optional["Trend"] = None,
-             loud_percent: float = LOUD_PERCENT) -> Tuple[Optional[str], int, str]:
+             loud_percent: float = LOUD_PERCENT,
+             loud_evening: float = LOUD_PERCENT_EVENING) -> Tuple[Optional[str], int, str]:
     """(sound, priority, message) for a minute that reaches the phone.
 
     The first ring of a new move is an emergency (see Persist); the
@@ -2492,7 +2507,8 @@ def ring_out(moved: Optional[Tuple[str, str]], call: Optional[Tuple[str, str]],
         # that the 1% move after it should carry.
         size = max(alarms.last_pct if ringing else 0.0,
                    trend.last_pct if (moved and trend is not None) else 0.0)
-        if loud_percent > 0 and size < loud_percent:
+        limit = loud_threshold(stamp, loud_percent, loud_evening)
+        if limit > 0 and size < limit:
             return None, PRIORITY_UPDATE, message
     if (ringing or moved) and persist.urgent(
             ring_direction(moved, call if ringing else None), stamp):
@@ -2507,7 +2523,8 @@ def run_overnight(symbol: str, night_start: datetime, night_end: datetime,
                   sounds: Tuple[str, str, str, str], started: datetime,
                   gateway=None, reference: Optional[Day] = None,
                   clock=None, sleep=None, send=None,
-                  loud_percent: float = LOUD_PERCENT) -> int:
+                  loud_percent: float = LOUD_PERCENT,
+                  loud_evening: float = LOUD_PERCENT_EVENING) -> int:
     """One overnight session, read from IB Gateway, rung like the day.
 
     Every minute goes through the same Alarms, Trend and Persist the day
@@ -2602,7 +2619,7 @@ def run_overnight(symbol: str, night_start: datetime, night_end: datetime,
                 else:
                     sound, priority, message = ring_out(
                         moved, call, ringing, alarms, persist, stamp, message, sounds,
-                        trend, loud_percent)
+                        trend, loud_percent, loud_evening)
                     status = send(message, ring_title(symbol, stamp, moved, call, ringing),
                                   priority, dry_run, sound=sound)
                 print(message)
@@ -2753,7 +2770,7 @@ def overnight_checks() -> List[str]:
             self.closed = True
 
     def night(prices, started_at, start=None, end_minutes=30, down=(), anchor=reference,
-              forming=None, loud=LOUD_PERCENT):
+              forming=None, loud=LOUD_PERCENT, evening=1.0):
         start = start or at(*sun, 20, 0)
         clock = Clock(start)
         sent = []
@@ -2771,7 +2788,8 @@ def overnight_checks() -> List[str]:
                           Alarms(), Trend(), Persist(gap=30),
                           ("buy", "sell", "climb", "falling"), started_at,
                           gateway=gateway, reference=anchor, clock=clock,
-                          sleep=clock.sleep, send=send, loud_percent=loud)
+                          sleep=clock.sleep, send=send, loud_percent=loud,
+                          loud_evening=evening)
         if not gateway.closed:
             failures.append("the gateway connection should be closed at the end")
         return sent
@@ -2786,7 +2804,8 @@ def overnight_checks() -> List[str]:
     rings = [(s.title[5:10], s.priority) for s in sent]
     quiet = [s for s in sent if s.title[5:10] == "20:05"]
     if not quiet or quiet[0].priority != PRIORITY_UPDATE or quiet[0].sound is not None:
-        failures.append(f"a 0.5% ring arrives, silently: {rings}")
+        failures.append(f"with the evening threshold at 1%, a 0.5% ring arrives "
+                        f"silently: {rings}")
     ups = [s for s in sent if s.title[5:10] == "20:10"]
     if not ups or ups[0].priority != PRIORITY_EMERGENCY:
         failures.append(f"the first 1% move up overnight should ring an emergency at "
@@ -2805,6 +2824,17 @@ def overnight_checks() -> List[str]:
         failures.append(f"the first major drop should be an emergency too: {rings}")
     if any(s.title[5:10] < "20:05" for s in sent):
         failures.append(f"nothing should ring before the move: {rings}")
+
+    # After the close, 0.5% is loud enough; in the day and pre-market, 1%.
+    sent = night(prices, started_at=at(*sun, 20, 0), evening=LOUD_PERCENT_EVENING)
+    first = sent[0] if sent else None
+    if not first or first.title[5:10] != "20:05" or first.priority != PRIORITY_EMERGENCY:
+        failures.append(f"overnight, a 0.5% move should ring: "
+                        f"{[(s.title[5:10], s.priority) for s in sent]}")
+    for hhmm, want in (((9, 0), 1.0), ((12, 0), 1.0), ((16, 0), 0.5), ((19, 59), 0.5),
+                       ((23, 0), 0.5), ((3, 49), 0.5), ((3, 50), 1.0)):
+        if loud_threshold(at(2026, 10, 20, *hhmm)) != want:
+            failures.append(f"the loud threshold at {hhmm} should be {want}%")
 
     # The size each ring reports, which decides whether it makes a sound.
     t = Trend(step=0.5)
@@ -2825,7 +2855,7 @@ def overnight_checks() -> List[str]:
         failures.append(f"a level ring 1.2% from the close should report 1.2: {lv.last_pct}")
 
     # Every ring audible again with --loud-percent 0.
-    sent = night(prices, started_at=at(*sun, 20, 0), loud=0)
+    sent = night(prices, started_at=at(*sun, 20, 0), loud=0, evening=0)
     if not sent or sent[0].title[5:10] != "20:05" or sent[0].priority != PRIORITY_EMERGENCY:
         failures.append(f"--loud-percent 0 makes the 0.5% ring audible again: "
                         f"{[(s.title[5:10], s.priority) for s in sent]}")
@@ -4054,6 +4084,11 @@ def main() -> int:
                         help=f"Only SPCX rings for a move of PCT or more make a "
                              f"sound; smaller ones arrive silently (default "
                              f"{LOUD_PERCENT}; 0 makes every ring audible)")
+    parser.add_argument("--loud-evening-percent", type=float,
+                        default=LOUD_PERCENT_EVENING, metavar="PCT",
+                        help=f"The same, from the 16:00 close through the "
+                             f"overnight session (default {LOUD_PERCENT_EVENING}; "
+                             f"pre-market uses --loud-percent)")
     parser.add_argument("--rings-only", action="store_true",
                         help="Send the phone alarms only: no quiet minute "
                              "updates, no volume-spike notes, no summary")
@@ -4166,7 +4201,7 @@ def main() -> int:
                         args.climb_sound, args.falling_sound,
                         args.market_drop, args.market_step, args.market_sound,
                         args.market_extended, args.persist, args.rings_only,
-                        args.loud_percent)
+                        args.loud_percent, args.loud_evening_percent)
 
     if not args.overnight:
         return day_run()
@@ -4193,7 +4228,8 @@ def main() -> int:
             Persist(gap=args.persist),
             (args.buy_sound, args.sell_sound, args.climb_sound,
              args.falling_sound),
-            started, loud_percent=args.loud_percent)
+            started, loud_percent=args.loud_percent,
+            loud_evening=args.loud_evening_percent)
 
     if not args.dry_run:
         # One copy only: two would ring every alarm twice. Then the
