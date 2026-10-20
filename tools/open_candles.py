@@ -3873,6 +3873,9 @@ def self_test() -> int:
 
     # --- 20 Oct: the watchdog beats from every loop that waits -----------
     import inspect
+    for fn in (run_live, run_overnight):
+        if "trend, loud_percent, loud_evening)" not in inspect.getsource(fn):
+            failures.append(f"{fn.__name__} must hand both loud thresholds to ring_out")
     for fn in (run_live, run_overnight, run_around_the_clock):
         if "pulse(" not in inspect.getsource(fn):
             failures.append(f"{fn.__name__} must beat the heartbeat while it waits")
