@@ -37,8 +37,8 @@ $old = Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
 foreach ($p in $old) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
 if ($old) { Write-Host "Stopped the SPCX alarms window that was running; the task takes over." ; Start-Sleep -Seconds 2 }
 
-$args = '"' + (Join-Path $folder 'open_candles.py') + '" --from 04:00 --until 20:00 --rings-only --persist 30 --market-drop 1.25 --overnight'
-$action = New-ScheduledTaskAction -Execute $python -Argument $args -WorkingDirectory $folder
+$taskArgs = '"' + (Join-Path $folder 'open_candles.py') + '" --from 04:00 --until 20:00 --rings-only --persist 30 --market-drop 1.25 --overnight'
+$action = New-ScheduledTaskAction -Execute $python -Argument $taskArgs -WorkingDirectory $folder
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
