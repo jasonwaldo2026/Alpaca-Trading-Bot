@@ -332,8 +332,9 @@ def self_test() -> int:
             failures.append(f"an unlock dated Saturday counts from Monday: {sat}")
         if not any("Nov 05" in x and "after the close" in x for x in lines):
             failures.append(f"coming up should list the earnings: {lines}")
-        if not any(x.startswith("no date yet") for x in lines):
-            failures.append(f"an undated unlock is always listed: {lines}")
+        undated = Event("unlock", None, None, "SPCX share unlock, 1.30bn shares", "UNCONFIRMED")
+        if not any(x.startswith("no date yet") for x in coming_up(evs + [undated], today)):
+            failures.append("an undated unlock is always listed")
 
     rss = (b"<rss><channel>"
            b"<item><title>SpaceX surprises Wall Street with Oct. 20 earnings date</title>"
