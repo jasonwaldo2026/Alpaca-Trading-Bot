@@ -67,10 +67,11 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+import calendar_watch
 import heartbeat
 from feed_check import ET, load_env
 from spcx_alert import (
@@ -150,8 +151,9 @@ SUMMARY_LATEST = time(21, 45)
 PENDING_KEEP = timedelta(hours=2)
 
 #: Seconds between checks of each source.
-INTERVALS = {"halts": 60, "sec": 120, "polymarket": 300}
-SOURCE_NAMES = {"halts": "Nasdaq halts", "sec": "SEC filings",
+INTERVALS = {"halts": 60, "sec": 120, "polymarket": 300, "calendar": 3600}
+SOURCE_NAMES = {"calendar": "Earnings & unlock calendar",
+                "halts": "Nasdaq halts", "sec": "SEC filings",
                 "polymarket": "Polymarket odds"}
 
 STATE_PATH = "merger_watch_state.json"
@@ -203,7 +205,8 @@ class Filing:
 def new_state() -> dict:
     return {"seen_filings": [], "seen_halts": [], "odds": {}, "labels": {},
             "open_seen": [], "rung": {}, "last_ok": {}, "blind": [],
-            "summary_date": "", "pending": []}
+            "summary_date": "", "pending": [], "cal_sent": {}, "news_seen": [],
+            "news_primed": False, "earnings_estimate": None}
 
 
 def load_state(path: str) -> dict:
@@ -455,7 +458,8 @@ def blind_alerts(state: dict, now: datetime, enabled: List[str],
     return alerts
 
 
-def summary_alert(state: dict, now: datetime, sec_on: bool) -> List[Alert]:
+def summary_alert(state: dict, now: datetime, sec_on: bool,
+                  coming: Optional[List[str]] = None) -> List[Alert]:
     today = f"{now:%Y-%m-%d}"
     if state["summary_date"] == today or now.time() < SUMMARY_AT:
         return []
@@ -475,6 +479,8 @@ def summary_alert(state: dict, now: datetime, sec_on: bool) -> List[Alert]:
     body = "\n".join(line for _, line in sorted(lines)) or "no odds read yet"
     if not sec_on:
         body += "\nSEC check is OFF: add SEC_CONTACT to .env."
+    if coming:
+        body += "\n\nComing up (14 days):\n" + "\n".join(coming)
     return [Alert(PRIORITY_SILENT, f"Merger odds tonight:\n{body}")]
 
 
@@ -506,6 +512,8 @@ def check_source(source: str, state: dict, now: datetime, contact: str) -> List[
             sorted(markets, key=lambda m: _label_key(m.label)) if not m.closed), flush=True)
     elif source == "halts":
         alerts = halt_alerts(parse_halts(fetch(HALTS_URL)), state, now)
+    elif source == "calendar":
+        alerts = calendar_check(state, now)
     else:
         agent = sec_agent(contact)
 
@@ -522,6 +530,46 @@ def check_source(source: str, state: dict, now: datetime, contact: str) -> List[
             alerts += filing_alerts(filings, state, now, read)
     state["last_ok"][source] = _iso(now)
     return alerts
+
+
+def calendar_check(state: dict, now: datetime) -> List[Alert]:
+    """Hourly: Nasdaq's earnings estimate, and the news for new dates.
+    Either failing leaves the other; the reminders themselves need neither."""
+    try:
+        estimate = calendar_watch.parse_nasdaq_estimate(fetch(
+            calendar_watch.NASDAQ_ESTIMATE.format(symbol=calendar_watch.SYMBOL),
+            agent="Mozilla/5.0"))
+        state["earnings_estimate"] = estimate.isoformat() if estimate else None
+    except Exception as exc:  # noqa: BLE001
+        log(f"earnings estimate: {type(exc).__name__}")
+    alerts = []
+    first = not state["news_primed"]
+    for query in calendar_watch.NEWS_QUERIES:
+        try:
+            items = calendar_watch.parse_news(fetch(
+                calendar_watch.NEWS_SEARCH.format(query=query), agent="Mozilla/5.0"))
+        except Exception as exc:  # noqa: BLE001
+            log(f"news ({query}): {type(exc).__name__}")
+            continue
+        alerts += [Alert(PRIORITY_NORMAL, text) for text in
+                   calendar_watch.news_alerts(items, state["news_seen"], now, first)]
+    state["news_primed"] = True
+    return alerts
+
+
+def calendar_events(state: dict, now: datetime) -> List["calendar_watch.Event"]:
+    raw = state.get("earnings_estimate")
+    estimate = date.fromisoformat(raw) if raw else None
+    return calendar_watch.all_events(now.date(), estimate)
+
+
+def calendar_reminders(events: list, state: dict, now: datetime) -> List[Alert]:
+    out = [Alert(PRIORITY_LOUD if r.loud else PRIORITY_NORMAL, f"CALENDAR: {r.text}")
+           for r in calendar_watch.due(events, state["cal_sent"], now)]
+    if len(state["cal_sent"]) > 500:
+        for key in sorted(state["cal_sent"], key=state["cal_sent"].get)[:-500]:
+            del state["cal_sent"][key]
+    return out
 
 
 def deliver(alerts: List[Alert], state: dict, now: datetime, dry_run: bool) -> None:
@@ -549,7 +597,10 @@ def deliver(alerts: List[Alert], state: dict, now: datetime, dry_run: bool) -> N
 
 def watch(dry_run: bool, once: bool, state_path: str) -> int:
     contact = os.getenv("SEC_CONTACT", "").strip()
-    enabled = ["halts", "polymarket"] + (["sec"] if contact else [])
+    enabled = ["halts", "polymarket"] + (["sec"] if contact else []) + ["calendar"]
+    # Checked hourly, so it is not held to the 30-minute blind rule; its
+    # reminders run from files and need no network at all.
+    watched = [s for s in enabled if s != "calendar"]
     state = load_state(state_path)
     started = datetime.now(ET)
     watch = None
@@ -569,6 +620,8 @@ def watch(dry_run: bool, once: bool, state_path: str) -> int:
                        + ", ".join(SOURCE_NAMES[s] for s in enabled))],
                 state, started, dry_run)
     due = {s: 0.0 for s in enabled}
+    last_cal_minute = -1
+    events: list = []
     while True:
         now = datetime.now(ET)
         alerts: List[Alert] = []
@@ -584,8 +637,13 @@ def watch(dry_run: bool, once: bool, state_path: str) -> int:
             alerts += [Alert(PRIORITY_LOUD if loud else PRIORITY_NORMAL, text)
                        for loud, text in watch.beat(now)]
         if not once:
-            alerts += blind_alerts(state, now, enabled, started)
-            alerts += summary_alert(state, now, bool(contact))
+            if now.minute != last_cal_minute:      # once a minute is plenty
+                last_cal_minute = now.minute
+                events = calendar_events(state, now)
+                alerts += calendar_reminders(events, state, now)
+            alerts += blind_alerts(state, now, watched, started)
+            alerts += summary_alert(state, now, bool(contact),
+                                    calendar_watch.coming_up(events, now.date()))
         deliver(alerts, state, now, dry_run)
         save_state(state, state_path)
         if once:
@@ -812,6 +870,10 @@ def self_test() -> int:
             failures.append(f"this file must not mention {forbidden}")
 
     import inspect
+    if "calendar_reminders(" not in inspect.getsource(watch):
+        failures.append("the watch loop must send the calendar's reminders")
+    if calendar_watch.self_test.__module__ != "calendar_watch":
+        failures.append("calendar_watch.py is missing")
     if "watch.beat(" not in inspect.getsource(watch):
         failures.append("the watch loop must beat the heartbeat")
     for fn in (main,):
