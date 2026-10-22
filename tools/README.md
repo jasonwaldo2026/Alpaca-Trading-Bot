@@ -29,8 +29,9 @@ all. Trades are placed by hand, in DAS.
 | `screener.py` | Which other symbols are worth the same attention | research |
 | `darkpool_study.py` | Do big dark pool prints mark price levels that hold, against random prices | research |
 | `merger_watch.py` | Rings the phone on a Tesla–SpaceX merger: SEC filings, Nasdaq halts, Polymarket odds. Read-only | **yes, 24/7** (scheduled task) |
-| `heartbeat.py` | The SPCX alarms and the merger watch say they are alive, and each rings the phone if the other stops; also stops a second copy starting | imported by both |
+| `heartbeat.py` | The SPCX alarms and the merger watch say they are alive, and each rings the phone if the other stops; also stops a second copy starting (of those two and `auto_cycle.py`) | imported by all three |
 | `calendar_watch.py` + `events.json` | Earnings, unlock and launch reminders (3 days, evening before, morning of, 30 min before earnings), plus news about new dates; run by the merger watch | imported by `merger_watch.py` |
+| `auto_cycle.py` | **Paper account only.** Sells SPCX when the position is $1,200 under its purchase price and buys back $600 off the low (the buy-back becomes the new purchase price), at most 2 cycles a day; refuses any live port or non-`DU` account. `--dry-run` only pretends, on live prices | experiment, run by hand |
 | `session_clock.py` | The trading day as a clock face — where movement is, where signals fire | research |
 | `bracket.py` | The stop, target and share count to type, from an entry and a risk budget | **before entering** |
 | `lockups.py` + `lockups.json` | The share-unlock calendar | read by the others |
