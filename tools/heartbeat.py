@@ -37,9 +37,10 @@ RUNNING_WITHIN = timedelta(minutes=3)
 SPCX_ALARMS = "spcx_alarms.alive"
 MERGER_WATCH = "merger_watch.alive"
 AUTO_CYCLE = "auto_cycle.alive"
+DAY_RULES = "day_rules.alive"
 #: Each watcher's name, and the verb that agrees with it.
 NAMES = {SPCX_ALARMS: ("SPCX alarms", "are"), MERGER_WATCH: ("Merger watch", "is"),
-         AUTO_CYCLE: ("Auto cycle", "is")}
+         AUTO_CYCLE: ("Auto cycle", "is"), DAY_RULES: ("Day rules", "are")}
 
 
 def _named(path: str) -> Tuple[str, str]:

@@ -72,4 +72,6 @@ tools/merger_watch_state.json*
 tools/merger_watch.log
 # heartbeat.py's "alive" files: which process, and when.
 tools/*.alive
+# day_rules.py's memory: each day's P&L.
+tools/day_rules_state.json*
 !tools/primer/SPCX_primer.pdf

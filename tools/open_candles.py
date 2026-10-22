@@ -1182,8 +1182,11 @@ def open_call_due(now: datetime, done: bool) -> bool:
 def opening_call(change_pct: float) -> str:
     """The opening call's text: direction first, so the lock screen says it."""
     up = change_pct >= 0
-    return (f"S&P 500 OPEN {'▲ UP' if up else '▼ DOWN'} {change_pct:+.2f}% "
+    text = (f"S&P 500 OPEN {'▲ UP' if up else '▼ DOWN'} {change_pct:+.2f}% "
             f"from yesterday's close")
+    if not up:
+        text += "\nRULE 5: S&P negative. Extreme caution; best not to trade today."
+    return text
 
 
 def describe(symbol: str, candle: Candle, day: Optional[Day] = None,
@@ -3893,6 +3896,8 @@ def self_test() -> int:
         failures.append(f"opening call text: {opening_call(0.42)}")
     if not opening_call(-0.65).startswith("S&P 500 OPEN ▼ DOWN -0.65%"):
         failures.append(f"opening call text: {opening_call(-0.65)}")
+    if "RULE 5" not in opening_call(-0.65) or "RULE 5" in opening_call(0.42):
+        failures.append("a negative open carries rule 5, a positive one does not")
     opened_at = datetime.combine(d, REGULAR_OPEN, tzinfo=ET)
 
     def spy(symbol, start, end, force_sip=False):
