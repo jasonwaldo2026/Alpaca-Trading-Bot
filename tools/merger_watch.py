@@ -562,12 +562,20 @@ def calendar_check(state: dict, now: datetime) -> List[Alert]:
     return alerts
 
 
-def news_check(state: dict, now: datetime, get=None) -> List[Alert]:
+_IBKR_NEWS: Optional["spcx_news.IbkrNews"] = None
+
+
+def news_check(state: dict, now: datetime, get=None, ibkr=None) -> List[Alert]:
     """Every 10 minutes: SPCX headlines (see spcx_news.py). A headline that
     can move the stock makes a sound; the rest arrive silently. One source
     failing leaves the others; all failing counts as a failed check. The
-    Alpaca source is skipped when .env has no Alpaca keys."""
+    Alpaca source is skipped when .env has no Alpaca keys; IBKR's when IB
+    Gateway is not answering (logged, like any source)."""
+    global _IBKR_NEWS
     get = get or (lambda url, headers: fetch(url, agent="Mozilla/5.0", headers=headers))
+    if ibkr is None:
+        _IBKR_NEWS = _IBKR_NEWS or spcx_news.IbkrNews()
+        ibkr = _IBKR_NEWS
     keys = spcx_news.alpaca_headers()
     items, tried, failed = [], 0, 0
     for name, url, parser, needs_keys in spcx_news.SOURCES:
@@ -579,6 +587,12 @@ def news_check(state: dict, now: datetime, get=None) -> List[Alert]:
         except Exception as exc:  # noqa: BLE001 -- never the headers: they hold the keys
             failed += 1
             log(f"news ({name}): {type(exc).__name__}")
+    tried += 1
+    try:
+        items += ibkr.headlines()
+    except Exception as exc:  # noqa: BLE001
+        failed += 1
+        log(f"news (IBKR): {type(exc).__name__}")
     if failed == tried:
         raise RuntimeError("no news source answered")
     return [Alert(PRIORITY_NORMAL if big else PRIORITY_SILENT, text)
@@ -915,6 +929,18 @@ def self_test() -> int:
 
     asked = []
 
+    class FakeIbkr:
+        def __init__(self, items=(), down=False):
+            self.items, self.down, self.asked = list(items), down, 0
+
+        def headlines(self):
+            self.asked += 1
+            if self.down:
+                raise ConnectionRefusedError("gateway down")
+            return self.items
+
+    gateway_down = FakeIbkr(down=True)
+
     def one_down(url, headers):
         asked.append((url, headers))
         if "yahoo" in url:
@@ -927,30 +953,39 @@ def self_test() -> int:
     saved_keys = {k: os.environ.pop(k, None) for k in
                   ("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_API_SECRET")}
     try:
-        got = news_check(s, news_now, get=one_down)
+        got = news_check(s, news_now, get=one_down, ibkr=gateway_down)
         if [a.priority for a in got] != [PRIORITY_NORMAL, PRIORITY_SILENT]:
             failures.append(f"an offering rings, a plain headline is silent: {got}")
         if any("alpaca" in u for u, _ in asked) or any(h for _, h in asked):
             failures.append(f"without Alpaca keys, Alpaca is not asked: {asked}")
         try:
-            news_check(s, news_now,
+            news_check(s, news_now, ibkr=gateway_down,
                        get=lambda url, headers: (_ for _ in ()).throw(OSError("down")))
             failures.append("without Alpaca keys, both feeds down is a failed check")
         except RuntimeError:
             pass
         os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"] = "id", "sec"
         asked.clear()
-        news_check(s, news_now, get=one_down)
+        news_check(s, news_now, get=one_down, ibkr=gateway_down)
         sent = {u: h for u, h in asked}
         if sent.get(spcx_news.ALPACA_NEWS, {}).get("APCA-API-KEY-ID") != "id" or \
                 any(h for u, h in sent.items() if "alpaca" not in u):
             failures.append(f"the keys go to Alpaca and nowhere else: {asked}")
         try:
-            news_check(s, news_now,
+            news_check(s, news_now, ibkr=gateway_down,
                        get=lambda url, headers: (_ for _ in ()).throw(OSError("down")))
             failures.append("every news source down must count as a failed check")
         except RuntimeError:
             pass
+        # IB Gateway up, every web feed down: IBKR alone carries the check.
+        dj = spcx_news.Headline("SpaceX files for share offering", "", "Dow Jones",
+                                datetime(2026, 10, 23, 12, 20, tzinfo=timezone.utc), tagged=True)
+        got = news_check(s, news_now, ibkr=FakeIbkr([dj]),
+                         get=lambda url, headers: (_ for _ in ()).throw(OSError("down")))
+        if [a.priority for a in got] != [PRIORITY_NORMAL] or "Dow Jones" not in got[0].message:
+            failures.append(f"IBKR's headline arrives when the web feeds are down: {got}")
+        if gateway_down.asked < 3:
+            failures.append("IBKR is asked on every check")
     finally:
         LOG_PATH = saved_log
         for k, v in saved_keys.items():

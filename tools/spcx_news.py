@@ -10,6 +10,9 @@ so it now also reads, every 10 minutes:
   Alpaca        Benzinga's newswire, every story tagged SPCX -- often
                 minutes ahead of the other two. Uses the ALPACA_API_KEY
                 and ALPACA_SECRET_KEY already in .env; skipped without them.
+  IBKR          Dow Jones and Briefing.com (analyst actions), through the
+                IB Gateway already running -- a READ-ONLY connection on
+                its own client id, 7707. Gateway down: skipped quietly.
 
 and sends:
 
@@ -132,6 +135,90 @@ def alpaca_headers() -> Optional[dict]:
     return {"APCA-API-KEY-ID": key_id, "APCA-API-SECRET-KEY": secret}
 
 
+IBKR_HOST = os.environ.get("IBKR_HOST", "127.0.0.1")
+IBKR_PORT = int(os.environ.get("IBKR_PORT", "4001"))
+IBKR_CLIENT_ID = int(os.environ.get("IBKR_NEWS_CLIENT_ID", "7707"))
+#: IBKR's newest headlines per check. Asked with no time window: given
+#: one, the 23 Oct probe got only 19-20 Oct back.
+IBKR_LATEST = 50
+IBKR_NAMES = {"DJ": "Dow Jones", "BRF": "Briefing.com"}
+
+
+def _ibkr_title(headline: str) -> str:
+    """'{A:800015:L:en}Musk Vows ... Share--5th Update' -> 'Musk Vows ... Share'.
+    The code in braces is IBKR's; the update count would make each
+    revision look like a new story; '-- WSJ' is the publisher, which
+    other feeds leave off, so the same story compares equal."""
+    title = re.sub(r"^\{[^}]*\}", "", headline or "").strip()
+    title = re.sub(r"\s*--\s*\d+(st|nd|rd|th) Update$", "", title, flags=re.I)
+    return re.sub(r"\s+--\s+[A-Za-z.&' ]{1,30}$", "", title).strip()
+
+
+def parse_ibkr(items) -> List[Headline]:
+    """IBKR historical-news rows (time, providerCode, articleId, headline).
+    A time without a zone is taken as UTC."""
+    from datetime import timezone
+
+    out = []
+    for n in items or []:
+        title = _ibkr_title(getattr(n, "headline", ""))
+        when = getattr(n, "time", None)
+        if isinstance(when, datetime) and when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        code = getattr(n, "providerCode", "") or ""
+        source = next((v for k, v in IBKR_NAMES.items() if code.startswith(k)), code)
+        if title:
+            out.append(Headline(title, "", source, when if isinstance(when, datetime) else None,
+                                tagged=True))
+    return out
+
+
+class IbkrNews:
+    """SPCX headlines from every IBKR news provider this account has.
+
+    One READ-ONLY connection, opened when first needed and again after it
+    drops (IB Gateway restarts nightly). It asks for news and nothing else.
+    """
+
+    def __init__(self):
+        self.ib = None
+        self.codes = ""
+        self.con_id = 0
+
+    def headlines(self) -> List[Headline]:
+        if self.ib is None or not self.ib.isConnected():
+            self.close()
+            from ib_async import IB, Stock
+
+            ib = IB()
+            ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID, timeout=10,
+                       readonly=True)
+            try:
+                self.codes = "+".join(p.code for p in ib.reqNewsProviders())
+                stock = Stock(SYMBOL, "SMART", "USD")
+                if not self.codes or not [c for c in ib.qualifyContracts(stock) if c]:
+                    raise RuntimeError("no IBKR news providers, or no SPCX contract")
+                self.con_id = stock.conId
+            except BaseException:
+                ib.disconnect()
+                raise
+            self.ib = ib
+        try:
+            return parse_ibkr(self.ib.reqHistoricalNews(self.con_id, self.codes, "", "",
+                                                        IBKR_LATEST))
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self.ib is not None:
+            try:
+                self.ib.disconnect()
+            except Exception:  # noqa: BLE001 -- closing a dead link is not news
+                pass
+        self.ib = None
+
+
 #: (name, url, parser, needs the Alpaca keys)
 SOURCES = (("Google News", FEEDS[0], parse, False),
            ("Yahoo Finance", FEEDS[1], parse, False),
@@ -204,10 +291,11 @@ def check(items: List[Headline], state: dict, now: datetime) -> List[Tuple[bool,
         recent.append([now.isoformat(), h.title, h.link, h.source, word or ""])
         stamp = _clock(h.when, now.tzinfo)
         by = f"{h.source}, " if h.source else ""
+        link = f"\n{h.link}" if h.link else ""
         if word:
-            out.append((True, f"SPCX NEWS ({word}): {h.title} ({by}{stamp})\n{h.link}"))
+            out.append((True, f"SPCX NEWS ({word}): {h.title} ({by}{stamp}){link}"))
         elif len([1 for big, _ in out if not big]) < PER_CHECK:
-            out.append((False, f"SPCX news: {h.title} ({by}{stamp})\n{h.link}"))
+            out.append((False, f"SPCX news: {h.title} ({by}{stamp}){link}"))
         else:
             held += 1
     if held:
@@ -352,10 +440,33 @@ def self_test() -> int:
             if v is not None:
                 os.environ[k] = v
 
+    # IBKR: codes, update counts and the publisher come off the title.
+    from types import SimpleNamespace as NS
+
+    rows = [NS(time=datetime(2026, 10, 23, 8, 45), providerCode="DJ-N", articleId="1",
+               headline="{A:800015:L:en}SpaceX Weighs Merger Terms With Tesla -- WSJ"),
+            NS(time=datetime(2026, 10, 23, 8, 46), providerCode="DJ-N", articleId="2",
+               headline="{A:800015:L:en}SpaceX Weighs Merger Terms With Tesla--2nd Update"),
+            NS(time=datetime(2026, 10, 23, 8, 47), providerCode="BRFUPDN", articleId="3",
+               headline="SpaceX price target raised to $210 from $160 at JPMorgan"),
+            NS(time=None, providerCode="XX", articleId="4", headline="{A:1}")]
+    ib_items = parse_ibkr(rows)
+    ok([h.title for h in ib_items] == ["SpaceX Weighs Merger Terms With Tesla"] * 2
+       + ["SpaceX price target raised to $210 from $160 at JPMorgan"],
+       f"IBKR titles cleaned: {[h.title for h in ib_items]}")
+    ok(ib_items[0].source == "Dow Jones" and ib_items[2].source == "Briefing.com"
+       and ib_items[0].when.tzinfo is not None and ib_items[0].tagged and not ib_items[0].link,
+       f"IBKR rows: {ib_items}")
+    said = check(ib_items, state, later + timedelta(minutes=40))
+    ok(len(said) == 2 and said[0][1] == "SPCX NEWS (merger talks): SpaceX Weighs Merger "
+       "Terms With Tesla (Dow Jones, Fri 4:45 AM)", f"an update is not a new story; no "
+       f"empty link line: {said}")
+    ok(said[1][0] and "(price target)" in said[1][1], f"Briefing's analyst action is big: {said}")
+
     # The 07:00 digest.
     ok(digest(state, datetime(2026, 10, 23, 6, 59, tzinfo=et)) is None, "not before 7")
     text = digest(state, datetime(2026, 10, 23, 7, 0, tzinfo=et))
-    ok(text is not None and text.startswith("SPCX news since Thu 4 PM (12,"),
+    ok(text is not None and text.startswith("SPCX news since Thu 4 PM (14,"),
        f"the digest counts everything since Thursday's close: {text}")
     ok(text.split("\n")[1].startswith("! SpaceX downgraded? No"), f"big ones first: {text}")
     ok(digest(state, datetime(2026, 10, 23, 7, 5, tzinfo=et)) is None, "once a day")
@@ -404,12 +515,26 @@ def main() -> int:
             print(f"\n{name}: did not answer ({type(exc).__name__})")
             continue
         print(f"\n{name}: {len(items)} headlines")
-        for h in sorted(items, key=lambda h: h.when or now, reverse=True)[:15]:
-            if h.tagged or about_company(h.title):
-                word = big_word(h.title)
-                print(f"  {_clock(h.when, now.tzinfo) if h.when else '?':>12}  "
-                      f"{'! ' + word + ': ' if word else ''}{h.title[:100]}")
+        show(items, now)
+    ibkr = IbkrNews()
+    try:
+        items = ibkr.headlines()
+        print(f"\nIBKR (Dow Jones, Briefing.com): {len(items)} headlines")
+        show(items, now)
+    except Exception as exc:  # noqa: BLE001
+        print(f"\nIBKR: not read ({type(exc).__name__}: {str(exc)[:80]})")
+    finally:
+        ibkr.close()
     return 0
+
+
+def show(items: List[Headline], now: datetime) -> None:
+    """The newest 15 about the company, '!' marking the ones that ring."""
+    for h in sorted(items, key=lambda h: h.when or now, reverse=True)[:15]:
+        if h.tagged or about_company(h.title):
+            word = big_word(h.title)
+            print(f"  {_clock(h.when, now.tzinfo) if h.when else '?':>12}  "
+                  f"{'! ' + word + ': ' if word else ''}{h.title[:100]}")
 
 
 if __name__ == "__main__":
