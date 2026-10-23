@@ -87,6 +87,11 @@ def money(x: float) -> str:
     return f"-${-x:,.0f}" if x < 0 else f"+${x:,.0f}"
 
 
+def dollars(x: float) -> str:
+    """A size with no sign, for sentences that already say which way."""
+    return f"${abs(x):,.0f}"
+
+
 def finite(x) -> bool:
     try:
         return x is not None and math.isfinite(float(x)) and abs(float(x)) < UNSET
@@ -143,8 +148,10 @@ class Rules:
 
     def __init__(self, day: date, yesterday_pnl: Optional[float] = None,
                  warn: float = LOSS_WARN, limit: float = LOSS_LIMIT,
-                 big_win: float = BIG_WIN, run: int = LOSING_RUN):
+                 big_win: float = BIG_WIN, run: int = LOSING_RUN,
+                 events: Optional[List[str]] = None):
         self.day, self.yesterday = day, yesterday_pnl
+        self.events = events or []
         self.warn, self.limit, self.big_win, self.run = warn, limit, big_win, run
         self.reminded = self.warned = False
         self.over_fills: Optional[int] = None
@@ -156,7 +163,7 @@ class Rules:
         if self.reminded or not REMIND_AT <= t <= REMIND_LATEST:
             return None
         self.reminded = True
-        lines = []
+        lines = list(self.events)
         if finite(self.yesterday) and self.yesterday >= self.big_win:
             lines.append(f"Yesterday {money(self.yesterday)}. RULE 1: go light "
                          f"today. Do not enter until the day develops.")
@@ -176,13 +183,13 @@ class Rules:
             if self.over_fills is None and pnl <= -self.limit:
                 self.over_fills = snap.fills
                 said.append((PRIORITY_EMERGENCY,
-                             f"THE DAY IS OVER. Down {money(pnl)} today. RULE 2: "
+                             f"THE DAY IS OVER. Down {dollars(pnl)} today. RULE 2: "
                              f"{money(-self.limit)} ends the day. No more trades."))
             elif not self.warned and self.over_fills is None and pnl <= -self.warn:
                 self.warned = True
                 said.append((PRIORITY_LOUD,
-                             f"Down {money(pnl)} today. {money(-self.limit)} ends "
-                             f"the day (RULE 2). {money(self.limit + pnl)[1:]} left."))
+                             f"Down {dollars(pnl)} today. {money(-self.limit)} ends "
+                             f"the day (RULE 2). {dollars(self.limit + pnl)} left."))
         if self.over_fills is not None and snap.fills > self.over_fills:
             self.over_fills = snap.fills
             said.append((PRIORITY_LOUD, "A trade AFTER the day was over. RULE 2: "
@@ -204,6 +211,34 @@ class Rules:
                              f"VWAP, under the open, or VWAP falling). RULE 6: "
                              f"no margin until the day trends up."))
         return said
+
+
+def event_lines(events, day: date) -> List[str]:
+    """The 09:25 lines for an unlock or earnings report on `day`.
+
+    `events` are calendar_watch Events, which already move a weekend
+    unlock to the Monday it first bites.
+    """
+    lines = []
+    for e in events:
+        if e.day != day or e.kind not in ("unlock", "earnings"):
+            continue
+        name = "UNLOCK DAY" if e.kind == "unlock" else "EARNINGS DAY"
+        lines.append(f"{name}: {e.title}{e.flag()}, {e.when_words()}. "
+                     f"RULES 1 and 4: go light; stay out if it is choppy.")
+    return lines
+
+
+def todays_events(day: date) -> List[str]:
+    """Today's lines from the calendar, or none if it cannot be read: a
+    missing calendar must never stop the loss alarms."""
+    try:
+        import calendar_watch
+
+        return event_lines(calendar_watch.all_events(day), day)
+    except Exception as exc:  # noqa: BLE001
+        print(f"(calendar not read: {type(exc).__name__}: {exc})", flush=True)
+        return []
 
 
 # ------------------------------------------------------------- state file
@@ -381,7 +416,7 @@ def run(args) -> int:
             if rules is None:
                 rules = Rules(now.date(), previous_pnl(load_state(state), now.date()),
                               args.loss_warn, args.loss_limit, args.big_win,
-                              args.losing_run)
+                              args.losing_run, todays_events(now.date()))
                 last_seen = now
             try:
                 snap = account.snapshot(now, now.date())
@@ -425,7 +460,8 @@ def status() -> int:
     pnl = money(snap.daily_pnl) if finite(snap.daily_pnl) else "not reported"
     print(f"Day's P&L:        {pnl}")
     print(f"Trades today:     {snap.fills} fills, {len(snap.exits)} closing orders, "
-          f"{losing_run(snap.exits)} losses in a row")
+          f"{losing_run(snap.exits)} {'loss' if losing_run(snap.exits) == 1 else 'losses'} "
+          f"in a row")
     print(f"On margin:        {'unknown' if snap.on_margin is None else snap.on_margin}")
     trend = {None: "not measured (outside 09:30-16:00 or too early)",
              True: "yes", False: "no"}[snap.trending_up]
@@ -453,10 +489,12 @@ def self_test() -> int:
     said = r.check(snap(10, 1, daily_pnl=-4000))
     check(len(said) == 1 and said[0][0] == PRIORITY_LOUD and "$1,000 left" in said[0][1],
           f"-$4,000 warns loudly with what is left: {said}")
+    check(said[0][1].startswith("Down $4,000 today."), f"no double minus: {said}")
     check(r.check(snap(10, 2, daily_pnl=-4500)) == [], "the warning is said once")
     said = r.check(snap(10, 3, daily_pnl=-5000, fills=6))
     check(len(said) == 1 and said[0][0] == PRIORITY_EMERGENCY
           and "THE DAY IS OVER" in said[0][1], f"-$5,000 ends the day: {said}")
+    check("Down $5,000 today" in said[0][1], f"no double minus: {said}")
     check(r.check(snap(10, 4, daily_pnl=-5600, fills=6)) == [],
           "the day is over once, not every minute")
     check(r.check(snap(10, 5, daily_pnl=-4000, fills=6)) == [],
@@ -519,6 +557,24 @@ def self_test() -> int:
     said = Rules(day, yesterday_pnl=2999).check(snap(9, 30))
     check(said and "RULE 1" not in said[0][1].split("\n")[0], "a small win is not a big win")
     check(Rules(day).check(snap(9, 50)) == [], "too late for the morning reminder")
+
+    # Unlock and earnings days lead the reminder.
+    from calendar_watch import Event, REPORT_TIMES
+
+    cal = [Event("unlock", day, None, "SPCX share unlock, 328M shares", "UNCONFIRMED"),
+           Event("earnings", day, REPORT_TIMES["after-close"], "SPCX earnings", "CONFIRMED"),
+           Event("launch", day, time(10, 0), "Starship", "CONFIRMED"),
+           Event("unlock", date(2026, 10, 27), None, "another unlock", "CONFIRMED")]
+    lines = event_lines(cal, day)
+    check(len(lines) == 2, f"today's unlock and earnings, not the launch or tomorrow: {lines}")
+    check(lines[0].startswith("UNLOCK DAY: SPCX share unlock, 328M shares [UNCONFIRMED]")
+          and "RULES 1 and 4" in lines[0], f"the unlock line: {lines}")
+    check(lines[1].startswith("EARNINGS DAY") and "after the close" in lines[1],
+          f"the earnings line: {lines}")
+    said = Rules(day, yesterday_pnl=3500, events=lines[:1]).check(snap(9, 25))
+    check(said and said[0][1].startswith("UNLOCK DAY") and "RULE 1: go light" in said[0][1],
+          f"the unlock leads, rule 1 follows: {said}")
+    check(event_lines(cal, date(2026, 10, 28)) == [], "a day with nothing says nothing")
 
     # Trending up from minute bars.
     idx = pd.date_range("2026-10-26 09:30", periods=30, freq="1min")
