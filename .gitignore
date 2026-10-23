@@ -74,4 +74,6 @@ tools/merger_watch.log
 tools/*.alive
 # day_rules.py's memory: each day's P&L.
 tools/day_rules_state.json*
+# ibkr_scanner_probe.py's output: this account's scanner list, local only.
+tools/ibkr_scanner_params.xml
 !tools/primer/SPCX_primer.pdf
