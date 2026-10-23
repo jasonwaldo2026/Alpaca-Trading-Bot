@@ -7,6 +7,9 @@ so it now also reads, every 10 minutes:
 
   Google News   "SpaceX OR SPCX", the last day
   Yahoo Finance the SPCX headline feed
+  Alpaca        Benzinga's newswire, every story tagged SPCX -- often
+                minutes ahead of the other two. Uses the ALPACA_API_KEY
+                and ALPACA_SECRET_KEY already in .env; skipped without them.
 
 and sends:
 
@@ -29,6 +32,8 @@ Read-only: public RSS feeds, no account. Imported by merger_watch.py.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import sys
 import xml.etree.ElementTree as ElementTree
@@ -42,6 +47,9 @@ FEEDS = (
     "&hl=en-US&gl=US&ceid=US:en",
     "https://feeds.finance.yahoo.com/rss/2.0/headline?s=SPCX&region=US&lang=en-US",
 )
+ALPACA_NEWS = ("https://data.alpaca.markets/v1beta1/news?symbols=SPCX"
+               "&limit=50&sort=desc")
+SYMBOL = "SPCX"
 #: Only headlines that are about the company.
 ABOUT = ("spacex", "spcx", "starlink", "starship")
 #: Words that can move the stock at the open. Matched as whole words.
@@ -75,6 +83,8 @@ class Headline:
     link: str
     source: str
     when: Optional[datetime]
+    #: The feed itself tagged the story SPCX, so the title need not say so.
+    tagged: bool = False
 
 
 def parse(payload: bytes) -> List[Headline]:
@@ -93,6 +103,39 @@ def parse(payload: bytes) -> List[Headline]:
         if title:
             out.append(Headline(title, (item.findtext("link") or "").strip(), source, when))
     return out
+
+
+def parse_alpaca(payload: bytes) -> List[Headline]:
+    """Alpaca's news: JSON, one entry per story, with the symbols it is about."""
+    out = []
+    for n in json.loads(payload).get("news", []):
+        title = (n.get("headline") or "").strip()
+        try:
+            when = datetime.fromisoformat((n.get("created_at") or "").replace("Z", "+00:00"))
+        except ValueError:
+            when = None
+        if title:
+            out.append(Headline(title, (n.get("url") or "").strip(),
+                                (n.get("source") or "").strip().capitalize(), when,
+                                tagged=SYMBOL in (n.get("symbols") or [])))
+    return out
+
+
+def alpaca_headers() -> Optional[dict]:
+    """The Alpaca key pair as request headers, or None if .env has none.
+    Never printed or logged."""
+    key_id = os.getenv("ALPACA_API_KEY", "").strip()
+    secret = (os.getenv("ALPACA_SECRET_KEY", "").strip()
+              or os.getenv("ALPACA_API_SECRET", "").strip())
+    if not key_id or not secret:
+        return None
+    return {"APCA-API-KEY-ID": key_id, "APCA-API-SECRET-KEY": secret}
+
+
+#: (name, url, parser, needs the Alpaca keys)
+SOURCES = (("Google News", FEEDS[0], parse, False),
+           ("Yahoo Finance", FEEDS[1], parse, False),
+           ("Alpaca/Benzinga", ALPACA_NEWS, parse_alpaca, True))
 
 
 def key(title: str) -> str:
@@ -153,7 +196,7 @@ def check(items: List[Headline], state: dict, now: datetime) -> List[Tuple[bool,
             continue
         seen.append(k)
         seen_set.add(k)
-        if first or not about_company(h.title):
+        if first or not (h.tagged or about_company(h.title)):
             continue
         if h.when is None or now - h.when > FRESH:
             continue
@@ -279,10 +322,40 @@ def self_test() -> int:
     ok(len(said) == PER_CHECK + 1 and "3 more headline(s)" in said[-1][1],
        f"at most {PER_CHECK} a check, the rest wait for the digest: {len(said)}")
 
+    # Alpaca's JSON: a story tagged SPCX counts even if the title never says SpaceX.
+    alpaca = json.dumps({"news": [
+        {"headline": "Tower stocks rally on wireless report", "created_at": "2026-10-23T08:30:00Z",
+         "url": "https://b/1", "source": "benzinga", "symbols": ["CCI", "SPCX"]},
+        {"headline": "Tower stocks rally on wireless report", "created_at": "2026-10-23T08:30:00Z",
+         "url": "https://b/1", "source": "benzinga", "symbols": ["CCI", "SPCX"]},
+        {"headline": "Analyst downgrades AMT", "created_at": "2026-10-23T08:31:00Z",
+         "url": "https://b/2", "source": "benzinga", "symbols": ["AMT"]},
+        {"headline": "", "created_at": "bad", "symbols": ["SPCX"]}]}).encode()
+    stories = parse_alpaca(alpaca)
+    ok(len(stories) == 3 and stories[0].tagged and not stories[2].tagged
+       and stories[0].source == "Benzinga" and stories[0].when.hour == 8,
+       f"Alpaca's stories, tagged by symbol: {stories}")
+    said = check(stories, state, later + timedelta(minutes=30))
+    ok(said == [(False, "SPCX news: Tower stocks rally on wireless report "
+                        "(Benzinga, Fri 4:30 AM)\nhttps://b/1")],
+       f"a tagged story counts once; an untagged one about another stock does not: {said}")
+    saved = {k: os.environ.pop(k, None) for k in
+             ("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_API_SECRET")}
+    try:
+        ok(alpaca_headers() is None, "no keys, no Alpaca")
+        os.environ["ALPACA_API_KEY"], os.environ["ALPACA_API_SECRET"] = "id", "sec"
+        ok(alpaca_headers() == {"APCA-API-KEY-ID": "id", "APCA-API-SECRET-KEY": "sec"},
+           "either name for the secret works")
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
     # The 07:00 digest.
     ok(digest(state, datetime(2026, 10, 23, 6, 59, tzinfo=et)) is None, "not before 7")
     text = digest(state, datetime(2026, 10, 23, 7, 0, tzinfo=et))
-    ok(text is not None and text.startswith("SPCX news since Thu 4 PM (11,"),
+    ok(text is not None and text.startswith("SPCX news since Thu 4 PM (12,"),
        f"the digest counts everything since Thursday's close: {text}")
     ok(text.split("\n")[1].startswith("! SpaceX downgraded? No"), f"big ones first: {text}")
     ok(digest(state, datetime(2026, 10, 23, 7, 5, tzinfo=et)) is None, "once a day")
@@ -311,14 +384,28 @@ def main() -> int:
     import urllib.request
     from zoneinfo import ZoneInfo
 
+    try:
+        from feed_check import load_env
+        load_env()
+    except ImportError:
+        pass
     now = datetime.now(ZoneInfo("America/New_York"))
-    for url in FEEDS:
-        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(request, timeout=20) as response:
-            items = parse(response.read(4_000_000))
-        print(f"\n{url[:60]}... {len(items)} headlines")
+    keys = alpaca_headers()
+    for name, url, parser, needs_keys in SOURCES:
+        if needs_keys and keys is None:
+            print(f"\n{name}: skipped, no Alpaca keys in .env")
+            continue
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0",
+                                                       **(keys if needs_keys else {})})
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                items = parser(response.read(4_000_000))
+        except Exception as exc:  # noqa: BLE001
+            print(f"\n{name}: did not answer ({type(exc).__name__})")
+            continue
+        print(f"\n{name}: {len(items)} headlines")
         for h in sorted(items, key=lambda h: h.when or now, reverse=True)[:15]:
-            if about_company(h.title):
+            if h.tagged or about_company(h.title):
                 word = big_word(h.title)
                 print(f"  {_clock(h.when, now.tzinfo) if h.when else '?':>12}  "
                       f"{'! ' + word + ': ' if word else ''}{h.title[:100]}")

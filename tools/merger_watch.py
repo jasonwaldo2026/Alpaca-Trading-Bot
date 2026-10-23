@@ -491,9 +491,11 @@ def _label_key(label: str) -> datetime:
 
 # --------------------------------------------------------------- the I/O
 
-def fetch(url: str, agent: str = USER_AGENT, limit: int = 4_000_000) -> bytes:
+def fetch(url: str, agent: str = USER_AGENT, limit: int = 4_000_000,
+          headers: Optional[dict] = None) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": agent,
-                                                   "Accept-Encoding": "identity"})
+                                                   "Accept-Encoding": "identity",
+                                                   **(headers or {})})
     with urllib.request.urlopen(request, timeout=20) as response:
         return response.read(limit)
 
@@ -562,18 +564,23 @@ def calendar_check(state: dict, now: datetime) -> List[Alert]:
 
 def news_check(state: dict, now: datetime, get=None) -> List[Alert]:
     """Every 10 minutes: SPCX headlines (see spcx_news.py). A headline that
-    can move the stock makes a sound; the rest arrive silently. One feed
-    failing leaves the other; both failing counts as a failed check."""
-    get = get or (lambda url: fetch(url, agent="Mozilla/5.0"))
-    items, failed = [], 0
-    for url in spcx_news.FEEDS:
+    can move the stock makes a sound; the rest arrive silently. One source
+    failing leaves the others; all failing counts as a failed check. The
+    Alpaca source is skipped when .env has no Alpaca keys."""
+    get = get or (lambda url, headers: fetch(url, agent="Mozilla/5.0", headers=headers))
+    keys = spcx_news.alpaca_headers()
+    items, tried, failed = [], 0, 0
+    for name, url, parser, needs_keys in spcx_news.SOURCES:
+        if needs_keys and keys is None:
+            continue
+        tried += 1
         try:
-            items += spcx_news.parse(get(url))
-        except Exception as exc:  # noqa: BLE001
+            items += parser(get(url, keys if needs_keys else None))
+        except Exception as exc:  # noqa: BLE001 -- never the headers: they hold the keys
             failed += 1
-            log(f"news feed {url[:40]}: {type(exc).__name__}")
-    if failed == len(spcx_news.FEEDS):
-        raise RuntimeError("no news feed answered")
+            log(f"news ({name}): {type(exc).__name__}")
+    if failed == tried:
+        raise RuntimeError("no news source answered")
     return [Alert(PRIORITY_NORMAL if big else PRIORITY_SILENT, text)
             for big, text in spcx_news.check(items, state, now)]
 
@@ -906,23 +913,50 @@ def self_test() -> int:
     s = new_state()
     s["spcx_news_primed"] = True
 
-    def one_down(url):
+    asked = []
+
+    def one_down(url, headers):
+        asked.append((url, headers))
         if "yahoo" in url:
             raise OSError("down")
+        if "alpaca" in url:
+            return b'{"news": []}'
         return feed
 
     saved_log, LOG_PATH = LOG_PATH, os.devnull
+    saved_keys = {k: os.environ.pop(k, None) for k in
+                  ("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_API_SECRET")}
     try:
         got = news_check(s, news_now, get=one_down)
         if [a.priority for a in got] != [PRIORITY_NORMAL, PRIORITY_SILENT]:
             failures.append(f"an offering rings, a plain headline is silent: {got}")
+        if any("alpaca" in u for u, _ in asked) or any(h for _, h in asked):
+            failures.append(f"without Alpaca keys, Alpaca is not asked: {asked}")
         try:
-            news_check(s, news_now, get=lambda url: (_ for _ in ()).throw(OSError("down")))
-            failures.append("both news feeds down must count as a failed check")
+            news_check(s, news_now,
+                       get=lambda url, headers: (_ for _ in ()).throw(OSError("down")))
+            failures.append("without Alpaca keys, both feeds down is a failed check")
+        except RuntimeError:
+            pass
+        os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"] = "id", "sec"
+        asked.clear()
+        news_check(s, news_now, get=one_down)
+        sent = {u: h for u, h in asked}
+        if sent.get(spcx_news.ALPACA_NEWS, {}).get("APCA-API-KEY-ID") != "id" or \
+                any(h for u, h in sent.items() if "alpaca" not in u):
+            failures.append(f"the keys go to Alpaca and nowhere else: {asked}")
+        try:
+            news_check(s, news_now,
+                       get=lambda url, headers: (_ for _ in ()).throw(OSError("down")))
+            failures.append("every news source down must count as a failed check")
         except RuntimeError:
             pass
     finally:
         LOG_PATH = saved_log
+        for k, v in saved_keys.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
     if spcx_news.self_test.__module__ != "spcx_news":
         failures.append("spcx_news.py is missing")
 
