@@ -452,4 +452,5 @@ backup, and restores it if the result does not compile.
 | File | What it changes |
 |---|---|
 | `patch_alpaca_news_sec_float.py` | **Run first.** FMP is gone: the Live Feed's news comes from Alpaca (Benzinga, market-wide, one row per tagged symbol) instead of FMP, and Top Gainers' Float % is approximated from SEC filings (new `collectors/sec_float.py`; needs `SEC_CONTACT` in `.env`). Both used to switch off silently without an FMP key |
+| `patch_sec_edgar_vix.py` | **Run second.** SEC filings (Live Feed "SEC 8-K" rows, and the shadow strategy's dilution check) from EDGAR itself instead of FMP (new `collectors/sec_edgar.py`); the Hot List's VIX from IBKR (read-only, client id 7708); Float % falls back to average shares for companies that file no whole count (FCNCA). `fmp_intel` no longer stops without an FMP key |
 | `patch_early_news.py` | `fast_scan`'s news stage also runs 04:00–07:55 and 16:35–19:55 ET (news only, no volume), so overnight headlines reach the Live Feed before 8 AM. About 90 more news requests a day (Alpaca after the patch above) |
