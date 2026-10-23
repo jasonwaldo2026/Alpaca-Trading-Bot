@@ -73,6 +73,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import calendar_watch
 import heartbeat
+import spcx_news
 from feed_check import ET, load_env
 from spcx_alert import (
     PRIORITY_EMERGENCY,
@@ -151,8 +152,8 @@ SUMMARY_LATEST = time(21, 45)
 PENDING_KEEP = timedelta(hours=2)
 
 #: Seconds between checks of each source.
-INTERVALS = {"halts": 60, "sec": 120, "polymarket": 300, "calendar": 3600}
-SOURCE_NAMES = {"calendar": "Earnings & unlock calendar",
+INTERVALS = {"halts": 60, "sec": 120, "polymarket": 300, "calendar": 3600, "news": 600}
+SOURCE_NAMES = {"calendar": "Earnings & unlock calendar", "news": "SPCX news",
                 "halts": "Nasdaq halts", "sec": "SEC filings",
                 "polymarket": "Polymarket odds"}
 
@@ -514,6 +515,8 @@ def check_source(source: str, state: dict, now: datetime, contact: str) -> List[
         alerts = halt_alerts(parse_halts(fetch(HALTS_URL)), state, now)
     elif source == "calendar":
         alerts = calendar_check(state, now)
+    elif source == "news":
+        alerts = news_check(state, now)
     else:
         agent = sec_agent(contact)
 
@@ -557,6 +560,24 @@ def calendar_check(state: dict, now: datetime) -> List[Alert]:
     return alerts
 
 
+def news_check(state: dict, now: datetime, get=None) -> List[Alert]:
+    """Every 10 minutes: SPCX headlines (see spcx_news.py). A headline that
+    can move the stock makes a sound; the rest arrive silently. One feed
+    failing leaves the other; both failing counts as a failed check."""
+    get = get or (lambda url: fetch(url, agent="Mozilla/5.0"))
+    items, failed = [], 0
+    for url in spcx_news.FEEDS:
+        try:
+            items += spcx_news.parse(get(url))
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            log(f"news feed {url[:40]}: {type(exc).__name__}")
+    if failed == len(spcx_news.FEEDS):
+        raise RuntimeError("no news feed answered")
+    return [Alert(PRIORITY_NORMAL if big else PRIORITY_SILENT, text)
+            for big, text in spcx_news.check(items, state, now)]
+
+
 def calendar_events(state: dict, now: datetime) -> List["calendar_watch.Event"]:
     raw = state.get("earnings_estimate")
     estimate = date.fromisoformat(raw) if raw else None
@@ -597,10 +618,12 @@ def deliver(alerts: List[Alert], state: dict, now: datetime, dry_run: bool) -> N
 
 def watch(dry_run: bool, once: bool, state_path: str) -> int:
     contact = os.getenv("SEC_CONTACT", "").strip()
-    enabled = ["halts", "polymarket"] + (["sec"] if contact else []) + ["calendar"]
-    # Checked hourly, so it is not held to the 30-minute blind rule; its
-    # reminders run from files and need no network at all.
-    watched = [s for s in enabled if s != "calendar"]
+    enabled = ["halts", "polymarket"] + (["sec"] if contact else []) + ["calendar", "news"]
+    # The calendar is checked hourly, so it is not held to the 30-minute
+    # blind rule; its reminders run from files and need no network at all.
+    # News is a convenience: a news site that stops answering is logged,
+    # not rung, or a slow night at Google would wake the phone.
+    watched = [s for s in enabled if s not in ("calendar", "news")]
     state = load_state(state_path)
     started = datetime.now(ET)
     watch = None
@@ -641,6 +664,9 @@ def watch(dry_run: bool, once: bool, state_path: str) -> int:
                 last_cal_minute = now.minute
                 events = calendar_events(state, now)
                 alerts += calendar_reminders(events, state, now)
+                morning = spcx_news.digest(state, now)
+                if morning:
+                    alerts.append(Alert(PRIORITY_NORMAL, morning))
             alerts += blind_alerts(state, now, watched, started)
             alerts += summary_alert(state, now, bool(contact),
                                     calendar_watch.coming_up(events, now.date()))
@@ -869,7 +895,40 @@ def self_test() -> int:
         if forbidden in source.replace(f'"{forbidden}"', ""):
             failures.append(f"this file must not mention {forbidden}")
 
+    # SPCX news: big headlines make a sound, the rest are silent; one
+    # feed down is fine, both down is a failed check.
+    feed = (b"<rss><channel><item><title>SpaceX prices share offering - Reuters</title>"
+            b"<link>l1</link><pubDate>Fri, 23 Oct 2026 12:00:00 GMT</pubDate>"
+            b"<source>Reuters</source></item><item><title>Starlink adds airline</title>"
+            b"<link>l2</link><pubDate>Fri, 23 Oct 2026 12:05:00 GMT</pubDate></item>"
+            b"</channel></rss>")
+    news_now = datetime(2026, 10, 23, 8, 30, tzinfo=ET)
+    s = new_state()
+    s["spcx_news_primed"] = True
+
+    def one_down(url):
+        if "yahoo" in url:
+            raise OSError("down")
+        return feed
+
+    saved_log, LOG_PATH = LOG_PATH, os.devnull
+    try:
+        got = news_check(s, news_now, get=one_down)
+        if [a.priority for a in got] != [PRIORITY_NORMAL, PRIORITY_SILENT]:
+            failures.append(f"an offering rings, a plain headline is silent: {got}")
+        try:
+            news_check(s, news_now, get=lambda url: (_ for _ in ()).throw(OSError("down")))
+            failures.append("both news feeds down must count as a failed check")
+        except RuntimeError:
+            pass
+    finally:
+        LOG_PATH = saved_log
+    if spcx_news.self_test.__module__ != "spcx_news":
+        failures.append("spcx_news.py is missing")
+
     import inspect
+    if "spcx_news.digest(" not in inspect.getsource(watch):
+        failures.append("the watch loop must send the 07:00 news list")
     if "calendar_reminders(" not in inspect.getsource(watch):
         failures.append("the watch loop must send the calendar's reminders")
     if calendar_watch.self_test.__module__ != "calendar_watch":
