@@ -441,3 +441,13 @@ It does not predict. Nothing measured in this project beats a coin flip,
 and no sound, colour or line here means "buy". The alerts say *something
 is happening now, with participation behind it, in a direction you care
 about* — and the judgement stays with whoever is reading them.
+
+## Market Scanner patches (`market_scanner/`)
+
+Run from `C:\Dev\Market-Scanner`, `--check` first. Each refuses to touch a
+file that is not the version it was written against, keeps a timestamped
+backup, and restores it if the result does not compile.
+
+| File | What it changes |
+|---|---|
+| `patch_early_news.py` | `fast_scan`'s news stage also runs 04:00–07:55 and 16:35–19:55 ET (news only, no volume), so overnight headlines reach the Live Feed before 8 AM. About 90 more FMP calls a day |
