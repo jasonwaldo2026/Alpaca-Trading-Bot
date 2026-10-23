@@ -65,12 +65,19 @@ BIG_WORDS = ("offering", "secondary", "dilution", "downgrade", "downgrades",
              "guidance", "unlock", "lockup", "lock-up", "explodes", "explosion",
              "anomaly", "failure", "grounded", "faa", "merger agreement",
              "agree to merge", "agreed to merge", "to acquire", "acquisition",
-             "buyback", "stock split", "resigns", "steps down", "recall")
-MERGER_WORDS = ("merger", "merge", "merging", "combine", "combination")
+             "buyback", "stock split", "resigns", "steps down", "recall",
+             # Borrowing can move the stock like an offering (23 Oct:
+             # "SpaceX $40B debt deal gets pricey").
+             "debt deal", "bond", "bonds", "convertible")
+MERGER_WORDS = ("merger", "merge", "merging", "combine", "combination", "tie-up", "tie up")
 MERGER_MOVES = ("talks", "deal", "agreement", "agree", "agreed", "announce",
                 "announces", "announced", "review", "board", "vote", "approve",
                 "approves", "approved", "special committee", "terms", "endorse",
-                "endorsement", "endorses")
+                "endorsement", "endorses",
+                # Missed on 23 Oct: "Musk's Approval Required in Potential
+                # Merger", "Sign-Off For Any Tesla Tie-Up", "merger could
+                # face antitrust scrutiny".
+                "approval", "sign-off", "antitrust", "scrutiny")
 PER_CHECK = 6
 FRESH = timedelta(hours=12)
 KEEP = timedelta(days=4)
@@ -369,6 +376,15 @@ def self_test() -> int:
                   "What Is SpaceX (SPCX) Considering With A $3.5 Trillion Merger Review?",
                   "Elon Musk To Merge SpaceX, Tesla: A Look Into $3.5 Trillion Corporate Deal"):
         ok(big_word(title) == "merger talks", f"merger talks are big: {title}")
+    for title in ("SpaceX CEO Elon Musk's Approval Required in Potential Merger With Tesla",
+                  "SpaceX Flags Elon Musk's Sign-Off For Any Tesla Tie-Up",
+                  "Exclusive / SpaceX-Tesla merger could face antitrust scrutiny",
+                  "Tesla-SpaceX merger may trigger US antitrust review"):
+        ok(big_word(title) == "merger talks", f"23 Oct's merger headlines are big: {title}")
+    ok(big_word("'SpaceX $40B debt deal gets pricey as AI fears spread'- Semafor") == "debt deal",
+       "a debt deal is big")
+    ok(big_word("SpaceX prices convertible notes") == "convertible", "convertibles are big")
+    ok(big_word("Bondi Beach launch party") is None, "whole words: Bondi is not a bond")
     for title in ("SpaceX-Tesla Merger: 7 Tie-Ups Musk Named",
                   "Why a Merger With Tesla Could Be a Disaster for SpaceX",
                   "3 Hurdles Could Complicate a Tesla and SpaceX Merger",
