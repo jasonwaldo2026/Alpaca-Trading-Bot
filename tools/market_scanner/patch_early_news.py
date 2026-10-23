@@ -16,7 +16,9 @@ Three edits to src/main.py:
      fast_scan_days: 04:00-07:55, 16:35-16:55 and 17:00-19:55 ET.
   3. Comments saying why.
 
-The daytime 08:00-16:30 jobs are not changed. About 90 more FMP calls a day.
+The daytime 08:00-16:30 jobs are not changed. About 90 more news requests a
+day -- to Alpaca once patch_alpaca_news_sec_float.py has run (free), to FMP
+before it.
 
 It refuses to touch the file unless every line it changes is exactly the
 version it was written against, keeps a timestamped backup, keeps the
@@ -65,7 +67,7 @@ SCHEDULE_NEW = SCHEDULE_OLD + '''
     # EARLY NEWS (2026-10-23): stage 2 (news) only, either side of the
     # window above, so overnight and early-morning headlines reach the
     # Live Feed before 08:00 and evening ones are not left until tomorrow.
-    # One FMP call per run, about 90 a day. Volume stays market hours.
+    # One news request per run, about 90 a day. Volume stays market hours.
     for job_id, hours, minutes in (
             ("fast_news_early", "4-7", f"*/{fast_minutes}"),
             ("fast_news_late", "16", f"35-55/{fast_minutes}"),
