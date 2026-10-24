@@ -78,6 +78,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import calendar_watch
 import heartbeat
 import spcx_news
+import todo_watch
 from feed_check import ET, load_env
 from spcx_alert import (
     PRIORITY_EMERGENCY,
@@ -696,6 +697,9 @@ def watch(dry_run: bool, once: bool, state_path: str) -> int:
                 morning = spcx_news.digest(state, now)
                 if morning:
                     alerts.append(Alert(PRIORITY_NORMAL, morning))
+                todo = todo_watch.morning(state, now, events)
+                if todo:
+                    alerts.append(Alert(PRIORITY_NORMAL, todo))
             alerts += blind_alerts(state, now, watched, started)
             alerts += summary_alert(state, now, bool(contact),
                                     calendar_watch.coming_up(events, now.date()))
@@ -1010,6 +1014,10 @@ def self_test() -> int:
         failures.append("spcx_news.py is missing")
 
     import inspect
+    if "todo_watch.morning(" not in inspect.getsource(watch):
+        failures.append("the watch loop must send the 9:00 to-do list")
+    if todo_watch.self_test.__module__ != "todo_watch":
+        failures.append("todo_watch.py is missing")
     if "spcx_news.digest(" not in inspect.getsource(watch):
         failures.append("the watch loop must send the 07:00 news list")
     if "calendar_reminders(" not in inspect.getsource(watch):

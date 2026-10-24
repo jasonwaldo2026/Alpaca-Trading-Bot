@@ -76,4 +76,6 @@ tools/*.alive
 tools/day_rules_state.json*
 # ibkr_scanner_probe.py's output: this account's scanner list, local only.
 tools/ibkr_scanner_params.xml
+# todo_watch.py's list: Jason's own tasks, local only.
+tools/todo.txt
 !tools/primer/SPCX_primer.pdf
