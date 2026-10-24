@@ -1,0 +1,16 @@
+{
+  "_README": [
+    "Earnings dates as the COMPANY announced them. Enter a date only from",
+    "the company's own announcement (press release, investor-relations page,",
+    "or an SEC filing), and set \"confirmed\": true. time is \"after-close\"",
+    "or \"pre-market\"; leave it out if the announcement does not say.",
+    "Estimates from Nasdaq are used only when no date ahead is listed here,",
+    "and are labelled ESTIMATED everywhere they appear."
+  ],
+  "SPCX": {
+    "earnings": [
+      {"date": "2026-10-20", "time": "after-close", "quarter": "Q3 2026", "confirmed": true,
+       "source": "company release 16 Oct 2026; webcast 3:30 PM CT"}
+    ]
+  }
+}

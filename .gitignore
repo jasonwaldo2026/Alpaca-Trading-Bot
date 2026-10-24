@@ -38,3 +38,44 @@ floats.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Trade records — personal financial data, never committed.
+# daily_report.py reads these if present and draws nothing if not, so a
+# checkout without them still builds every chart.
+#
+# These rules used to name the files: trades*.csv, *_fills.csv and so on.
+# That was backwards. A broker export arrives called whatever the broker
+# felt like -- 9-25-26_Robinhood.csv, 9-25-26_IBKR.xlsx -- and neither of
+# those matched any pattern here, so the real files this tool was written
+# for were the ones it would have let through. The listing is public.
+#
+# So the class is blocked instead of the names, and nothing tracked in
+# tools/ is a spreadsheet or a CSV, so this costs nothing. Add an
+# exception deliberately if that ever changes; the data files that DO
+# belong in version control (notes.json and the two calendars) are JSON
+# and are unaffected.
+tools/*.csv
+tools/*.tsv
+tools/*.xlsx
+tools/*.xlsm
+tools/*.xls
+tools/trades*.json
+tools/*statement*
+tools/*confirmation*
+# Generated reports carry positions and P&L in the header.
+tools/*.pdf
+# darkpool_study.py's download cache: SIP market data, which is licensed
+# for personal use and is not ours to publish.
+tools/darkpool_cache/
+# merger_watch.py's memory and log: local to the PC that runs it.
+tools/merger_watch_state.json*
+tools/merger_watch.log
+# heartbeat.py's "alive" files: which process, and when.
+tools/*.alive
+# day_rules.py's memory: each day's P&L.
+tools/day_rules_state.json*
+# ibkr_scanner_probe.py's output: this account's scanner list, local only.
+tools/ibkr_scanner_params.xml
+# todo_watch.py's list: Jason's own tasks, local only.
+tools/todo.txt
+!tools/primer/SPCX_primer.pdf
