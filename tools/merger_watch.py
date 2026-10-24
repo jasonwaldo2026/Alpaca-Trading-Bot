@@ -24,17 +24,21 @@ How the phone rings:
              - an 8-K "material definitive agreement" that could not be read
              - SPCX or TSLA halted for news
              - any Polymarket date at 90% or more, or settled "Yes"
-  LOUD       - odds up or down 10+ points in a day, or 5+ in an hour
-             - an 8-K "material agreement" that does not name the other
+  LOUD       - an 8-K "material agreement" that does not name the other
              - SPCX or TSLA paused for volatility
              - a source unreachable for 30 minutes ("merger watch is blind")
-  NORMAL     - any other 8-K from either company
+  NORMAL     - odds up or down 15+ points in a day, or 10+ in an hour
+               (LOUD at 10 / 5 until 24 Oct: see JUMP_DAY_POINTS)
+             - any other 8-K from either company
              - a deadline that passed with no announcement
+             - SPCX headlines that can move the stock (spcx_news.py), one
+               sound per topic every 2 hours, silent 10 PM - 7 AM
   SILENT     - the odds at 19:45 ET each day, before the overnight session
 
 The Polymarket markets are small -- a few thousand dollars behind each
 date -- so one bettor can move them. That is why a jump in the odds is
-LOUD and only the filings, halts and a settled market are EMERGENCY.
+only a normal sound and only the filings, halts and a settled market are
+EMERGENCY.
 
 Read-only. It reads public pages: no account, no order, no bet. There is
 no trading client in this file.
@@ -130,8 +134,12 @@ VOLATILITY_HALTS = {"LUDP": "volatility pause", "LUDS": "volatility pause",
                     "M": "volatility pause"}
 
 #: Odds moves, in percentage points, that make the phone ring.
-JUMP_DAY_POINTS = 10.0
-JUMP_HOUR_POINTS = 5.0
+#: Raised from 10 / 5 on 24 Oct 2026, and the ring turned from LOUD to
+#: normal: in the week to then, nine alarms were 5-8 point moves that the
+#: same few bettors reversed within the hour. An announcement moves these
+#: markets 30-50 points, and the filing and halt alarms ring with it.
+JUMP_DAY_POINTS = 15.0
+JUMP_HOUR_POINTS = 10.0
 #: Once a jump has rung, the same market and direction rings again only
 #: after this long -- or sooner, if the odds move another full day-step.
 JUMP_QUIET = timedelta(hours=6)
@@ -339,7 +347,7 @@ def polymarket_alerts(markets: List[Market], state: dict, now: datetime) -> List
             if not quiet:
                 state["rung"][key] = [_iso(now), m.yes_pct]
                 word = "UP" if direction == "up" else "DOWN"
-                alerts.append(Alert(PRIORITY_LOUD,
+                alerts.append(Alert(PRIORITY_NORMAL,
                     f"Merger odds {word} {points:.0f} points in {span} for "
                     f"{m.label}: now {m.yes_pct:.0f}%.\n"
                     f"Small market: a few bettors can move it. Check the news.\n{page}"))
@@ -760,25 +768,30 @@ def self_test() -> int:
             ("Dec 31, 2026", 28.5, False), ("Jun 30, 2027", 40.0, True)]:
         failures.append(f"Polymarket parsed wrong: {parsed}")
 
-    # A 10-point day jump rings once; a smaller wobble does not; another
-    # full step inside the quiet period rings again.
+    # A 15-point day jump rings once, at normal priority; a smaller wobble
+    # does not; another full step inside the quiet period rings again.
     s = new_state()
     polymarket_alerts([market("m", 30)], s, t0)
-    if polymarket_alerts([market("m", 39)], s, t0 + timedelta(hours=20)):
-        failures.append("a 9-point move should not ring")
-    a = polymarket_alerts([market("m", 41)], s, t0 + timedelta(hours=21))
-    if len(a) != 1 or a[0].priority != PRIORITY_LOUD or "UP 11" not in a[0].message:
-        failures.append(f"a 11-point day jump should ring once, loud: {a}")
-    if polymarket_alerts([market("m", 44)], s, t0 + timedelta(hours=22)):
+    if polymarket_alerts([market("m", 44)], s, t0 + timedelta(hours=20)):
+        failures.append("a 14-point day move should not ring")
+    a = polymarket_alerts([market("m", 46)], s, t0 + timedelta(hours=21))
+    if len(a) != 1 or a[0].priority != PRIORITY_NORMAL or "UP 16" not in a[0].message:
+        failures.append(f"a 16-point day jump should ring once, normal: {a}")
+    if polymarket_alerts([market("m", 50)], s, t0 + timedelta(hours=22)):
         failures.append("a smaller follow-on move inside the quiet period should not ring")
-    if not polymarket_alerts([market("m", 52)], s, t0 + timedelta(hours=23)):
-        failures.append("another 10 points inside the quiet period should ring")
+    if not polymarket_alerts([market("m", 62)], s, t0 + timedelta(hours=23)):
+        failures.append("another 15 points inside the quiet period should ring")
 
     s = new_state()
     polymarket_alerts([market("h", 50)], s, t0)
-    a = polymarket_alerts([market("h", 44)], s, t0 + timedelta(minutes=40))
-    if len(a) != 1 or "DOWN 6" not in a[0].message or "an hour" not in a[0].message:
-        failures.append(f"a 6-point drop within the hour should ring: {a}")
+    a = polymarket_alerts([market("h", 39)], s, t0 + timedelta(minutes=40))
+    if len(a) != 1 or "DOWN 11" not in a[0].message or "an hour" not in a[0].message:
+        failures.append(f"an 11-point drop within the hour should ring: {a}")
+    # 24 Oct's whipsaw: 28 -> 20 -> 26 -> 18 over three hours, nothing rings.
+    s = new_state()
+    for minutes, pct in ((0, 28), (35, 20), (60, 26), (165, 18)):
+        if polymarket_alerts([market("w", pct)], s, t0 + timedelta(minutes=minutes)):
+            failures.append(f"5-8 point back-and-forth must stay quiet (at {pct}%)")
     if polymarket_alerts([market("new", 80)], new_state(), t0):
         failures.append("the first reading has nothing to jump from")
 
@@ -978,7 +991,8 @@ def self_test() -> int:
         except RuntimeError:
             pass
         # IB Gateway up, every web feed down: IBKR alone carries the check.
-        dj = spcx_news.Headline("SpaceX files for share offering", "", "Dow Jones",
+        # (a different topic from the offering above, which rang already)
+        dj = spcx_news.Headline("Analyst downgrades SpaceX", "", "Dow Jones",
                                 datetime(2026, 10, 23, 12, 20, tzinfo=timezone.utc), tagged=True)
         got = news_check(s, news_now, ibkr=FakeIbkr([dj]),
                          get=lambda url, headers: (_ for _ in ()).throw(OSError("down")))

@@ -20,6 +20,9 @@ and sends:
            digest) -- it sits in the tray to be read when you look
   NORMAL   a headline with a word that can move the stock at the open:
            offering, downgrade, halt, lawsuit, unlock, guidance...
+           One sound per topic every 2 hours, and none 10 PM - 7 AM: the
+           rest of those arrive silently, still marked SPCX NEWS (24 Oct:
+           17 sounds in a day, most of them one story from five outlets).
   NORMAL   07:00 ET, weekdays: everything since the last regular close
            (Friday 4 PM for a Monday), the big ones first
 
@@ -79,6 +82,10 @@ MERGER_MOVES = ("talks", "deal", "agreement", "agree", "agreed", "announce",
                 # face antitrust scrutiny".
                 "approval", "sign-off", "antitrust", "scrutiny")
 PER_CHECK = 6
+#: A topic ("merger talks", "upgrade") makes a sound at most this often.
+TOPIC_EVERY = timedelta(hours=2)
+#: No news sounds overnight; the 07:00 list carries what came in.
+QUIET_FROM, QUIET_UNTIL = time(22, 0), time(7, 0)
 FRESH = timedelta(hours=12)
 KEEP = timedelta(days=4)
 SEEN_KEEP = 1500
@@ -275,6 +282,16 @@ def _clock(when: datetime, tz) -> str:
     return f"{when.astimezone(tz):%a %I:%M %p}".replace(" 0", " ")
 
 
+def quiet_hours(now: datetime) -> bool:
+    t = now.time()
+    return t >= QUIET_FROM or t < QUIET_UNTIL
+
+
+def topic(word: str) -> str:
+    """'upgrades' and 'upgrade' are one topic; so are 'bonds' and 'bond'."""
+    return word[:-1] if word.endswith("s") and not word.endswith("ss") else word
+
+
 def check(items: List[Headline], state: dict, now: datetime) -> List[Tuple[bool, str]]:
     """New headlines as (big, message). Remembers every one it sees, and
     keeps the recent ones for the morning digest."""
@@ -282,8 +299,9 @@ def check(items: List[Headline], state: dict, now: datetime) -> List[Tuple[bool,
     recent: list = state.setdefault("spcx_news", [])
     first = not state.get("spcx_news_primed", False)
     seen_set = set(seen)
+    rang: dict = state.setdefault("spcx_news_rang", {})
     out: List[Tuple[bool, str]] = []
-    held = 0
+    held = plain = 0
     for h in sorted(items, key=lambda h: h.when or now):
         k = key(h.title)
         if not k or k in seen_set:
@@ -300,8 +318,14 @@ def check(items: List[Headline], state: dict, now: datetime) -> List[Tuple[bool,
         by = f"{h.source}, " if h.source else ""
         link = f"\n{h.link}" if h.link else ""
         if word:
-            out.append((True, f"SPCX NEWS ({word}): {h.title} ({by}{stamp}){link}"))
-        elif len([1 for big, _ in out if not big]) < PER_CHECK:
+            last = rang.get(topic(word))
+            sound = not quiet_hours(now) and (
+                last is None or now - datetime.fromisoformat(last) >= TOPIC_EVERY)
+            if sound:
+                rang[topic(word)] = now.isoformat()
+            out.append((sound, f"SPCX NEWS ({word}): {h.title} ({by}{stamp}){link}"))
+        elif plain < PER_CHECK:
+            plain += 1
             out.append((False, f"SPCX news: {h.title} ({by}{stamp}){link}"))
         else:
             held += 1
@@ -393,7 +417,7 @@ def self_test() -> int:
         ok(big_word(title) is None, f"not merger news for us: {title}")
     ok(big_word("Dr. Faaris on SpaceX") is None, "whole words only")
 
-    now = datetime(2026, 10, 23, 4, 0, tzinfo=et)            # Friday, 4 AM
+    now = datetime(2026, 10, 23, 10, 0, tzinfo=et)           # Friday, 10 AM
     state: dict = {}
     ok(check(items, state, now) == [], "the first check only learns what is out")
     newer = parse(b"""<rss><channel>
@@ -409,7 +433,7 @@ def self_test() -> int:
 <item><title>Tesla deliveries beat</title><link>https://y/7</link>
 <pubDate>Fri, 23 Oct 2026 08:05:00 +0000</pubDate></item>
 </channel></rss>""")
-    later = datetime(2026, 10, 23, 4, 20, tzinfo=et)
+    later = datetime(2026, 10, 23, 10, 20, tzinfo=et)
     said = check(newer, state, later)
     ok(len(said) == 2, f"two new SPCX stories, not the repeat, the old one or Tesla: {said}")
     ok(said[0] == (False, "SPCX news: Starlink adds airline (Fri 4:05 AM)\nhttps://y/5"),
@@ -477,7 +501,43 @@ def self_test() -> int:
     ok(len(said) == 2 and said[0][1] == "SPCX NEWS (merger talks): SpaceX Weighs Merger "
        "Terms With Tesla (Dow Jones, Fri 4:45 AM)", f"an update is not a new story; no "
        f"empty link line: {said}")
-    ok(said[1][0] and "(price target)" in said[1][1], f"Briefing's analyst action is big: {said}")
+    ok(said[1][1].startswith("SPCX NEWS (price target)") and said[1][0] is False,
+       f"Briefing's analyst action is big, but a price target rang 20 minutes ago, "
+       f"so it comes silently: {said}")
+
+    # One sound per topic every 2 hours; none overnight.
+    def big_item(title, mins):
+        return Headline(title, "l", "", datetime(2026, 10, 23, 14, mins, tzinfo=timezone.utc),
+                        tagged=True)
+    from datetime import timezone
+
+    st = {"spcx_news_primed": True}
+    noon = datetime(2026, 10, 23, 12, 0, tzinfo=et)
+    said = check([big_item("SpaceX-Tesla merger talks advance", 1),
+                  big_item("SpaceX and Tesla boards in merger talks", 2),
+                  big_item("Analyst upgrades SpaceX", 3)], st, noon)
+    ok([s for s, _ in said] == [True, False, True],
+       f"the second merger story in a check is silent, an upgrade still rings: {said}")
+    said = check([big_item("Tesla merger talks: what we know", 4)], st,
+                 noon + timedelta(hours=1, minutes=59))
+    ok(said and said[0][0] is False and said[0][1].startswith("SPCX NEWS (merger talks)"),
+       f"inside 2 hours: silent, still marked: {said}")
+    said = check([big_item("Tesla merger talks resume", 5)], st, noon + timedelta(hours=2))
+    ok(said and said[0][0] is True, f"after 2 hours the topic rings again: {said}")
+    said = check([big_item("Another analyst upgrade for SpaceX", 6)], st,
+                 noon + timedelta(hours=1))
+    ok(said and said[0][0] is False, f"'upgrade' and 'upgrades' are one topic: {said}")
+    def at(h, m):
+        when = datetime(2026, 10, 24, h, m, tzinfo=et)
+        item = Headline(f"SpaceX prices offering {h}{m}", "l", "", when - timedelta(minutes=10))
+        return check([item], {"spcx_news_primed": True}, when)
+
+    for h, m in ((22, 0), (3, 30), (6, 59)):
+        quiet = at(h, m)
+        ok(quiet and quiet[0][0] is False, f"no sound at {h}:{m:02d}: {quiet}")
+    ok(at(7, 0)[0][0] is True and at(21, 59)[0][0] is True, "7:00 AM to 9:59 PM ring")
+    ok(topic("upgrades") == "upgrade" and topic("bonds") == "bond" and topic("faa") == "faa",
+       "topics")
 
     # The 07:00 digest.
     ok(digest(state, datetime(2026, 10, 23, 6, 59, tzinfo=et)) is None, "not before 7")
