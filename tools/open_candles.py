@@ -434,10 +434,11 @@ LOUD_PERCENT_EVENING: float = 0.5
 #: LOUD_PERCENT rule above and the persistent first ring.
 PRICE_RINGS_AUDIBLE: bool = False
 #: ...except a climb in DOLLARS (25 Oct, Jason: "easy money"). A rise of
-#: this much off the climb's low, on finished one-minute closes, sounds an
-#: alarm that repeats until acknowledged. Further steps of the same climb
-#: arrive quietly; a fall of the same size off the climb's high ends it,
-#: and the next rise is a new climb. See UpMove.
+#: this much off the climb's low, on finished one-minute closes, rings once
+#: -- and the FIRST climb of each session outside regular hours (pre-market,
+#: after the close, overnight) repeats until acknowledged. Further steps of
+#: the same climb arrive quietly; a fall of the same size off the climb's
+#: high ends it, and the next rise is a new climb. See UpMove.
 UP_MOVE_REGULAR: float = 0.75        # 09:30-16:00
 UP_MOVE_OUTSIDE: float = 0.50        # pre-market, after hours, overnight
 
@@ -1663,16 +1664,35 @@ def up_move_step(at: datetime) -> float:
     return UP_MOVE_REGULAR if regular else UP_MOVE_OUTSIDE
 
 
+PREMARKET_OPEN = time(4, 0)
+
+
+def up_session(at: datetime) -> Optional[Tuple[str, date]]:
+    """The session outside regular hours this minute belongs to, as
+    (name, the date it began), or None in regular hours. Overnight runs
+    from 20:00 to the next pre-market, and belongs to the evening it began."""
+    t = at.time()
+    if REGULAR_OPEN <= t < REGULAR_CLOSE:
+        return None
+    if PREMARKET_OPEN <= t < REGULAR_OPEN:
+        return "pre-market", at.date()
+    if REGULAR_CLOSE <= t < OVERNIGHT_START:
+        return "after the close", at.date()
+    began = at.date() if t >= OVERNIGHT_START else at.date() - timedelta(days=1)
+    return "overnight", began
+
+
 @dataclass
 class UpMove:
     """A climb in dollars. See UP_MOVE_REGULAR.
 
     Waiting, it tracks the lowest close. A rise of a step off it starts a
-    climb: (True, message), the one that sounds. While the climb lasts,
-    each further step above the last alert is (False, message), quiet. A
-    fall of a step off the climb's high ends it, and that close is the new
-    low. Steps compare in whole cents, so a 75-cent rise in floating point
-    is never 74.9999.
+    climb: ("urgent", message) for the first climb of a session outside
+    regular hours, ("ring", message) for any other. While the climb lasts,
+    each further step above the last alert is ("quiet", message). A fall
+    of a step off the climb's high ends it, and that close is the new low.
+    Steps compare in whole cents, so a 75-cent rise in floating point is
+    never 74.9999.
     """
 
     symbol: str = SYMBOL
@@ -1681,8 +1701,10 @@ class UpMove:
     climbing: bool = False
     high: float = 0.0
     last: float = 0.0                   # the close at the last alert
+    #: Sessions whose first climb has already been urgent.
+    urged: set = field(default_factory=set)
 
-    def update(self, at: datetime, close: float) -> Optional[Tuple[bool, str]]:
+    def update(self, at: datetime, close: float) -> Optional[Tuple[str, str]]:
         step = up_move_step(at)
 
         def cents(x: float) -> float:
@@ -1699,7 +1721,7 @@ class UpMove:
                 return None
             if cents(close - self.last) >= step:
                 self.last = close
-                return (False, f"{self.symbol} still climbing: now {money(close)}, up "
+                return ("quiet", f"{self.symbol} still climbing: now {money(close)}, up "
                                f"${close - self.low:.2f} from the {self.low_at:%H:%M} low "
                                f"of {money(self.low)}")
             return None
@@ -1708,18 +1730,24 @@ class UpMove:
             return None
         if cents(close - self.low) >= step:
             self.climbing, self.high, self.last = True, close, close
-            return (True, f"{self.symbol} UP ${close - self.low:.2f} from the "
-                          f"{self.low_at:%H:%M} low of {money(self.low)}, now {money(close)}\n"
-                          f"{PERSIST_NOTE}")
+            text = (f"{self.symbol} UP ${close - self.low:.2f} from the "
+                    f"{self.low_at:%H:%M} low of {money(self.low)}, now {money(close)}")
+            session = up_session(at)
+            if session is not None and session not in self.urged:
+                self.urged.add(session)
+                return ("urgent", f"{text}\nFirst climb {session[0]}. {PERSIST_NOTE}")
+            return ("ring", text)
         return None
 
 
-def up_out(up: Tuple[bool, str], climb_sound: str) -> Tuple[str, int, Optional[str]]:
-    """(message, priority, sound) for an UpMove alert: the first of a climb
-    repeats until acknowledged; the rest of it is quiet."""
-    first, text = up
-    if first:
+def up_out(up: Tuple[str, str], climb_sound: str) -> Tuple[str, int, Optional[str]]:
+    """(message, priority, sound) for an UpMove alert: urgent repeats until
+    acknowledged, ring sounds once through a focus mode, quiet is quiet."""
+    kind, text = up
+    if kind == "urgent":
         return text, PRIORITY_EMERGENCY, climb_sound
+    if kind == "ring":
+        return text, PRIORITY_SUMMARY, climb_sound
     return text, PRIORITY_UPDATE, None
 
 
@@ -2966,8 +2994,8 @@ def overnight_checks() -> List[str]:
 
     # As shipped (25 Oct): the same night still sends every ring, all quiet,
     # except the dollar climb: $146.03 -> $146.80 at 20:05 is +$0.77, past
-    # the $0.50 outside regular hours, an alarm until acknowledged; 20:10's
-    # $147.60 is the next step of the same climb, quiet.
+    # the $0.50 outside regular hours and the night's first climb, an alarm
+    # until acknowledged; 20:10's $147.60 is the same climb's next step, quiet.
     sent = night(prices, started_at=at(*sun, 20, 0), evening=LOUD_PERCENT_EVENING)
     rings = [s for s in sent if not s.title.endswith(" UP")]
     ups = [(s.title[5:10], s.priority, s.sound) for s in sent if s.title.endswith(" UP")]
@@ -2975,17 +3003,18 @@ def overnight_checks() -> List[str]:
         failures.append(f"price rings arrive, with no sound: "
                         f"{[(s.title[5:10], s.priority, s.sound) for s in rings]}")
     if ups != [("20:05", PRIORITY_EMERGENCY, "climb"), ("20:10", PRIORITY_UPDATE, None)]:
-        failures.append(f"overnight, a $0.77 climb is an alarm, its next step quiet: {ups}")
+        failures.append(f"overnight, a $0.77 first climb is an alarm, its next step quiet: {ups}")
     up_text = [s.message for s in sent if s.title.endswith(" UP")][0]
-    if not up_text.startswith("SPCX UP $0.77 from the 20:00 low of $146.03, now $146.80") \
-            or PERSIST_NOTE not in up_text:
-        failures.append(f"the up alarm says where from and how to stop it: {up_text!r}")
+    if not up_text.startswith("SPCX UP $0.77 from the 20:00 low of $146.03, now $146.80\n"
+                              "First climb overnight.") or PERSIST_NOTE not in up_text:
+        failures.append(f"the up alarm says where from, which session, and how to stop it: "
+                        f"{up_text!r}")
     if any(s.title.endswith(" UP") for s in night(prices, started_at=at(*sun, 20, 20))):
         failures.append("a late start must not sound for a climb that closed before it")
 
     # --- 25 Oct: the dollar climb (UpMove) -------------------------------
-    def climb(prices, start=(10, 0)):
-        u, out = UpMove(), []
+    def climb(prices, start=(10, 0), u=None):
+        u, out = u or UpMove(), []
         t0 = datetime(2026, 10, 26, *start, tzinfo=ET)
         for i, p in enumerate(prices):
             got = u.update(t0 + timedelta(minutes=i), p)
@@ -2994,40 +3023,54 @@ def overnight_checks() -> List[str]:
         return out
     if climb([146.20, 146.94]) or climb([146.20, 145.80, 146.54]):
         failures.append("74 cents off the low is not a climb in regular hours")
-    if climb([146.20, 146.95]) != [(1, True)] or climb([146.20, 145.80, 146.55]) != [(2, True)]:
-        failures.append(f"75 cents off the low sounds: {climb([146.20, 146.95])}")
-    if climb([146.20, 146.70], start=(16, 0)) != [(1, True)] \
-            or climb([146.20, 146.70], start=(9, 0)) != [(1, True)] \
+    if climb([146.20, 146.95]) != [(1, "ring")] or climb([146.20, 145.80, 146.55]) != [(2, "ring")]:
+        failures.append(f"75 cents off the low rings, once, in regular hours: {climb([146.20, 146.95])}")
+    if climb([146.20, 146.70], start=(16, 0)) != [(1, "urgent")] \
+            or climb([146.20, 146.70], start=(9, 0)) != [(1, "urgent")] \
             or climb([146.20, 146.69], start=(9, 0)):
-        failures.append("outside regular hours, pre-market too, 50 cents sounds")
+        failures.append("outside regular hours, pre-market too, 50 cents is the first climb")
     if up_move_step(datetime(2026, 10, 26, 9, 30)) != 0.75 \
             or up_move_step(datetime(2026, 10, 26, 15, 59)) != 0.75 \
             or up_move_step(datetime(2026, 10, 26, 16, 0)) != 0.50:
         failures.append("regular hours are 09:30 to 16:00")
     run = [146.20, 146.95, 147.30, 147.70, 148.45]
-    if climb(run) != [(1, True), (3, False), (4, False)]:
+    if climb(run) != [(1, "ring"), (3, "quiet"), (4, "quiet")]:
         failures.append(f"the rest of a climb is quiet, a step at a time: {climb(run)}")
     again = [146.20, 146.95, 147.40, 146.66, 146.30, 147.05]
-    if climb(again) != [(1, True), (5, True)]:
-        failures.append(f"a fall of 74 cents off the high is not the end; "
-                        f"a new rise off the new low sounds again: {climb(again)}")
-    if climb([3.35, 4.10]) != [(1, True)]:      # 4.10 - 3.35 is 0.7499999... in floats
+    if climb(again) != [(1, "ring"), (5, "ring")]:
+        failures.append(f"a new rise off the new low rings again: {climb(again)}")
+    evening = [146.20, 146.70, 146.10, 146.60, 146.00, 146.50]
+    if climb(evening, start=(17, 0)) != [(1, "urgent"), (3, "ring"), (5, "ring")]:
+        failures.append(f"only the session's first climb must be tapped: {climb(evening, start=(17, 0))}")
+    u = UpMove()
+    climb([146.20, 146.70], start=(9, 20), u=u)               # pre-market's first
+    late = climb([146.10, 146.60], start=(16, 30), u=u)        # after the close's first
+    if late != [(1, "urgent")]:
+        failures.append(f"each session outside regular hours has its own first climb: {late}")
+    for when, want in (((4, 0), ("pre-market", date(2026, 10, 26))), ((9, 30), None),
+                       ((15, 59), None), ((16, 0), ("after the close", date(2026, 10, 26))),
+                       ((20, 0), ("overnight", date(2026, 10, 26))),
+                       ((3, 49), ("overnight", date(2026, 10, 25)))):
+        if up_session(datetime(2026, 10, 26, *when)) != want:
+            failures.append(f"{when} is in {want}: {up_session(datetime(2026, 10, 26, *when))}")
+    if climb([3.35, 4.10]) != [(1, "ring")]:      # 4.10 - 3.35 is 0.7499999... in floats
         failures.append("75 cents is compared in cents, not floating point")
-    if climb([146.20, 146.95, 147.40, 146.60, 147.00]) != [(1, True)]:
+    if climb([146.20, 146.95, 147.40, 146.60, 147.00]) != [(1, "ring")]:
         failures.append("a climb's end is the new low: 40 cents off it is not a climb")
-    if climb([146.20, 146.95, 147.40, 146.66, 147.41]) != [(1, True)]:
+    if climb([146.20, 146.95, 147.40, 146.66, 147.41]) != [(1, "ring")]:
         failures.append("74 cents back off the high does not end the climb")
     if climb([148.0, 147.0, 146.0, 145.0]):
         failures.append("a fall never sounds")
+    if up_out(("urgent", "x"), "climb") != ("x", PRIORITY_EMERGENCY, "climb") \
+            or up_out(("ring", "z"), "climb") != ("z", PRIORITY_SUMMARY, "climb") \
+            or up_out(("quiet", "y"), "climb") != ("y", PRIORITY_UPDATE, None):
+        failures.append("urgent repeats until acknowledged, ring sounds once, quiet is quiet")
     from inspect import getsource
     for fn in (run_live, run_overnight):
         source = getsource(fn)
         if "upmove.update(stamp, minute.close)" not in source or "up_out(up," not in source \
                 or "if up and fresh and not backlog:" not in source:
             failures.append(f"{fn.__name__} must feed every minute to the up alarm and send it")
-    if up_out((True, "x"), "climb") != ("x", PRIORITY_EMERGENCY, "climb") \
-            or up_out((False, "y"), "climb") != ("y", PRIORITY_UPDATE, None):
-        failures.append("the first of a climb repeats until acknowledged; the rest is quiet")
 
     # A bar still being built is never read: its spike may not last.
     if night([close] * 20, started_at=at(*sun, 20, 0), forming=close * 1.02):
