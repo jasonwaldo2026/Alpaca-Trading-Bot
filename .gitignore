@@ -78,4 +78,6 @@ tools/day_rules_state.json*
 tools/ibkr_scanner_params.xml
 # todo_watch.py's list: Jason's own tasks, local only.
 tools/todo.txt
+# day_plan.py's day sheets and log: local only.
+tools/daily/
 !tools/primer/SPCX_primer.pdf

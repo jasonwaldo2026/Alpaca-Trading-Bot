@@ -608,6 +608,28 @@ def news_check(state: dict, now: datetime, get=None, ibkr=None) -> List[Alert]:
             for big, text in spcx_news.check(items, state, now)]
 
 
+_PLAN_ERROR = {"last": ""}
+
+
+def plan_tick(now: datetime, events: list, todo: Optional[str]) -> List[Alert]:
+    """The SPCX day plan (day_plan.py): set-ups, the flush alert, the
+    debrief. Whatever goes wrong there is logged once and never stops the
+    merger alarms; the flush alert is the plan's only LOUD text."""
+    try:
+        import day_plan
+
+        said = day_plan.tick(now, events, todo_text=todo)
+        _PLAN_ERROR["last"] = ""
+        return [Alert(PRIORITY_LOUD if priority > 0 else PRIORITY_NORMAL, text)
+                for priority, text in said]
+    except Exception as exc:  # noqa: BLE001
+        why = f"{type(exc).__name__}: {str(exc)[:120]}"
+        if why != _PLAN_ERROR["last"]:
+            _PLAN_ERROR["last"] = why
+            log(f"day plan: {why}")
+        return []
+
+
 def calendar_events(state: dict, now: datetime) -> List["calendar_watch.Event"]:
     raw = state.get("earnings_estimate")
     estimate = date.fromisoformat(raw) if raw else None
@@ -700,6 +722,7 @@ def watch(dry_run: bool, once: bool, state_path: str) -> int:
                 todo = todo_watch.morning(state, now, events)
                 if todo:
                     alerts.append(Alert(PRIORITY_NORMAL, todo))
+                alerts += plan_tick(now, events, todo)
             alerts += blind_alerts(state, now, watched, started)
             alerts += summary_alert(state, now, bool(contact),
                                     calendar_watch.coming_up(events, now.date()))
@@ -1014,6 +1037,33 @@ def self_test() -> int:
         failures.append("spcx_news.py is missing")
 
     import inspect
+    # The day plan: its texts pass through, the flush alert loud; a failure
+    # inside it is logged and the watch carries on.
+    import types as _types
+    real_plan = sys.modules.get("day_plan")
+    try:
+        sys.modules["day_plan"] = _types.SimpleNamespace(
+            tick=lambda now, events, todo_text=None: [(0, "SPCX zones for today"), (1, "SPCX FLUSH")])
+        got = plan_tick(t0, [], None)
+        if [a.priority for a in got] != [PRIORITY_NORMAL, PRIORITY_LOUD]:
+            failures.append(f"the plan's texts pass through, the flush loud: {got}")
+
+        def broken(now, events, todo_text=None):
+            raise KeyError("no bars")
+        sys.modules["day_plan"] = _types.SimpleNamespace(tick=broken)
+        saved_log, LOG_PATH = LOG_PATH, os.devnull
+        try:
+            if plan_tick(t0, [], None) != []:
+                failures.append("a failing day plan sends nothing and does not raise")
+        finally:
+            LOG_PATH = saved_log
+    finally:
+        if real_plan is not None:
+            sys.modules["day_plan"] = real_plan
+        else:
+            sys.modules.pop("day_plan", None)
+    if "plan_tick(" not in inspect.getsource(watch):
+        failures.append("the watch loop must run the day plan")
     if "todo_watch.morning(" not in inspect.getsource(watch):
         failures.append("the watch loop must send the 9:00 to-do list")
     if todo_watch.self_test.__module__ != "todo_watch":
