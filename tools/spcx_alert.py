@@ -53,6 +53,7 @@ on exactly the objects the study measured.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sqlite3
@@ -348,7 +349,8 @@ def _multipart(fields: dict, image_path: str) -> tuple:
 def send_pushover(message: str, title: str = "SPCX setup",
                   priority: int = 0,
                   attachment: Optional[str] = None,
-                  sound: Optional[str] = None) -> Optional[str]:
+                  sound: Optional[str] = None,
+                  html: bool = False) -> Optional[str]:
     """Deliver to the phone. Returns an error string, or None on success.
 
     Priority -1 arrives without a sound or vibration -- it sits in the
@@ -361,6 +363,9 @@ def send_pushover(message: str, title: str = "SPCX setup",
     `sound` names one of Pushover's built-in sounds, or a custom sound
     uploaded to the account that owns the app token. It only matters at
     priority 0 and above; at -1 nothing plays whatever is asked for.
+
+    `html` lets the message carry tappable <a href> links (and <b>); the
+    caller escapes everything else.
     """
     token = os.getenv("PUSHOVER_APP_TOKEN", "").strip()
     user = os.getenv("PUSHOVER_USER_KEY", "").strip()
@@ -374,6 +379,8 @@ def send_pushover(message: str, title: str = "SPCX setup",
         # default for this application. Naming one overrides it, which is
         # the point: the sound is carrying the direction.
         fields["sound"] = sound
+    if html:
+        fields["html"] = "1"
     fields.update(emergency_fields(priority))
 
     usable = (attachment and os.path.exists(attachment)
@@ -864,6 +871,32 @@ def self_test() -> int:
         devices, error = registered_devices()   # returns before any network call
         if devices is not None or not error:
             failures.append("registered_devices() should report an error when no key is set")
+
+        # html=True asks Pushover for its html mode (tappable links); the
+        # default does not. Captured, never sent.
+        os.environ["PUSHOVER_APP_TOKEN"] = os.environ["PUSHOVER_USER_KEY"] = "test"
+        sent, real_open = [], urllib.request.urlopen
+
+        class Answer(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def capture(request, timeout=None):
+            sent.append(urllib.parse.parse_qs(request.data.decode()))
+            return Answer(b'{"status": 1}')
+        urllib.request.urlopen = capture
+        try:
+            send_pushover("a", html=True)
+            send_pushover("b")
+        finally:
+            urllib.request.urlopen = real_open
+        if [x.get("html") for x in sent] != [["1"], None]:
+            failures.append(f"html=True should send html=1, and only then: {[x.get('html') for x in sent]}")
+        for name in ("PUSHOVER_APP_TOKEN", "PUSHOVER_USER_KEY"):
+            os.environ.pop(name, None)
     finally:
         for name, value in saved.items():
             if value is not None:

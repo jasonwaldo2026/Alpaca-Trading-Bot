@@ -428,6 +428,11 @@ LOUD_PERCENT: float = 1.0
 #: first hour -- and after hours, with no stop working, is when hearing
 #: about it matters most. Pre-market keeps the day's LOUD_PERCENT.
 LOUD_PERCENT_EVENING: float = 0.5
+#: Price rings make no sound (25 Oct): the phone sounds for the 9:00 to-do
+#: list, the 9:20 set-up, the flush buy and a major event, all sent by the
+#: merger watch. Every ring still arrives, quietly. True puts back the
+#: LOUD_PERCENT rule above and the persistent first ring.
+PRICE_RINGS_AUDIBLE: bool = False
 
 
 def loud_threshold(at: datetime, day: float = LOUD_PERCENT,
@@ -474,7 +479,7 @@ def pulse(now: Optional[datetime] = None) -> None:
     if _watch is None:
         return
     for loud, text in _watch.beat(now or datetime.now(ET)):
-        status = deliver(text, "WATCHDOG", PRIORITY_SUMMARY if loud else 0, False)
+        status = deliver(text, "WATCHDOG", PRIORITY_UPDATE, False)
         print(f"  {datetime.now(ET):%H:%M}  WATCHDOG: {text}  [{status}]")
 
 
@@ -1821,7 +1826,8 @@ def market_push(alarm: "MarketAlarm", why: str, change_pct: Optional[float]
     if alarm.urgent:
         return (body + "\nRepeats every minute until you tap Acknowledge.",
                 PRIORITY_EMERGENCY)
-    return body, PRIORITY_SUMMARY
+    # Short of the -2% emergency, quiet (25 Oct): see PRICE_RINGS_AUDIBLE.
+    return body, PRIORITY_UPDATE
 
 
 def market_policy(alarm: "MarketAlarm") -> str:
@@ -2172,7 +2178,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
                 if market_open:
                     open_called = True
                     text = opening_call(100.0 * (market_open - market_prev) / market_prev)
-                    status = deliver(text, "S&P 500 open", 0, dry_run)
+                    status = deliver(text, "S&P 500 open", PRIORITY_UPDATE, dry_run)
                     print(f"  {now:%H:%M}  {text}  [{status}]\n")
             elif not open_called and now.time() > OPEN_CALL_LATEST:
                 if now.time() < REGULAR_CLOSE and window_start.time() <= OPEN_CALL_AT:
@@ -2307,7 +2313,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
         print(text)
         if not rings_only:
             print("\n[summary push: "
-                  f"{deliver(text, f'{symbol} morning', PRIORITY_SUMMARY, dry_run)}]")
+                  f"{deliver(text, f'{symbol} morning', PRIORITY_UPDATE, dry_run)}]")
     else:
         print("No candles collected.")
     return 0
@@ -2496,6 +2502,8 @@ def ring_out(moved: Optional[Tuple[str, str]], call: Optional[Tuple[str, str]],
     to say how to make it stop. Shared by day and night, so the two can
     never disagree about what a ring sounds like.
     """
+    if not PRICE_RINGS_AUDIBLE:
+        return None, PRIORITY_UPDATE, message
     buy_sound, sell_sound, climb_sound, falling_sound = sounds
     if moved:
         sound = climb_sound if moved[0] == "up" else falling_sound
@@ -2575,7 +2583,7 @@ def run_overnight(symbol: str, night_start: datetime, night_end: datetime,
                     blind = False
                     status = send(f"IB Gateway is answering again. Overnight "
                                   f"{symbol} alarms are back on.",
-                                  f"{symbol} overnight", 0, dry_run)
+                                  f"{symbol} overnight", PRIORITY_UPDATE, dry_run)
                     print(f"  {now:%H:%M}  gateway back  [{status}]")
             except Exception as exc:  # noqa: BLE001 -- one bad pass is not the night
                 reason = f"{type(exc).__name__}: {str(exc)[:100]}"
@@ -2588,7 +2596,7 @@ def run_overnight(symbol: str, night_start: datetime, night_end: datetime,
                         f"minutes ({reason}). Overnight {symbol} alarms are BLIND "
                         f"until it does. Log IB Gateway back in. A login to IBKR "
                         f"on the phone or in DAS with the same username logs it out.",
-                        f"{symbol} overnight BLIND", PRIORITY_SUMMARY, dry_run)
+                        f"{symbol} overnight BLIND", PRIORITY_UPDATE, dry_run)
                     print(f"  {now:%H:%M}  ** overnight alarms blind **  [{status}]")
 
             done = drop_forming(frame, now, 1)
@@ -2797,6 +2805,9 @@ def overnight_checks() -> List[str]:
             failures.append("the gateway connection should be closed at the end")
         return sent
 
+    # The audible rule below is kept for PRICE_RINGS_AUDIBLE = True.
+    saved_audible = globals()["PRICE_RINGS_AUDIBLE"]
+    globals()["PRICE_RINGS_AUDIBLE"] = True
     # Flat at the close; +0.5% at 20:05, which reaches the phone SILENTLY
     # (under LOUD_PERCENT); +1.1% at 20:10, the first major move up, an
     # emergency on the first bar that earns it; then a slide to -0.6%
@@ -2862,6 +2873,13 @@ def overnight_checks() -> List[str]:
     if not sent or sent[0].title[5:10] != "20:05" or sent[0].priority != PRIORITY_EMERGENCY:
         failures.append(f"--loud-percent 0 makes the 0.5% ring audible again: "
                         f"{[(s.title[5:10], s.priority) for s in sent]}")
+    globals()["PRICE_RINGS_AUDIBLE"] = saved_audible
+
+    # As shipped (25 Oct): the same night still sends every ring, all quiet.
+    sent = night(prices, started_at=at(*sun, 20, 0), evening=LOUD_PERCENT_EVENING)
+    if len(sent) < 3 or any(s.priority != PRIORITY_UPDATE or s.sound for s in sent):
+        failures.append(f"price rings arrive, with no sound: "
+                        f"{[(s.title[5:10], s.priority, s.sound) for s in sent]}")
 
     # A bar still being built is never read: its spike may not last.
     if night([close] * 20, started_at=at(*sun, 20, 0), forming=close * 1.02):
@@ -2898,12 +2916,12 @@ def overnight_checks() -> List[str]:
         failures.append(f"after midnight the ring should still measure from the 16:00 "
                         f"close: {[s.title for s in sent]}")
 
-    # IB Gateway down from 20:00 to 20:25: one loud BLIND after ten
+    # IB Gateway down from 20:00 to 20:25: one quiet BLIND after ten
     # minutes, one note when it answers again, nothing in between.
     sent = night([close] * 30, started_at=at(*sun, 20, 0),
                  down=[(at(*sun, 20, 0), at(*sun, 20, 25))])
     notes = [(s.at.strftime("%H:%M"), s.priority, "BLIND" in s.title) for s in sent]
-    if (len(sent) != 2 or not notes[0][2] or notes[0][1] != PRIORITY_SUMMARY
+    if (len(sent) != 2 or not notes[0][2] or notes[0][1] != PRIORITY_UPDATE
             or not (at(*sun, 20, 10) <= sent[0].at < at(*sun, 20, 12))
             or "again" not in sent[1].message):
         failures.append(f"gateway down should be one BLIND alarm at ~20:10 and one "
@@ -3667,8 +3685,11 @@ def self_test() -> int:
     shallow = MarketAlarm()
     why = shallow.update(-0.55)
     body, priority = market_push(shallow, why, -0.55)
-    if priority != PRIORITY_SUMMARY or "Acknowledge" in body:
-        failures.append(f"a -0.5% ring is a single sound: {priority} {body!r}")
+    if priority != PRIORITY_UPDATE or "Acknowledge" in body:
+        failures.append(f"a -0.5% ring is quiet: {priority} {body!r}")
+    if ring_out(("up", "x"), None, False, None, None, datetime(2026, 10, 26, 9, 40),
+                "m", ("a", "b", "c", "d")) != (None, PRIORITY_UPDATE, "m"):
+        failures.append("price rings arrive with no sound (PRICE_RINGS_AUDIBLE)")
 
     # --- 16 Oct: pre-market alarms, persistence, rings only ---------------
     pm_day = Day(last=101.0, high=101.0, low=100.0, prev_close=100.0)
@@ -3884,6 +3905,20 @@ def self_test() -> int:
             failures.append(f"{fn.__name__} must beat the heartbeat while it waits")
     if heartbeat.self_test.__module__ != "heartbeat":
         failures.append("heartbeat.py is missing")
+    import contextlib
+    import io
+    from types import SimpleNamespace
+    global _watch, deliver
+    saved_watch, real_deliver, said = _watch, deliver, []
+    _watch = SimpleNamespace(beat=lambda now: [(True, "merger watch NOT running")])
+    deliver = lambda text, title, priority, dry_run, **kw: said.append(priority) or "captured"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            pulse(datetime(2026, 10, 26, 9, 0, tzinfo=ET))
+    finally:
+        _watch, deliver = saved_watch, real_deliver
+    if said != [PRIORITY_UPDATE]:
+        failures.append(f"the watchdog's note arrives quietly: {said}")
 
     # --- the S&P opening call ---------------------------------------------
     d = date(2026, 10, 19)
@@ -3921,7 +3956,7 @@ def self_test() -> int:
     body, priority = market_push(mkt, why, -0.30)
     if not why or "from its 09:30 price" not in why or "1.29%" not in why \
             or "-0.30%" not in body or "from its 09:30 price" not in body \
-            or priority != PRIORITY_SUMMARY:
+            or priority != PRIORITY_UPDATE:
         failures.append(f"a 1.29% fall from the open should ring, saying so: {why!r} {body!r}")
     if mkt.update(-1.31, from_open_pct=-1.40) is not None:
         failures.append("the same fall must not ring twice from two references")
@@ -3960,7 +3995,8 @@ def self_test() -> int:
           f"{MOVE_PERCENT:.2f}% within {MOVE_MINUTES} min, on "
           f"{ALARM_VOLUME:.1f}x volume")
     print(f"  Sounds, buy / sell             : {SOUND_BUY} / {SOUND_SELL}, "
-          f"one per direction per {SOUND_COOLDOWN_MINUTES} min")
+          f"one per direction per {SOUND_COOLDOWN_MINUTES} min"
+          + ("" if PRICE_RINGS_AUDIBLE else " -- OFF: price rings arrive quietly"))
     print("  25 Sep afternoon replayed      : 0 rings of 70 readings (was 6)")
     print("  Test push                      : devices and sound names "
           "checked first")

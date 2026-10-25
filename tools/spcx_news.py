@@ -14,7 +14,9 @@ so it now also reads, every 10 minutes:
                 IB Gateway already running -- a READ-ONLY connection on
                 its own client id, 7707. Gateway down: skipped quietly.
 
-and sends:
+and sends (since 25 Oct the merger watch delivers every one of these with
+no sound; the "big" mark below still decides what reads SPCX NEWS and
+what leads the digest):
 
   SILENT   each new headline, at most 6 a check (the rest wait for the
            digest) -- it sits in the tray to be read when you look

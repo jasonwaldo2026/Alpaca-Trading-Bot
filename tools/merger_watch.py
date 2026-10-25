@@ -16,29 +16,31 @@ around the clock, weekends included:
                    date. A sharp jump means bettors are reacting to
                    something; a market settling "Yes" means it happened.
 
-How the phone rings:
+How the phone rings (25 Oct 2026: a sound only for a major event, at 9:00
+and at 9:20; no repeating emergency alarms):
 
-  EMERGENCY  repeats until acknowledged
+  MAJOR      rings once, through a focus mode
              - Form 425 / S-4 / merger proxy from either company
              - an 8-K naming the other company with a merger word
-             - an 8-K "material definitive agreement" that could not be read
+             - an 8-K "material definitive agreement", read or not
              - SPCX or TSLA halted for news
              - any Polymarket date at 90% or more, or settled "Yes"
-  LOUD       - an 8-K "material agreement" that does not name the other
+  NORMAL     - the 9:00 to-do list (todo_watch.py)
+             - the day plan's sounds (day_plan.py): 9:20 set-up, the flush
+               buy (LOUD), and a final set-up that takes the dip buy away
+  QUIET      everything else arrives with no sound:
+             - odds up or down 15+ points in a day, or 10+ in an hour
+             - any other 8-K, a deadline passed with no announcement
              - SPCX or TSLA paused for volatility
-             - a source unreachable for 30 minutes ("merger watch is blind")
-  NORMAL     - odds up or down 15+ points in a day, or 10+ in an hour
-               (LOUD at 10 / 5 until 24 Oct: see JUMP_DAY_POINTS)
-             - any other 8-K from either company
-             - a deadline that passed with no announcement
-             - SPCX headlines that can move the stock (spcx_news.py), one
-               sound per topic every 2 hours, silent 10 PM - 7 AM
-  SILENT     - the odds at 19:45 ET each day, before the overnight session
+             - SPCX headlines (spcx_news.py) and the 7:00 digest
+             - calendar reminders
+             - a source unreachable for 30 minutes ("merger watch is
+               blind"), or the SPCX alarms not running
+             - the odds at 19:45 ET each day
 
 The Polymarket markets are small -- a few thousand dollars behind each
 date -- so one bettor can move them. That is why a jump in the odds is
-only a normal sound and only the filings, halts and a settled market are
-EMERGENCY.
+quiet and only the filings, halts and a settled market ring.
 
 Read-only. It reads public pages: no account, no order, no bet. There is
 no trading client in this file.
@@ -90,6 +92,11 @@ from spcx_alert import (
 PRIORITY_LOUD = PRIORITY_SUMMARY
 PRIORITY_NORMAL = 0
 PRIORITY_SILENT = PRIORITY_UPDATE
+#: A major merger event rings once, through a focus mode. Not Pushover's
+#: emergency priority, which repeats until it is acknowledged (25 Oct).
+#: Everything else from this watch arrives quietly, except the 9:00 to-do
+#: list and the day plan's 9:20 set-up, flush and switch-off.
+PRIORITY_MAJOR = PRIORITY_LOUD
 
 TITLE = "MERGER WATCH"
 
@@ -134,7 +141,7 @@ NEWS_HALTS = {
 VOLATILITY_HALTS = {"LUDP": "volatility pause", "LUDS": "volatility pause",
                     "M": "volatility pause"}
 
-#: Odds moves, in percentage points, that make the phone ring.
+#: Odds moves, in percentage points, worth a (quiet, since 25 Oct) note.
 #: Raised from 10 / 5 on 24 Oct 2026, and the ring turned from LOUD to
 #: normal: in the week to then, nine alarms were 5-8 point moves that the
 #: same few bettors reversed within the hour. An announcement moves these
@@ -178,6 +185,8 @@ class Alert:
     priority: int
     message: str
     created: str = ""
+    #: Sent in Pushover's html mode: the message is escaped, with links.
+    html: bool = False
 
 
 @dataclass
@@ -316,12 +325,12 @@ def polymarket_alerts(markets: List[Market], state: dict, now: datetime) -> List
         state["labels"][m.slug] = m.label
         if m.closed:
             if m.yes_pct >= SETTLED_YES_PCT and _once(state, f"settled:{m.slug}", now):
-                alerts.append(Alert(PRIORITY_EMERGENCY,
+                alerts.append(Alert(PRIORITY_MAJOR,
                     f"Polymarket SETTLED YES: merger announced by {m.label}.\n"
                     f"Check the news now.\n{page}"))
             elif (m.yes_pct < SETTLED_YES_PCT and m.slug in state["open_seen"]
                   and _once(state, f"expired:{m.slug}", now)):
-                alerts.append(Alert(PRIORITY_NORMAL,
+                alerts.append(Alert(PRIORITY_SILENT,
                     f"Deadline {m.label} passed with no merger announcement."))
             continue
 
@@ -333,7 +342,7 @@ def polymarket_alerts(markets: List[Market], state: dict, now: datetime) -> List
         history[:] = [r for r in history if datetime.fromisoformat(r[0]) >= cutoff]
 
         if m.yes_pct >= CERTAIN_PCT and _once(state, f"certain:{m.slug}", now):
-            alerts.append(Alert(PRIORITY_EMERGENCY,
+            alerts.append(Alert(PRIORITY_MAJOR,
                 f"Merger odds {m.yes_pct:.0f}% for {m.label}. Bettors think it is "
                 f"happening. Check the news now.\n{page}"))
             continue
@@ -348,7 +357,7 @@ def polymarket_alerts(markets: List[Market], state: dict, now: datetime) -> List
             if not quiet:
                 state["rung"][key] = [_iso(now), m.yes_pct]
                 word = "UP" if direction == "up" else "DOWN"
-                alerts.append(Alert(PRIORITY_NORMAL,
+                alerts.append(Alert(PRIORITY_SILENT,
                     f"Merger odds {word} {points:.0f} points in {span} for "
                     f"{m.label}: now {m.yes_pct:.0f}%.\n"
                     f"Small market: a few bettors can move it. Check the news.\n{page}"))
@@ -388,12 +397,12 @@ def halt_alerts(halts: List[Halt], state: dict, now: datetime) -> List[Alert]:
         state["seen_halts"].append(key)
         when = f"{h.when:%a %H:%M} ET"
         if h.code in NEWS_HALTS:
-            alerts.append(Alert(PRIORITY_EMERGENCY,
+            alerts.append(Alert(PRIORITY_MAJOR,
                 f"{h.symbol} HALTED {when}: {NEWS_HALTS[h.code]} ({h.code}).\n"
                 f"Big news is coming. Check the news now."))
         else:
             reason = VOLATILITY_HALTS.get(h.code, f"halt code {h.code}")
-            alerts.append(Alert(PRIORITY_LOUD,
+            alerts.append(Alert(PRIORITY_SILENT,
                 f"{h.symbol} halted {when}: {reason} ({h.code})."))
     state["seen_halts"] = state["seen_halts"][-200:]
     return alerts
@@ -402,25 +411,25 @@ def halt_alerts(halts: List[Halt], state: dict, now: datetime) -> List[Alert]:
 def classify_filing(f: Filing, text: Optional[str]) -> Optional[Tuple[int, str]]:
     """(priority, why) for a filing worth a message, or None."""
     if f.form in MERGER_FORMS:
-        return PRIORITY_EMERGENCY, f"filed a Form {f.form}, a MERGER document"
+        return PRIORITY_MAJOR, f"filed a Form {f.form}, a MERGER document"
     if not f.form.startswith("8-K"):
         return None
     items = ", ".join(f"{i} {ITEM_NAMES.get(i, '')}".strip() for i in f.items) or "no items"
     other = "SpaceX" if f.company == "Tesla" else "Tesla"
     if text is None:
         if "1.01" in f.items:
-            return (PRIORITY_EMERGENCY,
+            return (PRIORITY_MAJOR,
                     f"filed an 8-K with a material definitive agreement that could "
                     f"not be read ({items})")
-        return PRIORITY_NORMAL, f"filed an 8-K ({items})"
+        return PRIORITY_SILENT, f"filed an 8-K ({items})"
     names_other = any(name in text for name in COUNTERPART[f.company])
     if names_other and any(word in text for word in MERGER_WORDS):
-        return PRIORITY_EMERGENCY, f"filed an 8-K naming {other} with merger language ({items})"
+        return PRIORITY_MAJOR, f"filed an 8-K naming {other} with merger language ({items})"
     if "1.01" in f.items:
-        return (PRIORITY_LOUD,
+        return (PRIORITY_MAJOR,
                 f"filed an 8-K with a material definitive agreement, not naming "
                 f"{other} ({items})")
-    return PRIORITY_NORMAL, f"filed an 8-K ({items})"
+    return PRIORITY_SILENT, f"filed an 8-K ({items})"
 
 
 def filing_alerts(filings: List[Filing], state: dict, now: datetime,
@@ -436,7 +445,7 @@ def filing_alerts(filings: List[Filing], state: dict, now: datetime,
             continue
         priority, why = verdict
         when = f"{f.accepted.astimezone(ET):%a %m/%d %H:%M} ET"
-        if priority == PRIORITY_EMERGENCY:
+        if priority == PRIORITY_MAJOR:
             text = f"{f.company.upper()} {why}. {when}. Check the news now."
         else:
             text = f"{f.company} {why}. {when}."
@@ -458,12 +467,12 @@ def blind_alerts(state: dict, now: datetime, enabled: List[str],
     back = [s for s in state["blind"] if s not in blind]
     if newly:
         names = ", ".join(SOURCE_NAMES[s] for s in newly)
-        alerts.append(Alert(PRIORITY_LOUD,
+        alerts.append(Alert(PRIORITY_SILENT,
             f"Merger watch is BLIND: no answer from {names} for 30 minutes. "
             f"Check the PC's internet connection."))
     if back:
         names = ", ".join(SOURCE_NAMES[s] for s in back)
-        alerts.append(Alert(PRIORITY_NORMAL, f"Merger watch can see again: {names}."))
+        alerts.append(Alert(PRIORITY_SILENT, f"Merger watch can see again: {names}."))
     state["blind"] = blind
     return alerts
 
@@ -565,7 +574,7 @@ def calendar_check(state: dict, now: datetime) -> List[Alert]:
         except Exception as exc:  # noqa: BLE001
             log(f"news ({query}): {type(exc).__name__}")
             continue
-        alerts += [Alert(PRIORITY_NORMAL, text) for text in
+        alerts += [Alert(PRIORITY_SILENT, text) for text in
                    calendar_watch.news_alerts(items, state["news_seen"], now, first)]
     state["news_primed"] = True
     return alerts
@@ -575,8 +584,8 @@ _IBKR_NEWS: Optional["spcx_news.IbkrNews"] = None
 
 
 def news_check(state: dict, now: datetime, get=None, ibkr=None) -> List[Alert]:
-    """Every 10 minutes: SPCX headlines (see spcx_news.py). A headline that
-    can move the stock makes a sound; the rest arrive silently. One source
+    """Every 10 minutes: SPCX headlines (see spcx_news.py), all quiet since
+    25 Oct (spcx_news still marks the ones that can move the stock). One source
     failing leaves the others; all failing counts as a failed check. The
     Alpaca source is skipped when .env has no Alpaca keys; IBKR's when IB
     Gateway is not answering (logged, like any source)."""
@@ -604,8 +613,7 @@ def news_check(state: dict, now: datetime, get=None, ibkr=None) -> List[Alert]:
         log(f"news (IBKR): {type(exc).__name__}")
     if failed == tried:
         raise RuntimeError("no news source answered")
-    return [Alert(PRIORITY_NORMAL if big else PRIORITY_SILENT, text)
-            for big, text in spcx_news.check(items, state, now)]
+    return [Alert(PRIORITY_SILENT, text) for _, text in spcx_news.check(items, state, now)]
 
 
 _PLAN_ERROR = {"last": ""}
@@ -614,14 +622,14 @@ _PLAN_ERROR = {"last": ""}
 def plan_tick(now: datetime, events: list, todo: Optional[str]) -> List[Alert]:
     """The SPCX day plan (day_plan.py): set-ups, the flush alert, the
     debrief. Whatever goes wrong there is logged once and never stops the
-    merger alarms; the flush alert is the plan's only LOUD text."""
+    merger alarms. Its texts carry their own Pushover priority."""
     try:
         import day_plan
 
         said = day_plan.tick(now, events, todo_text=todo)
         _PLAN_ERROR["last"] = ""
-        return [Alert(PRIORITY_LOUD if priority > 0 else PRIORITY_NORMAL, text)
-                for priority, text in said]
+        # The day plan speaks in Pushover priorities already.
+        return [Alert(priority, text) for priority, text in said]
     except Exception as exc:  # noqa: BLE001
         why = f"{type(exc).__name__}: {str(exc)[:120]}"
         if why != _PLAN_ERROR["last"]:
@@ -637,7 +645,7 @@ def calendar_events(state: dict, now: datetime) -> List["calendar_watch.Event"]:
 
 
 def calendar_reminders(events: list, state: dict, now: datetime) -> List[Alert]:
-    out = [Alert(PRIORITY_LOUD if r.loud else PRIORITY_NORMAL, f"CALENDAR: {r.text}")
+    out = [Alert(PRIORITY_SILENT, f"CALENDAR: {r.text}")
            for r in calendar_watch.due(events, state["cal_sent"], now)]
     if len(state["cal_sent"]) > 500:
         for key in sorted(state["cal_sent"], key=state["cal_sent"].get)[:-500]:
@@ -648,9 +656,11 @@ def calendar_reminders(events: list, state: dict, now: datetime) -> List[Alert]:
 def deliver(alerts: List[Alert], state: dict, now: datetime, dry_run: bool) -> None:
     for alert in alerts:
         alert.created = _iso(now)
-        state["pending"].append([alert.priority, alert.message, alert.created])
+        state["pending"].append([alert.priority, alert.message, alert.created, alert.html])
     still = []
-    for priority, message, created in state["pending"]:
+    for entry in state["pending"]:
+        priority, message, created = entry[:3]
+        as_html = len(entry) > 3 and entry[3]           # older entries had three fields
         if now - datetime.fromisoformat(created) > PENDING_KEEP:
             log(f"gave up sending (Pushover unreachable for 2 hours): {message[:80]}")
             continue
@@ -659,10 +669,11 @@ def deliver(alerts: List[Alert], state: dict, now: datetime, dry_run: bool) -> N
         if dry_run:
             log(f"[dry run] {level}: {message}")
             continue
-        error = send_pushover(message, title=TITLE, priority=priority)
+        error = send_pushover(message, title=TITLE, priority=priority,
+                              **({"html": True} if as_html else {}))
         if error:
             log(f"not sent yet ({error}); will retry: {message[:80]}")
-            still.append([priority, message, created])
+            still.append([priority, message, created, as_html])
         else:
             log(f"sent {level}: {message}")
     state["pending"] = still
@@ -709,8 +720,7 @@ def watch(dry_run: bool, once: bool, state_path: str) -> int:
             except Exception as exc:  # noqa: BLE001 -- one source failing must not stop the rest
                 log(f"{SOURCE_NAMES[source]}: {type(exc).__name__}: {str(exc)[:120]}")
         if watch is not None:
-            alerts += [Alert(PRIORITY_LOUD if loud else PRIORITY_NORMAL, text)
-                       for loud, text in watch.beat(now)]
+            alerts += [Alert(PRIORITY_SILENT, text) for _, text in watch.beat(now)]
         if not once:
             if now.minute != last_cal_minute:      # once a minute is plenty
                 last_cal_minute = now.minute
@@ -718,10 +728,12 @@ def watch(dry_run: bool, once: bool, state_path: str) -> int:
                 alerts += calendar_reminders(events, state, now)
                 morning = spcx_news.digest(state, now)
                 if morning:
-                    alerts.append(Alert(PRIORITY_NORMAL, morning))
+                    alerts.append(Alert(PRIORITY_SILENT, morning))
                 todo = todo_watch.morning(state, now, events)
                 if todo:
-                    alerts.append(Alert(PRIORITY_NORMAL, todo))
+                    # The hot list's symbols as Robinhood links; plain if too long.
+                    page = todo_watch.as_html(todo)
+                    alerts.append(Alert(PRIORITY_NORMAL, page or todo, html=page is not None))
                 alerts += plan_tick(now, events, todo)
             alerts += blind_alerts(state, now, watched, started)
             alerts += summary_alert(state, now, bool(contact),
@@ -795,15 +807,15 @@ def self_test() -> int:
             ("Dec 31, 2026", 28.5, False), ("Jun 30, 2027", 40.0, True)]:
         failures.append(f"Polymarket parsed wrong: {parsed}")
 
-    # A 15-point day jump rings once, at normal priority; a smaller wobble
-    # does not; another full step inside the quiet period rings again.
+    # A 15-point day jump sends one quiet note; a smaller wobble does not;
+    # another full step inside the quiet period sends another.
     s = new_state()
     polymarket_alerts([market("m", 30)], s, t0)
     if polymarket_alerts([market("m", 44)], s, t0 + timedelta(hours=20)):
         failures.append("a 14-point day move should not ring")
     a = polymarket_alerts([market("m", 46)], s, t0 + timedelta(hours=21))
-    if len(a) != 1 or a[0].priority != PRIORITY_NORMAL or "UP 16" not in a[0].message:
-        failures.append(f"a 16-point day jump should ring once, normal: {a}")
+    if len(a) != 1 or a[0].priority != PRIORITY_SILENT or "UP 16" not in a[0].message:
+        failures.append(f"a 16-point day jump should send one quiet note: {a}")
     if polymarket_alerts([market("m", 50)], s, t0 + timedelta(hours=22)):
         failures.append("a smaller follow-on move inside the quiet period should not ring")
     if not polymarket_alerts([market("m", 62)], s, t0 + timedelta(hours=23)):
@@ -824,8 +836,8 @@ def self_test() -> int:
 
     s = new_state()
     a = polymarket_alerts([market("c", 91)], s, t0)
-    if len(a) != 1 or a[0].priority != PRIORITY_EMERGENCY:
-        failures.append("90%+ should be an emergency")
+    if len(a) != 1 or a[0].priority != PRIORITY_MAJOR:
+        failures.append(f"90%+ is a major event: rings once, not a repeating emergency: {a}")
     if polymarket_alerts([market("c", 93)], s, t0 + timedelta(minutes=5)):
         failures.append("the 90% emergency should ring once")
 
@@ -834,11 +846,11 @@ def self_test() -> int:
         failures.append("an old deadline that closed before we watched must stay quiet")
     polymarket_alerts([market("d", 20)], s, t0)
     a = polymarket_alerts([market("d", 0.1, closed=True)], s, t0 + timedelta(days=1))
-    if len(a) != 1 or a[0].priority != PRIORITY_NORMAL:
-        failures.append(f"a watched deadline passing should be one normal note: {a}")
+    if len(a) != 1 or a[0].priority != PRIORITY_SILENT:
+        failures.append(f"a watched deadline passing should be one quiet note: {a}")
     a = polymarket_alerts([market("y", 100, closed=True)], new_state(), t0)
-    if len(a) != 1 or a[0].priority != PRIORITY_EMERGENCY or "SETTLED YES" not in a[0].message:
-        failures.append("a market settled Yes is an emergency, watched before or not")
+    if len(a) != 1 or a[0].priority != PRIORITY_MAJOR or "SETTLED YES" not in a[0].message:
+        failures.append("a market settled Yes is a major event, watched before or not")
 
     # Halts: the feed starts with a byte-order mark; only our symbols, only
     # recent, only once; news halts are emergencies.
@@ -858,8 +870,8 @@ def self_test() -> int:
         failures.append(f"halts parsed wrong: {halts}")
     s = new_state()
     a = halt_alerts(halts, s, t0)
-    if [x.priority for x in a] != [PRIORITY_EMERGENCY, PRIORITY_LOUD]:
-        failures.append(f"SPCX T1 should be an emergency, TSLA LUDP loud, the rest "
+    if [x.priority for x in a] != [PRIORITY_MAJOR, PRIORITY_SILENT]:
+        failures.append(f"SPCX T1 should be a major event, TSLA LUDP quiet, the rest "
                         f"ignored: {[x.message for x in a]}")
     if halt_alerts(halts, s, t0 + timedelta(minutes=1)):
         failures.append("a halt should ring once")
@@ -888,8 +900,8 @@ def self_test() -> int:
     texts["x"] = "spacex announced a business combination with tesla"
     a = filing_alerts(batch, s, t0, read)
     got = [x.priority for x in a]
-    want = [PRIORITY_EMERGENCY, PRIORITY_EMERGENCY, PRIORITY_LOUD, PRIORITY_NORMAL,
-            PRIORITY_EMERGENCY, PRIORITY_EMERGENCY]
+    want = [PRIORITY_MAJOR, PRIORITY_MAJOR, PRIORITY_MAJOR, PRIORITY_SILENT,
+            PRIORITY_MAJOR, PRIORITY_MAJOR]
     if got != want:
         failures.append(f"filing priorities {got}, expected {want}: "
                         + " | ".join(x.message for x in a))
@@ -908,20 +920,21 @@ def self_test() -> int:
             or "/000162828026064366/" not in filings[0].url):
         failures.append(f"SEC filings parsed wrong: {filings}")
 
-    # Blind: one loud alert after 30 minutes, one note on recovery.
+    # Blind: one quiet alert after 30 minutes, one quiet note on recovery.
     s = new_state()
     s["last_ok"] = {"halts": _iso(t0), "polymarket": _iso(t0 + timedelta(minutes=25))}
     if blind_alerts(s, t0 + timedelta(minutes=29), ["halts", "polymarket"], t0):
         failures.append("29 minutes is not blind yet")
     a = blind_alerts(s, t0 + timedelta(minutes=31), ["halts", "polymarket"], t0)
-    if len(a) != 1 or "Nasdaq halts" not in a[0].message or "Polymarket" in a[0].message:
+    if (len(a) != 1 or "Nasdaq halts" not in a[0].message or "Polymarket" in a[0].message
+            or a[0].priority != PRIORITY_SILENT):
         failures.append(f"only the silent source should be reported blind: {a}")
     if blind_alerts(s, t0 + timedelta(minutes=40), ["halts", "polymarket"], t0):
         failures.append("blind should be reported once")
     s["last_ok"]["halts"] = _iso(t0 + timedelta(minutes=41))
     a = blind_alerts(s, t0 + timedelta(minutes=41), ["halts", "polymarket"], t0)
-    if len(a) != 1 or a[0].priority != PRIORITY_NORMAL:
-        failures.append("recovery should be one normal note")
+    if len(a) != 1 or a[0].priority != PRIORITY_SILENT:
+        failures.append("recovery should be one quiet note")
 
     # Summary: once a day at 19:45, silent; a late start skips the day.
     s = new_state()
@@ -947,8 +960,33 @@ def self_test() -> int:
         deliver([Alert(PRIORITY_LOUD, "dry-run check")], s, t0, dry_run=True)
         if s["pending"]:
             failures.append("a dry run should not queue anything")
+
+        # The 9:00 list goes in html mode (its links); the rest plain. An
+        # entry queued by the older three-field format still sends.
+        global send_pushover
+        real_send, calls = send_pushover, []
+
+        def fake_send(message, title="", priority=0, **kw):
+            calls.append((message, kw))
+            return "down" if message == "fails" else None
+        send_pushover = fake_send
+        try:
+            s = new_state()
+            s["pending"].append([PRIORITY_SILENT, "old entry", _iso(t0)])
+            deliver([Alert(PRIORITY_NORMAL, '<a href="x">X</a>', html=True),
+                     Alert(PRIORITY_SILENT, "plain"), Alert(PRIORITY_NORMAL, "fails", html=True)],
+                    s, t0, dry_run=False)
+            if calls != [("old entry", {}), ('<a href="x">X</a>', {"html": True}), ("plain", {}),
+                         ("fails", {"html": True})] or s["pending"] != [
+                             [PRIORITY_NORMAL, "fails", _iso(t0), True]]:
+                failures.append(f"html travels with its message, retries included: {calls} {s['pending']}")
+        finally:
+            send_pushover = real_send
     finally:
         LOG_PATH = saved_log
+    from inspect import signature
+    if "html" not in signature(send_pushover).parameters:
+        failures.append("spcx_alert.py is out of date: download it too (send_pushover needs html)")
 
     # Read-only, structurally.
     source = open(__file__, encoding="utf-8").read()
@@ -994,8 +1032,8 @@ def self_test() -> int:
                   ("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_API_SECRET")}
     try:
         got = news_check(s, news_now, get=one_down, ibkr=gateway_down)
-        if [a.priority for a in got] != [PRIORITY_NORMAL, PRIORITY_SILENT]:
-            failures.append(f"an offering rings, a plain headline is silent: {got}")
+        if [a.priority for a in got] != [PRIORITY_SILENT, PRIORITY_SILENT]:
+            failures.append(f"headlines arrive quietly, an offering too: {got}")
         if any("alpaca" in u for u, _ in asked) or any(h for _, h in asked):
             failures.append(f"without Alpaca keys, Alpaca is not asked: {asked}")
         try:
@@ -1023,7 +1061,7 @@ def self_test() -> int:
                                 datetime(2026, 10, 23, 12, 20, tzinfo=timezone.utc), tagged=True)
         got = news_check(s, news_now, ibkr=FakeIbkr([dj]),
                          get=lambda url, headers: (_ for _ in ()).throw(OSError("down")))
-        if [a.priority for a in got] != [PRIORITY_NORMAL] or "Dow Jones" not in got[0].message:
+        if [a.priority for a in got] != [PRIORITY_SILENT] or "Dow Jones" not in got[0].message:
             failures.append(f"IBKR's headline arrives when the web feeds are down: {got}")
         if gateway_down.asked < 3:
             failures.append("IBKR is asked on every check")
@@ -1070,8 +1108,20 @@ def self_test() -> int:
         failures.append("todo_watch.py is missing")
     if "spcx_news.digest(" not in inspect.getsource(watch):
         failures.append("the watch loop must send the 07:00 news list")
+    loop = inspect.getsource(watch)
+    if ("Alert(PRIORITY_SILENT, morning)" not in loop
+            or "Alert(PRIORITY_NORMAL, page or todo, html=page is not None)" not in loop):
+        failures.append("the 07:00 news list arrives quietly; the 9:00 list sounds, with its links")
     if "calendar_reminders(" not in inspect.getsource(watch):
         failures.append("the watch loop must send the calendar's reminders")
+    real_due = calendar_watch.due
+    calendar_watch.due = lambda events, sent, now: [_types.SimpleNamespace(text="unlock", loud=True)]
+    try:
+        got = calendar_reminders([], new_state(), t0)
+    finally:
+        calendar_watch.due = real_due
+    if [a.priority for a in got] != [PRIORITY_SILENT]:
+        failures.append(f"calendar reminders arrive quietly, loud ones too: {got}")
     if calendar_watch.self_test.__module__ != "calendar_watch":
         failures.append("calendar_watch.py is missing")
     if "watch.beat(" not in inspect.getsource(watch):

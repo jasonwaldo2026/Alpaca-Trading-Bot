@@ -68,6 +68,9 @@ BIG_MOVE, PAUSE_BARS, RETRACE = 0.015, 1, 1 / 3
 DEBRIEF_AT, DEBRIEF_LATEST = time(16, 5), time(19, 0)
 STOP_PAST, EDGE, TRAP_ZONE, MIN_SPREAD = 0.025, 0.0025, 0.008, 0.01
 MAX_LOSS = 5000.0
+#: Pushover priorities (25 Oct: sound only at 9:20 and for a major change).
+#: QUIET arrives with no sound; SOUND rings; LOUD rings through a focus mode.
+QUIET, SOUND, LOUD = -1, 0, 1
 OPEN, CLOSE = time(9, 30), time(16, 0)
 
 
@@ -462,7 +465,7 @@ def tick(now: datetime, events: list, todo_text: Optional[str] = None,
         d["context"] = {"S&P before the open": f"{spy_pre:+.2f}%" if spy_pre is not None else "n/a",
                         "Event": event or "none"}
         d["spy_pre"], d["event"] = spy_pre, event
-        out.append((0, d["pass1_text"]))
+        out.append((SOUND, d["pass1_text"]))
         changed = True
 
     flush_pending = "flush" not in d and FLUSH_FROM <= t <= FLUSH_UNTIL and not d.get("event")
@@ -482,7 +485,7 @@ def tick(now: datetime, events: list, todo_text: Optional[str] = None,
                 if f:
                     d["flush"] = {k: v for k, v in f.items()}
                     d["flush_text"], d["flush_time"] = text_flush(f), f"{f['t']:%H:%M}"
-                    out.append((0 if "skip" in f else 1, d["flush_text"]))
+                    out.append((QUIET if "skip" in f else LOUD, d["flush_text"]))
                     changed = True
             # ---- pass 2
             if "pass2" not in d and t >= PASS2_EARLIEST and "pass1" in d:
@@ -504,7 +507,8 @@ def tick(now: datetime, events: list, todo_text: Optional[str] = None,
                     d["context"].update({"S&P at the final set-up": f"{spy_now:+.2f}%" if spy_now is not None else "n/a",
                                          "First move": f"{first:+.2f}% ({kind})",
                                          "Final set-up at": f"{now:%H:%M}"})
-                    out.append((0, d["pass2_text"]))
+                    # A major change: 9:20 allowed the dip buy and this takes it away.
+                    out.append((SOUND if d["go_920"] and not go else QUIET, d["pass2_text"]))
                     changed = True
 
     # ---- debrief
@@ -538,7 +542,7 @@ def tick(now: datetime, events: list, todo_text: Optional[str] = None,
             lines.append(f"Day: open {money(session[0].o)}  high {money(hi)}  low {money(lo)}  "
                          f"close {money(session[-1].c)}")
             d["debrief_text"] = "\n".join(lines)
-            out.append((0, d["debrief_text"]))
+            out.append((QUIET, d["debrief_text"]))
             plan_pct = ((w["out"] / w["bought"][1] - 1) * 100) if w.get("bought") else None
             append_log(dict(day=today.isoformat(), gap_pct=round(d.get("gap", 0), 2),
                             spy_pre_pct=d.get("spy_pre"), spy_pass2_pct=d.get("spy_pass2"),
@@ -696,8 +700,12 @@ def self_test() -> int:
         ok(texts[0].startswith("SPCX zones for today") and "⛔ S&P down before the open" in texts[0],
            f"9:20: the set-up, and no dip buy with the S&P down: {texts[:1]}")
         fl = [s for _, _, p, s in said if s.startswith("SPCX FLUSH")]
-        ok(len(fl) == 1 and "Buy zone about $146.25" in fl[0] and [p for _, _, p, s in said if s.startswith("SPCX FLUSH")] == [1],
+        ok(len(fl) == 1 and "Buy zone about $146.25" in fl[0] and [p for _, _, p, s in said if s.startswith("SPCX FLUSH")] == [LOUD],
            f"one loud flush alert at the up-bar: {fl}")
+        sounds = {s.split("\n")[0][:18]: p for _, _, p, s in said}
+        ok(sounds == {"SPCX zones for tod": SOUND, "SPCX FLUSH: down 2": LOUD,
+                      "SPCX final zones f": QUIET, "SPCX debrief Fri O": QUIET},
+           f"sound at 9:20 and the flush; a final set-up that keeps the NO and the debrief are quiet: {sounds}")
         p2t = [s for s in texts if s.startswith("SPCX final zones")]
         ok(len(p2t) == 1 and "⛔ S&P down before the open" in p2t[0], f"pass 2 keeps the NO: {p2t}")
         db = [s for s in texts if s.startswith("SPCX debrief")]
@@ -721,6 +729,34 @@ def self_test() -> int:
         ok(not any(s.startswith("SPCX FLUSH") for s in said) and "⛔ Unlock day" in said[0]
            and any("Flush: not watched (unlock day)." in s for s in said),
            f"an unlock day: no flush alert, and the debrief says why: {said}")
+
+        def turning(symbol, start, end, now):
+            # S&P up before the open, down after it: 9:20 says GO, the final set-up NO.
+            if symbol != MARKET:
+                return fake(symbol, start, end, now)
+            base = 700.0 if start.date() == D0 else (702.0 if start.time() < OPEN else 697.0)
+            return [Bar(start + timedelta(minutes=i), base, base, base, base, 1)
+                    for i in range(int((min(end, now) - start).total_seconds() // 60))]
+        turned = os.path.join(folder, "turned")
+        said = []
+        for hh, mm in ((9, 20), (9, 34), (9, 45), (10, 0)):
+            said += tick(datetime.combine(D1, time(hh, mm)), [], fetch=turning,
+                         folder=turned, log_path=os.path.join(turned, "l.csv"))
+        p2 = [(p, s) for p, s in said if s.startswith("SPCX final zones")]
+        ok(said and said[0][1].startswith("SPCX zones") and "✅" in said[0][1]
+           and len(p2) == 1 and p2[0][0] == SOUND and "S&P turned down" in p2[0][1],
+           f"a final set-up that takes the 9:20 GO away makes a sound: {said}")
+
+        def plunge(symbol, start, end, now):
+            if symbol == MARKET or start.date() == D0:
+                return fake(symbol, start, end, now)
+            src = pre + deep + [m(2 + i, 143.9, 144.2, 143.6, 144.0) for i in range(60)]
+            return [b for b in src if start <= b.t < min(end, now.replace(second=0))]
+        said = []
+        for hh, mm in ((9, 20), (9, 33)):
+            said += tick(datetime.combine(D1, time(hh, mm)), [], fetch=plunge,
+                         folder=os.path.join(folder, "deep"), log_path=os.devnull)
+        ok([p for p, s in said if "too deep" in s] == [QUIET], f"a too-deep flush is quiet: {said}")
 
         class Ev:
             day, kind = D1, "unlock"
@@ -757,7 +793,7 @@ def replay(day: date) -> int:
         while t.time() <= time(16, 10):
             for prio, text in tick(t, events, fetch=fetch, folder=folder,
                                    log_path=os.path.join(folder, "log.csv")):
-                print(f"--- {t:%H:%M} ({'loud' if prio > 0 else 'normal'})\n{text}\n")
+                print(f"--- {t:%H:%M} ({ {QUIET: 'quiet', SOUND: 'sound', LOUD: 'loud'}[prio] })\n{text}\n")
             t += timedelta(minutes=1)
     return 0
 

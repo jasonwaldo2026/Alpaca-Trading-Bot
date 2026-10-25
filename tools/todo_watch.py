@@ -10,6 +10,10 @@ the 9:30 open gets busy, in three parts:
                 the SPCX alarms running (their heartbeat file is fresh)
                 the day-rules watcher running (likewise)
   TODAY       unlocks, earnings and launches dated today, from the calendar
+  HOT LIST    the top 5 of the Market Scanner's Pre-Market Hot List, the
+              list Scanner Studio shows (25 Oct), read from its database
+              without changing it. On the phone each symbol is a link to
+              its Robinhood page. A list not rebuilt today says so.
   YOUR LIST   the lines of todo.txt, beside this file. It stays on this PC
               and is never published. One task per line; a line starting
               "2026-10-26:" shows from that day on; blank lines and lines
@@ -18,8 +22,9 @@ the 9:30 open gets busy, in three parts:
 A PC that was off at 9:00 sends it when it comes back, until 9:20; after
 that the day's list is skipped rather than sent in the middle of the open.
 
-Read-only: it reads two heartbeat files and a text file, and knocks on
-IB Gateway's port without logging in. Imported by merger_watch.py.
+Read-only: it reads two heartbeat files, a text file and the Market
+Scanner's database (opened read-only), and knocks on IB Gateway's port
+without logging in. Imported by merger_watch.py.
 
     python todo_watch.py              # print today's list now
     python todo_watch.py --self-test
@@ -27,11 +32,14 @@ IB Gateway's port without logging in. Imported by merger_watch.py.
 
 from __future__ import annotations
 
+import html
 import os
 import re
 import socket
+import sqlite3
 import sys
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from typing import Callable, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -46,6 +54,17 @@ IBKR_PORT = int(os.environ.get("IBKR_PORT", "4001"))
 STALE = timedelta(minutes=10)
 DATED = re.compile(r"^(\d{4}-\d{2}-\d{2})\s*:\s*(.+)$")
 ET = ZoneInfo("America/New_York")
+#: The Market Scanner beside this folder: C:\Dev\Market-Scanner next to
+#: C:\Dev\Feed-Check. MARKET_SCANNER_DB in the environment overrides it.
+HOT_DB = os.environ.get("MARKET_SCANNER_DB") or os.path.join(
+    os.path.dirname(HERE), "Market-Scanner", "data", "scanner.db")
+HOT_TOP = 5
+HOT_HEAD = "HOT LIST"
+HOT_ROW = re.compile(r"^(\d+)\. ([A-Z][A-Z0-9.]*) ")
+#: Robinhood's stock page; on a phone with the app it usually opens the app.
+STOCK_LINK = "https://robinhood.com/stocks/{symbol}"
+#: Pushover's limit for one message.
+PUSHOVER_MAX = 1024
 
 
 def tasks(text: str, today: date) -> List[str]:
@@ -79,6 +98,89 @@ def read_tasks(today: date, path: str = TODO_PATH) -> Optional[List[str]]:
         return []
 
 
+def hot_list(path: str = HOT_DB, top: int = HOT_TOP):
+    """(rows, updated) from the Market Scanner's hot_list table, best rank
+    first; updated is the list's last rebuild in Eastern time. None when
+    there is no database or table to read."""
+    if not os.path.exists(path):
+        return None
+    try:
+        conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM hot_list ORDER BY rank LIMIT ?", (top,))]
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    stamps = [r.get("updated_at") for r in rows if r.get("updated_at")]
+    updated = None
+    if stamps:
+        try:
+            when = datetime.fromisoformat(max(stamps))
+            updated = (when.astimezone(ET) if when.tzinfo else when).replace(tzinfo=None)
+        except ValueError:
+            pass
+    return rows, updated
+
+
+def _short(n) -> str:
+    if n is None:
+        return "?"
+    for size, unit in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if n >= size:
+            return f"{n / size:.1f}{unit}"
+    return f"{n:.0f}"
+
+
+def hot_lines(found, today: date) -> List[str]:
+    if found is None:
+        return [f"{HOT_HEAD}", "(the Market Scanner's list could not be read)"]
+    rows, updated = found
+    if not rows:
+        return [f"{HOT_HEAD}", "(empty: the Market Scanner has not built it)"]
+    if updated is None or updated.date() != today:
+        last = f"{updated:%a %I:%M %p}" if updated else "unknown"
+        head = f"{HOT_HEAD} - NOT updated today (last {last}): check the Market Scanner"
+    else:
+        head = f"{HOT_HEAD} at {updated:%I:%M %p}"
+    out = [head]
+    for r in rows:
+        price, change = r.get("price"), r.get("change_pct")
+        parts = [f"{r.get('rank')}. {r.get('symbol')}",
+                 f"${price:,.2f}" if price is not None else "?",
+                 f"{change:+.1f}%" if change is not None else "",
+                 f"float {_short(r.get('float_shares'))}"]
+        out.append(" ".join(p for p in parts if p)
+                   + (f" - {r['verdict']}" if r.get("verdict") else ""))
+    return out
+
+
+def as_html(text: str) -> Optional[str]:
+    """The message for Pushover's html mode: everything escaped, each hot
+    list symbol a link to its Robinhood page. None if it would be too long,
+    so the caller sends the plain text instead."""
+    out, in_hot = [], False
+    for line in text.split("\n"):
+        if line.startswith(HOT_HEAD):
+            in_hot = True
+        elif not line:
+            in_hot = False
+        m = HOT_ROW.match(line) if in_hot else None
+        if m:
+            symbol = m.group(2)
+            link = html.escape(STOCK_LINK.format(symbol=symbol), quote=True)
+            rest = html.escape(line[m.end(2):])
+            out.append(f'{m.group(1)}. <a href="{link}">{symbol}</a>{rest}')
+        else:
+            out.append(html.escape(line))
+    body = "\n".join(out)
+    return body if len(body) <= PUSHOVER_MAX else None
+
+
 def gateway_up(host: str = IBKR_HOST, port: int = IBKR_PORT, timeout: float = 3.0) -> bool:
     """Whether IB Gateway's API port answers. It knocks; it never logs in."""
     try:
@@ -103,7 +205,7 @@ def watcher_line(path: str, name: str, now: datetime) -> str:
 
 
 def message(now: datetime, events: list, todo: Optional[List[str]],
-            gateway: bool, alarms_path: str, rules_path: str) -> str:
+            gateway: bool, alarms_path: str, rules_path: str, hot=None) -> str:
     lines = [f"TO DO today, {now:%a %b %d}", "", "CHECKS"]
     lines.append("OK   IB Gateway: answering" if gateway
                  else f"FIX  IB Gateway: not answering on port {IBKR_PORT} - log in")
@@ -114,6 +216,7 @@ def message(now: datetime, events: list, todo: Optional[List[str]],
         lines += ["", "TODAY"]
         for e in today:
             lines.append(f"- {e.title}{e.flag()}, {e.when_words()}")
+    lines += [""] + hot_lines(hot, now.date())
     lines += ["", "YOUR LIST"]
     if todo is None:
         lines.append("(no todo.txt in the Feed-Check folder yet)")
@@ -128,7 +231,8 @@ def morning(state: dict, now: datetime, events: list,
             gateway: Callable[[], bool] = gateway_up,
             todo_path: str = TODO_PATH,
             alarms_path: str = heartbeat.SPCX_ALARMS,
-            rules_path: str = heartbeat.DAY_RULES) -> Optional[str]:
+            rules_path: str = heartbeat.DAY_RULES,
+            hot_path: str = HOT_DB) -> Optional[str]:
     """The day's message, once, on a weekday between 9:00 and 9:20 ET.
     `now` is Eastern; the heartbeat files hold naive Eastern times."""
     local = now.replace(tzinfo=None)
@@ -138,7 +242,7 @@ def morning(state: dict, now: datetime, events: list,
         return None
     state["todo_sent"] = local.date().isoformat()
     return message(local, events, read_tasks(local.date(), todo_path), gateway(),
-                   alarms_path, rules_path)
+                   alarms_path, rules_path, hot_list(hot_path))
 
 
 # ---------------------------------------------------------------- self-test
@@ -176,7 +280,9 @@ def self_test() -> int:
         with open(todo, "w", encoding="utf-8") as handle:
             handle.write(text)
         st: dict = {}
-        args = dict(gateway=lambda: False, todo_path=todo, alarms_path=alarms, rules_path=rules)
+        hot_db = os.path.join(folder, "scanner.db")
+        args = dict(gateway=lambda: False, todo_path=todo, alarms_path=alarms, rules_path=rules,
+                    hot_path=hot_db)
         ok(morning(st, datetime(2026, 10, 26, 8, 59), [unlock], **args) is None, "not before 9:00")
         msg = morning(st, nine, [unlock, later], **args)
         ok(msg is not None and msg.startswith("TO DO today, Mon Oct 26"), f"at 9:00: {msg}")
@@ -212,6 +318,43 @@ def self_test() -> int:
         aware = datetime(2026, 10, 26, 9, 0, tzinfo=ZoneInfo("America/New_York"))
         ok(morning({}, aware, [], **args) is not None, "an Eastern-aware clock works too")
 
+        # The hot list: read-only, top five, each a Robinhood link on the phone.
+        ok("(the Market Scanner's list could not be read)" in morning({}, nine, [], **args)
+           and not os.path.exists(hot_db), "no database: says so, and does not create one")
+        db = sqlite3.connect(hot_db)
+        db.execute("CREATE TABLE hot_list (rank INTEGER, symbol TEXT, price REAL, change_pct REAL,"
+                   " float_shares REAL, verdict TEXT, updated_at TEXT)")
+        db.commit()
+        ok("(empty: the Market Scanner has not built it)" in morning({}, nine, [], **args),
+           "an empty list says so")
+        stamp = "2026-10-26T12:59:06+00:00"          # 08:59 Eastern
+        db.executemany("INSERT INTO hot_list VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       [(1, "BKYI", 3.2595, 8.65, 1335843.0, "Trade Approved", stamp),
+                        (2, "CCI", 91.5, 6.04, 425024440.0, "Avoid", stamp),
+                        (6, "SIXTH", 1.0, 1.0, 1.0, "", stamp),
+                        (3, "AXTI", 53.31, -4.14, 61608463.0, None, stamp),
+                        (4, "D", 10.0, None, None, "Middle", stamp),
+                        (5, "E", None, 2.0, 2.5e9, "Middle", stamp)])
+        db.commit()
+        db.close()
+        before = os.path.getmtime(hot_db)
+        msg = morning({}, nine, [], **args)
+        ok("HOT LIST at 08:59 AM\n1. BKYI $3.26 +8.7% float 1.3M - Trade Approved\n"
+           "2. CCI $91.50 +6.0% float 425.0M - Avoid\n3. AXTI $53.31 -4.1% float 61.6M\n"
+           "4. D $10.00 float ? - Middle\n5. E ? +2.0% float 2.5B - Middle\n\nYOUR LIST" in msg
+           and "SIXTH" not in msg, f"the top five, best first: {msg}")
+        ok(os.path.getmtime(hot_db) == before, "the Market Scanner's database is not written")
+        page = as_html("TO DO S&P <b>\n\n" + msg[msg.index("HOT LIST"):] + "\n1. ABC not a stock ")
+        ok(page is not None
+           and '1. <a href="https://robinhood.com/stocks/BKYI">BKYI</a> $3.26 +8.7%' in page
+           and '<a href="https://robinhood.com/stocks/AXTI">AXTI</a>' in page
+           and "S&amp;P &lt;b&gt;" in page and "1. ABC not a stock" in page,
+           f"hot list symbols link to Robinhood, nothing else is linked, the rest escaped: {page}")
+        ok(as_html("x" * (PUSHOVER_MAX + 1)) is None, "too long for Pushover: send it plain")
+        monday = morning({}, datetime(2026, 10, 27, 9, 0), [], **args)
+        ok("HOT LIST - NOT updated today (last Mon 08:59 AM): check the Market Scanner" in monday,
+           f"yesterday's list says so: {monday}")
+
     ok(gateway_up("127.0.0.1", 1, timeout=0.5) is False, "a closed port is not a Gateway")
 
     if failures:
@@ -238,7 +381,7 @@ def main() -> int:
     now = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
     print(message(now, calendar_watch.all_events(now.date()), read_tasks(now.date()),
                   gateway_up(), os.path.join(HERE, heartbeat.SPCX_ALARMS),
-                  os.path.join(HERE, heartbeat.DAY_RULES)))
+                  os.path.join(HERE, heartbeat.DAY_RULES), hot_list()))
     return 0
 
 
