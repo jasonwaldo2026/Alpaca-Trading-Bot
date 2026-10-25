@@ -181,6 +181,10 @@ class Session:
     #: it happened on. None when it could not be fetched, and then the page
     #: falls back to cost and says so rather than quietly mixing the two.
     prior_close: Optional[float] = None
+    #: The day plan (day_plan.py's daily/SPCX YYYY-MM-DD.json): the 9:20
+    #: set-up, the flush, the final set-up, the debrief. None on a day the
+    #: plan did not run; then the report is drawn exactly as before.
+    plan: Optional[dict] = None
 
 
 def session_vwap(minutes: pd.DataFrame) -> pd.Series:
@@ -1735,6 +1739,7 @@ def gather(symbol: str, day: date, start: time, end: time, db_path: str,
         start=start, end=end,
         benchmark=market_move(benchmark, day, start, end, force_sip),
         prior_close=previous_close(symbol, day, force_sip),
+        plan=load_plan(symbol, day),
     )
 
 
@@ -2235,6 +2240,7 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
     draw_trades(price, session.trades, slot_of, candles)
     draw_notes(price, session.notes, slot_of, candles,
                session.trades)
+    draw_plan(price, session.plan, slots)
 
     signal_x = []
     if not session.signals.empty:
@@ -2398,6 +2404,120 @@ def page_overview(pdf: PdfPages, session: Session) -> None:
     size_ax.set_xticklabels(labels, size=8)
     size_ax.set_xlabel("Eastern time")
 
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# The day plan (day_plan.py), drawn on the chart and as its own page
+# ---------------------------------------------------------------------------
+
+PLAN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily")
+PLAN_SELL, PLAN_BUY, PLAN_STOP, PLAN_BOX = UP, ACCENT, DOWN, "#e9e4d4"
+
+
+def load_plan(symbol: str, day: date, folder: str = PLAN_DIR) -> Optional[dict]:
+    """The day's plan, or None. A plan that cannot be read is no plan: the
+    report must never fail for the sake of an overlay."""
+    try:
+        with open(os.path.join(folder, f"{symbol} {day.isoformat()}.json"),
+                  encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def plan_x(slots: list, clock: str) -> Optional[float]:
+    """The slot position of a 'HH:MM' time on this chart: its own candle,
+    or the first slot if the window starts later."""
+    try:
+        at = time.fromisoformat(clock)
+    except (TypeError, ValueError):
+        return None
+    if not slots:
+        return None
+    stamp = datetime.combine(slots[0].date(), at, tzinfo=slots[0].tzinfo)
+    floor = stamp.replace(minute=stamp.minute - stamp.minute % BAR_MINUTES)
+    if floor < slots[0]:
+        return 0.0
+    if floor > slots[-1]:
+        return None
+    return float((floor - slots[0]) // timedelta(minutes=BAR_MINUTES))
+
+
+def draw_plan(price, plan: Optional[dict], slots: list) -> None:
+    """The 9:20 box and its two lines from 9:20 on; the final SELL / BUY /
+    STOP lines from the moment pass 2 set them; the flush buy, marked. Each
+    runs to the end of the day, as Jason draws them on his own chart."""
+    if not plan or not slots:
+        return
+    end = len(slots) - 0.5
+    p1 = plan.get("pass1")
+    x1 = plan_x(slots, "09:20")
+    if p1 and x1 is not None:
+        price.add_patch(Rectangle((x1, p1["box_lo"]), end - x1, p1["box_hi"] - p1["box_lo"],
+                                  facecolor=PLAN_BOX, edgecolor="none", alpha=0.55, zorder=0,
+                                  label="9:20 box"))
+        for y in (p1["top"], p1["bottom"]):
+            price.plot([x1, end], [y, y], color=INK_2, linewidth=0.9,
+                       linestyle=(0, (4, 3)), zorder=1)
+    p2 = plan.get("pass2")
+    x2 = plan_x(slots, plan.get("pass2_time", ""))
+    if p2 and x2 is not None:
+        for key, colour, name in (("sell", PLAN_SELL, "SELL"), ("buy", PLAN_BUY, "BUY"),
+                                  ("stop", PLAN_STOP, "STOP")):
+            y = p2[key]
+            price.plot([x2, end], [y, y], color=colour, linewidth=1.5, zorder=2,
+                       label=name)
+            price.text(end, y, literal(f" {name} ${y:,.2f}"), color=colour, size=7.5,
+                       va="center", ha="left", clip_on=False)
+    f = plan.get("flush")
+    xf = plan_x(slots, plan.get("flush_time", ""))
+    if f and "skip" not in f and xf is not None:
+        price.scatter([xf], [f["buy"]], marker="^", s=70, color=PLAN_BUY, zorder=5,
+                      edgecolors=SURFACE, linewidths=0.8, label="Flush buy")
+
+
+def plan_text(text: Optional[str]) -> str:
+    """Plan text as the page can print it: the marks the phone shows as
+    emoji become words, and money stays money."""
+    if not text:
+        return ""
+    return literal(text.replace("✅", "GO:").replace("⛔", "NO:"))
+
+
+def page_plan(pdf: PdfPages, session: Session) -> None:
+    """The day plan, start to finish, on one page: what was planned at each
+    step and, at the end, what the lines and the flush did."""
+    plan = session.plan or {}
+    fig = plt.figure(figsize=(11.0, 8.5))     # letter, landscape
+    fig.text(0.045, 0.955, "Day plan", size=18, weight="bold", color=INK)
+    fig.text(0.045, 0.918, f"{session.symbol} · {session.day:%A %d %B %Y}", size=10, color=INK_2)
+    left = [("To do (9:00 AM)", plan.get("todo")),
+            ("Set-up, pass 1 (9:20 AM)", plan.get("pass1_text")),
+            (f"Flush ({plan.get('flush_time', '')})", plan.get("flush_text"))]
+    right = [(f"Final set-up ({plan.get('pass2_time', '')})", plan.get("pass2_text")),
+             ("Debrief (4:05 PM)", plan.get("debrief_text")),
+             ("Kind of morning", "\n".join(f"{k}: {v}" for k, v in
+                                           (plan.get("context") or {}).items()))]
+    for column, x in ((left, 0.045), (right, 0.52)):
+        y = 0.875
+        for title, body in column:
+            if not body:
+                continue
+            fig.text(x, y, title, size=10.5, weight="bold", color=INK, va="top")
+            y -= 0.03
+            # 72 monospace characters at 8.2 pt fill a column without crossing the gutter.
+            wrapped = "\n".join(textwrap.fill(line, 72, subsequent_indent="   ") if line else ""
+                                 for line in str(body).splitlines())
+            fig.text(x, y, plan_text(wrapped), size=8.2, color=INK_2, va="top",
+                     family="monospace", linespacing=1.35)
+            y -= 0.0215 * (wrapped.count("\n") + 1) + 0.03
+    if not any(b for _, b in left + right):
+        fig.text(0.5, 0.5, "The day plan has not started yet (its first step is 9:00 AM).",
+                 ha="center", va="center", size=11, color=MUTED)
+    fig.text(0.045, 0.03, "Prices only. The plan reads no account and places no orders.",
+             size=7.5, color=MUTED)
     pdf.savefig(fig)
     plt.close(fig)
 
@@ -2801,8 +2921,13 @@ def page_performance(pdf: PdfPages, session: Session) -> None:
 def build(session: Session, path: str) -> str:
     with PdfPages(path) as pdf:
         page_overview(pdf, session)
+        if session.plan:
+            page_plan(pdf, session)
         page_performance(pdf, session)
-        page_signals(pdf, session)
+        # The old alert tool's page, kept for a day it ran; on a day with a
+        # plan and no signals it would only be an empty page.
+        if not session.plan or not session.signals.empty:
+            page_signals(pdf, session)
         info = pdf.infodict()
         info["Title"] = f"{session.symbol} Daily Debrief {session.day:%Y-%m-%d}"
         info["Subject"] = ("Daily Debrief — what was read against what price "
@@ -3826,6 +3951,75 @@ def self_test() -> int:
     print("  Half-hour buckets              : by entry; 09:30 apart from 10:00")
     print("  Performance header             : never more stats than it budgets")
     print("  A day with no trades           : no page, rather than a blank one")
+    print("  Day plan                       : box, lines and flush drawn; its own page")
+
+    # --- the day plan overlay and page -------------------------------------
+    plan = {"pass1": {"box_hi": 151.0, "box_lo": 148.0, "top": 152.0, "bottom": 145.0},
+            "pass2": {"sell": 150.6, "buy": 148.4, "stop": 145.5}, "pass2_time": "09:45",
+            "flush": {"buy": 148.2}, "flush_time": "09:33",
+            "todo": "TO DO today\n1. Read the news", "pass1_text": "✅ Good morning: dip buy allowed. $148.00",
+            "pass2_text": "SELL line at $150.60", "debrief_text": "SPCX debrief", "context": {"Gap": "+1.0%"}}
+    stamps = [datetime(2026, 10, 23, 9, 15, tzinfo=ET) + timedelta(minutes=5 * i) for i in range(20)]
+    bars = pd.DataFrame({"open": 149.0, "high": 149.5, "low": 148.5, "close": 149.2, "volume": 1000.0},
+                        index=pd.DatetimeIndex(stamps))
+    planned = Session(symbol="SPCX", day=date(2026, 10, 23), minutes=bars, candles=bars,
+                      vwap=pd.Series(149.0, index=bars.index), baseline={}, signals=blank,
+                      macd=blank, plan=plan)
+    slots = session_slots(planned)
+    if plan_x(slots, "09:20") != 1.0 or plan_x(slots, "09:33") != 3.0 or plan_x(slots, "09:00") != 0.0:
+        failures.append(f"plan times map to their candles: {[plan_x(slots, t) for t in ('09:20', '09:33', '09:00')]}")
+    if plan_x(slots, "nonsense") is not None or plan_x(slots, "17:00") is not None:
+        failures.append("a time that is not on the chart draws nothing")
+    fig, ax = plt.subplots()
+    draw_plan(ax, plan, slots)
+    labels = {t.get_text() for t in ax.texts}
+    if not {r" SELL \$150.60", r" BUY \$148.40", r" STOP \$145.50"} <= labels:
+        failures.append(f"SELL / BUY / STOP labelled at the right edge, money escaped: {labels}")
+    box = [p for p in ax.patches if p.get_label() == "9:20 box"]
+    if len(box) != 1 or box[0].get_x() != 1.0 or box[0].get_height() != 3.0:
+        failures.append("the 9:20 box starts at 9:20 and spans its prices")
+    lines = [ln for ln in ax.lines if ln.get_label() in ("SELL", "BUY", "STOP")]
+    if len(lines) != 3 or any(ln.get_xdata()[0] != 6.0 for ln in lines):
+        failures.append("the final lines start when pass 2 set them (9:45)")
+    if len(ax.collections) != 1:
+        failures.append("the flush buy is marked")
+    plt.close(fig)
+    fig, ax = plt.subplots()
+    draw_plan(ax, None, slots)
+    draw_plan(ax, {"flush": {"skip": "too deep"}, "flush_time": "09:33"}, slots)
+    if ax.patches or ax.lines or ax.collections:
+        failures.append("no plan, or a skipped flush, draws nothing")
+    plt.close(fig)
+    if plan_text("✅ Go $1 and ⛔ $2") != r"GO: Go \$1 and NO: \$2":
+        failures.append(f"emoji become words for the PDF: {plan_text('✅ Go $1 and ⛔ $2')}")
+
+    pages = []
+
+    class Pages:
+        def savefig(self, figure, **kw):
+            pages.append([t.get_text() for t in figure.texts])
+
+        def infodict(self):
+            return {}
+
+    page_plan(Pages(), planned)
+    words = " ".join(pages[-1]) if pages else ""
+    for want in ("Day plan", "To do (9:00 AM)", "Final set-up (09:45)", "GO: Good morning",
+                 "Debrief (4:05 PM)", "Gap: +1.0%"):
+        if want not in words:
+            failures.append(f"the Day plan page should show {want!r}")
+    plt.close("all")
+    with tempfile.TemporaryDirectory() as folder:
+        with open(os.path.join(folder, "SPCX 2026-10-23.json"), "w", encoding="utf-8") as handle:
+            json.dump(plan, handle)
+        if load_plan("SPCX", date(2026, 10, 23), folder) != plan:
+            failures.append("the day's plan file loads")
+        if load_plan("SPCX", date(2026, 10, 22), folder) is not None:
+            failures.append("a day without a plan file has no plan")
+        with open(os.path.join(folder, "SPCX 2026-10-22.json"), "w", encoding="utf-8") as handle:
+            handle.write("{half a file")
+        if load_plan("SPCX", date(2026, 10, 22), folder) is not None:
+            failures.append("a broken plan file is no plan, not a failed report")
 
     if failures:
         print("\nFAILED:")

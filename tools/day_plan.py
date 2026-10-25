@@ -24,9 +24,11 @@ and into one sheet per day:
              (S&P turned down, or a quiet open), never on.
   4:05 PM    DEBRIEF. What the lines did, what the flush did, the day.
 
-Everything is also written to daily/SPCX YYYY-MM-DD.json and .html beside
-this file (the day's sheet, with the 9:00 to-do list), and one row per day
-to daily/spcx_plan_log.csv. All of it stays on this PC.
+Everything is also written to daily/SPCX YYYY-MM-DD.json beside this file
+(the day's sheet, with the 9:00 to-do list), and one row per day to
+daily/spcx_plan_log.csv. All of it stays on this PC. The day's PDF
+(daily_report.py, rebuilt by the SPCX alarms every 15 minutes) reads that
+JSON: the zones drawn on the chart, and a "Day plan" page with every step.
 
 Prices only. Nothing here reads an account or places an order: the texts
 say where the lines are, and Jason decides.
@@ -38,7 +40,6 @@ say where the lines are, and Jason decides.
 from __future__ import annotations
 
 import csv
-import html
 import json
 import math
 import os
@@ -343,26 +344,6 @@ class Day:
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(self.data, handle, indent=1, default=str)
         os.replace(tmp, self.path)
-        with open(self.path[:-5] + ".html", "w", encoding="utf-8") as handle:
-            handle.write(sheet_html(self.data))
-
-
-def sheet_html(d: dict) -> str:
-    def block(title, body):
-        return f"<h2>{html.escape(title)}</h2><pre>{html.escape(body)}</pre>" if body else ""
-    parts = [block("To do (9:00 AM)", d.get("todo")),
-             block("Set-up, pass 1 (9:20 AM)", d.get("pass1_text")),
-             block(f"Flush ({d.get('flush_time', '')})", d.get("flush_text")),
-             block(f"Final set-up ({d.get('pass2_time', '')})", d.get("pass2_text")),
-             block("Debrief (4:05 PM)", d.get("debrief_text")),
-             block("Morning type (the log)", "\n".join(f"{k}: {v}" for k, v in d.get("context", {}).items()))]
-    return ("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' "
-            "content='width=device-width, initial-scale=1'>"
-            f"<title>SPCX {d.get('day')}</title><style>body{{font-family:system-ui,sans-serif;"
-            "max-width:760px;margin:16px auto;padding:0 16px;background:#fafaf8;color:#222}}"
-            "pre{white-space:pre-wrap;background:#fff;border:1px solid #ddd;padding:12px;"
-            "border-radius:6px;font-size:15px}h2{font-size:17px;margin-top:22px}</style></head>"
-            f"<body><h1>SPCX day sheet, {d.get('day')}</h1>{''.join(parts)}</body></html>")
 
 
 LOG_FIELDS = ["day", "gap_pct", "spy_pre_pct", "spy_pass2_pct", "event", "go_920", "go_final",
@@ -721,9 +702,10 @@ def self_test() -> int:
         ok(len(p2t) == 1 and "⛔ S&P down before the open" in p2t[0], f"pass 2 keeps the NO: {p2t}")
         db = [s for s in texts if s.startswith("SPCX debrief")]
         ok(len(db) == 1 and "Flush: bought" in db[0] and "Day: open $147.93" in db[0], f"one debrief: {db}")
-        sheet = open(os.path.join(folder, f"SPCX {D1.isoformat()}.html"), encoding="utf-8").read()
-        ok("To do (9:00 AM)" in sheet and "Final set-up" in sheet and "Debrief" in sheet
-           and "S&amp;P before the open" in sheet, "the day sheet has every part")
+        sheet = json.load(open(os.path.join(folder, f"SPCX {D1.isoformat()}.json"), encoding="utf-8"))
+        ok(all(sheet.get(k) for k in ("todo", "pass1_text", "flush_text", "pass2_text", "debrief_text"))
+           and "S&P before the open" in sheet.get("context", {}),
+           f"the day sheet the PDF reads has every part: {sorted(sheet)}")
         rows = list(csv.DictReader(open(log, encoding="utf-8")))
         ok(len(rows) == 1 and rows[0]["flush"] == "yes" and rows[0]["go_920"] == "False",
            f"one log row: {rows}")
