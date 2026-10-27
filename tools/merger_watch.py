@@ -28,15 +28,18 @@ and at 9:20; no repeating emergency alarms):
   NORMAL     - the 9:00 to-do list (todo_watch.py)
              - the day plan's sounds (day_plan.py): 9:20 set-up, the flush
                buy (LOUD), and a final set-up that takes the dip buy away
-  QUIET      everything else arrives with no sound:
+  SUMMARY    two quiet merger summaries a day, 08:30 and 16:15 ET (27 Oct):
+             the odds by date and their change since the last summary,
+             and, held for it rather than sent one by one:
              - odds up or down 15+ points in a day, or 10+ in an hour
              - any other 8-K, a deadline passed with no announcement
              - SPCX or TSLA paused for volatility
+             The afternoon one adds the next 14 days' calendar.
+  QUIET      the rest arrives with no sound:
              - SPCX headlines (spcx_news.py) and the 7:00 digest
              - calendar reminders
              - a source unreachable for 30 minutes ("merger watch is
                blind"), or the SPCX alarms not running
-             - the odds at 19:45 ET each day
 
 The Polymarket markets are small -- a few thousand dollars behind each
 date -- so one bettor can move them. That is why a jump in the odds is
@@ -162,8 +165,17 @@ RECENT_HALT = timedelta(hours=6)
 HISTORY_KEEP = timedelta(hours=48)
 
 BLIND_AFTER = timedelta(minutes=30)
-SUMMARY_AT = time(19, 45)
-SUMMARY_LATEST = time(21, 45)
+#: Everything about the merger short of a MAJOR event waits for one of two
+#: quiet summaries a day, every day (27 Oct): the odds by date with their
+#: change since the last summary, and what happened in between. A watcher
+#: started more than SUMMARY_LATE after a summary's time skips it; what it
+#: held goes in the next one.
+SUMMARIES = (("morning", time(8, 30)), ("afternoon", time(16, 15)))
+SUMMARY_LATE = timedelta(hours=2)
+#: The sources whose minor findings wait for a summary.
+MERGER_SOURCES = ("polymarket", "halts", "sec")
+#: Pushover's limit for one message.
+SUMMARY_MAX = 1024
 #: A message Pushover could not take is retried this long, then dropped.
 PENDING_KEEP = timedelta(hours=2)
 
@@ -224,7 +236,8 @@ class Filing:
 def new_state() -> dict:
     return {"seen_filings": [], "seen_halts": [], "odds": {}, "labels": {},
             "open_seen": [], "rung": {}, "last_ok": {}, "blind": [],
-            "summary_date": "", "pending": [], "cal_sent": {}, "news_seen": [],
+            "summaries_sent": {}, "held": [], "summary_odds": {},
+            "pending": [], "cal_sent": {}, "news_seen": [],
             "news_primed": False, "earnings_estimate": None}
 
 
@@ -477,30 +490,62 @@ def blind_alerts(state: dict, now: datetime, enabled: List[str],
     return alerts
 
 
+def hold_back(alerts: List[Alert], state: dict, now: datetime) -> List[Alert]:
+    """A merger source's MAJOR alerts go now; the rest wait for a summary,
+    by their first line (a filing's link line stays out of it)."""
+    out = []
+    for alert in alerts:
+        if alert.priority == PRIORITY_MAJOR:
+            out.append(alert)
+        else:
+            first = alert.message.split("\n")[0]
+            state["held"].append([_iso(now), first])
+            log(f"held for the summary: {first}")
+    state["held"] = state["held"][-200:]
+    return out
+
+
 def summary_alert(state: dict, now: datetime, sec_on: bool,
                   coming: Optional[List[str]] = None) -> List[Alert]:
+    """The morning or the afternoon merger summary, once each a day."""
     today = f"{now:%Y-%m-%d}"
-    if state["summary_date"] == today or now.time() < SUMMARY_AT:
+    due = [(name, at) for name, at in SUMMARIES
+           if now.time() >= at and state["summaries_sent"].get(name) != today]
+    if not due:
         return []
-    state["summary_date"] = today
-    if now.time() > SUMMARY_LATEST:
-        return []   # started late: tomorrow's comes on time
+    name, at = due[-1]
+    for skipped, _ in due:
+        state["summaries_sent"][skipped] = today
+    if now - now.replace(hour=at.hour, minute=at.minute, second=0, microsecond=0) > SUMMARY_LATE:
+        return []   # started late: what was held goes in the next one
     lines = []
     for slug, history in state["odds"].items():
         if not history or slug not in state["labels"]:
             continue
         latest = history[-1][1]
-        day_ago = [pct for when, pct in history
-                   if now - datetime.fromisoformat(when) >= timedelta(hours=23)]
-        change = f" ({latest - day_ago[-1]:+.0f} in 24h)" if day_ago else ""
+        before = state["summary_odds"].get(slug)
+        change = f" ({latest - before:+.0f})" if before is not None else ""
         lines.append((_label_key(state["labels"][slug]),
                       f"by {state['labels'][slug]}: {latest:.0f}%{change}"))
-    body = "\n".join(line for _, line in sorted(lines)) or "no odds read yet"
+        state["summary_odds"][slug] = latest
+    body = "Odds (change since the last summary):\n" + (
+        "\n".join(line for _, line in sorted(lines)) or "no odds read yet")
+    held = state["held"]
+    state["held"] = []
+    if held:
+        items = [f"- {datetime.fromisoformat(when).astimezone(ET):%a %H:%M} {text}"
+                 for when, text in held]
+        body += "\n\nSince the last summary:\n" + "\n".join(items)
+    else:
+        body += "\n\nNothing new since the last summary."
+    if name == "afternoon" and coming:
+        body += "\n\nComing up (14 days):\n" + "\n".join(coming)
     if not sec_on:
         body += "\nSEC check is OFF: add SEC_CONTACT to .env."
-    if coming:
-        body += "\n\nComing up (14 days):\n" + "\n".join(coming)
-    return [Alert(PRIORITY_SILENT, f"Merger odds tonight:\n{body}")]
+    head = f"Merger summary, {name}:\n"
+    if len(head) + len(body) > SUMMARY_MAX:
+        body = body[:SUMMARY_MAX - len(head) - 25].rsplit("\n", 1)[0] + "\n(more in merger_watch.log)"
+    return [Alert(PRIORITY_SILENT, head + body)]
 
 
 def _label_key(label: str) -> datetime:
@@ -716,7 +761,9 @@ def watch(dry_run: bool, once: bool, state_path: str) -> int:
                 continue
             due[source] = time_mod.monotonic() + INTERVALS[source]
             try:
-                alerts += check_source(source, state, now, contact)
+                got = check_source(source, state, now, contact)
+                alerts += hold_back(got, state, now) if (
+                    source in MERGER_SOURCES and not once) else got
             except Exception as exc:  # noqa: BLE001 -- one source failing must not stop the rest
                 log(f"{SOURCE_NAMES[source]}: {type(exc).__name__}: {str(exc)[:120]}")
         if watch is not None:
@@ -936,24 +983,51 @@ def self_test() -> int:
     if len(a) != 1 or a[0].priority != PRIORITY_SILENT:
         failures.append("recovery should be one quiet note")
 
-    # Summary: once a day at 19:45, silent; a late start skips the day.
-    s = new_state()
-    s["labels"] = {"m": "Jan 31, 2027"}
-    s["odds"] = {"m": [[_iso(t0), 30.0], [_iso(t0 + timedelta(hours=7, minutes=50)), 38.0]]}
-    evening = t0 + timedelta(hours=7, minutes=50)
-    a = summary_alert(s, evening, True)
-    if len(a) != 1 or a[0].priority != PRIORITY_SILENT or "38%" not in a[0].message:
-        failures.append(f"the evening summary is one silent note: {a}")
-    if summary_alert(s, evening + timedelta(minutes=5), True):
-        failures.append("the summary should come once a day")
-    if summary_alert(new_state(), t0 + timedelta(hours=11), True):
-        failures.append("a watcher started at 23:00 should not send that day's summary")
-    if summary_alert(new_state(), t0, True):
-        failures.append("no summary before 19:45")
+    # Merger summaries: 08:30 and 16:15, quiet; minor findings wait for them.
+    global LOG_PATH
+    saved_log, LOG_PATH = LOG_PATH, os.devnull
+    try:
+        s = new_state()
+        s["labels"] = {"m": "Jan 31, 2027", "n": "Dec 31, 2026"}
+        s["odds"] = {"m": [[_iso(t0), 38.0]], "n": [[_iso(t0), 22.0]]}
+        noon = t0.replace(hour=12, minute=0)
+        if summary_alert(s, noon, True, ["Dec 08 unlock"]) or s["summaries_sent"].get("morning") is None:
+            failures.append("started at noon: the morning summary is skipped, not sent late")
+        if summary_alert(s, noon.replace(hour=16, minute=14), True):
+            failures.append("no afternoon summary before 16:15")
+        a = summary_alert(s, noon.replace(hour=16, minute=15), True, ["Dec 08 unlock"])
+        if (len(a) != 1 or a[0].priority != PRIORITY_SILENT
+                or not a[0].message.startswith("Merger summary, afternoon:\nOdds (change since "
+                                               "the last summary):\nby Dec 31, 2026: 22%\n"
+                                               "by Jan 31, 2027: 38%\n\nNothing new")
+                or "Coming up (14 days):\nDec 08 unlock" not in a[0].message):
+            failures.append(f"the afternoon summary: odds by date, nothing new, what is coming: {a}")
+        if summary_alert(s, noon.replace(hour=16, minute=20), True):
+            failures.append("each summary comes once a day")
+        major = Alert(PRIORITY_MAJOR, "TESLA filed a Form 425\nhttps://sec/x")
+        minor = Alert(PRIORITY_SILENT, "Tesla filed an 8-K (2.02 earnings). Mon 10/19 07:12 ET.\nhttps://sec/y")
+        evening = noon.replace(hour=19, minute=12)
+        if hold_back([major, minor], s, evening) != [major] \
+                or s["held"] != [[_iso(evening), "Tesla filed an 8-K (2.02 earnings). Mon 10/19 07:12 ET."]]:
+            failures.append(f"a major alert goes now, a minor one waits by its first line: {s['held']}")
+        s["odds"]["m"].append([_iso(evening), 41.0])
+        morning = noon.replace(hour=8, minute=30) + timedelta(days=1)
+        a = summary_alert(s, morning, False, ["Dec 08 unlock"])
+        if (len(a) != 1 or "Merger summary, morning:" not in a[0].message
+                or "by Jan 31, 2027: 41% (+3)" not in a[0].message or "by Dec 31, 2026: 22% (+0)" not in a[0].message
+                or "Since the last summary:\n- " not in a[0].message
+                or "19:12 Tesla filed an 8-K (2.02 earnings)" not in a[0].message
+                or "Coming up" in a[0].message or "SEC check is OFF" not in a[0].message or s["held"]):
+            failures.append(f"the morning summary: changes since the last, what was held, held cleared: {a}")
+        s["held"] = [[_iso(morning), "x" * 60] for _ in range(40)]
+        a = summary_alert(s, morning.replace(hour=16, minute=15), True)
+        if not a or len(a[0].message) > SUMMARY_MAX or "(more in merger_watch.log)" not in a[0].message:
+            failures.append(f"a long summary is cut to Pushover's limit: {len(a[0].message) if a else a}")
+    finally:
+        LOG_PATH = saved_log
 
     # A dry run prints and queues nothing. Its log line goes nowhere, so
     # the self-test leaves no file behind.
-    global LOG_PATH
     saved_log, LOG_PATH = LOG_PATH, os.devnull
     try:
         s = new_state()
@@ -1100,6 +1174,8 @@ def self_test() -> int:
             sys.modules["day_plan"] = real_plan
         else:
             sys.modules.pop("day_plan", None)
+    if "hold_back(got, state, now)" not in inspect.getsource(watch):
+        failures.append("the watch loop must hold the merger sources' minor findings")
     if "plan_tick(" not in inspect.getsource(watch):
         failures.append("the watch loop must run the day plan")
     if "todo_watch.morning(" not in inspect.getsource(watch):
