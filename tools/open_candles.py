@@ -474,6 +474,13 @@ IBKR_CLIENT_ID = int(os.environ.get("IBKR_ALARM_CLIENT_ID", "7703"))
 #: overnight alarms are blind. A quiet tape is not silence -- an empty
 #: answer is still an answer -- so this only counts failures.
 GATEWAY_BLIND_MINUTES = 10
+#: Where the night is read from (27 Oct). Alpaca's "boats" feed (Blue Ocean,
+#: the overnight venue) was found 27 Oct with Jason's paid plan: 347 SPCX
+#: minutes on the night of 25 Oct, current to the minute -- so the night no
+#: longer needs IB Gateway, which a login to IBKR on the phone or in DAS
+#: logs out. OVERNIGHT_SOURCE=ibkr in .env goes back to IB Gateway.
+OVERNIGHT_SOURCE_DEFAULT = "alpaca"
+ALPACA_BARS_URL = "https://data.alpaca.markets/v2/stocks/bars"
 
 
 #: THE WATCHDOG (20 Oct). Set by main() for an around-the-clock run: this
@@ -2430,7 +2437,7 @@ def run_live(symbol: str, start: time, end: time, dry_run: bool,
 
 
 # --------------------------------------------------------------------------
-# Overnight: 20:00-03:50 through IB Gateway
+# Overnight: 20:00-03:50 on Alpaca's overnight feed (or IB Gateway, see night_source)
 # --------------------------------------------------------------------------
 
 def overnight_window(now: datetime) -> Optional[Tuple[datetime, datetime]]:
@@ -2457,8 +2464,8 @@ def next_session(now: datetime, start: time,
                  end: time) -> Tuple[str, datetime, datetime]:
     """("day" or "night", start, end): the session under way, or the next.
 
-    Days are weekdays from `start` to `end` on Alpaca; nights are the IBKR
-    overnight session. A day still counts as under way for one candle
+    Days are weekdays from `start` to `end` on Alpaca; nights are the
+    overnight session (Alpaca's overnight feed, or IBKR's). A day still counts as under way for one candle
     past `end`, the time run_live spends closing its last one.
     """
     night = overnight_window(now)
@@ -2500,6 +2507,75 @@ def bars_frame(bars, start: datetime) -> pd.DataFrame:
     return frame[frame.index >= start]
 
 
+class AlpacaNight:
+    """Alpaca's overnight feed (Blue Ocean), read-only: one-minute bars.
+
+    The same two calls as Gateway, so the night loop does not care which
+    it reads. Plain HTTP rather than alpaca-py, whose DataFeed only names
+    "boats" in recent versions. Market data only: no trading client.
+    """
+
+    name = "Alpaca's overnight data"
+    advice = "Check the PC's internet connection and the Alpaca keys in .env."
+    TIMEOUT = 20
+
+    def __init__(self, symbol: str, opener=None):
+        import urllib.request
+
+        self.symbol = symbol
+        self.opener = opener or urllib.request.urlopen
+
+    def describe(self) -> str:
+        return "Alpaca overnight feed (Blue Ocean), read-only"
+
+    def minutes(self, start: datetime, now: datetime) -> pd.DataFrame:
+        import json
+        import urllib.parse
+        import urllib.request
+
+        key, secret = load_credentials()
+
+        def utc(at: datetime) -> str:
+            return at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        rows, token = [], None
+        while True:
+            query = {"symbols": self.symbol, "timeframe": "1Min", "start": utc(start),
+                     "end": utc(now), "feed": "boats", "limit": 10000, "sort": "asc"}
+            if token:
+                query["page_token"] = token
+            request = urllib.request.Request(
+                f"{ALPACA_BARS_URL}?{urllib.parse.urlencode(query)}",
+                headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret})
+            with self.opener(request, timeout=self.TIMEOUT) as response:
+                page = json.loads(response.read().decode("utf-8"))
+            for bar in (page.get("bars") or {}).get(self.symbol) or []:
+                at = pd.Timestamp(bar["t"])
+                at = at.tz_localize("UTC") if at.tzinfo is None else at
+                rows.append((at.tz_convert(ET), float(bar["o"]), float(bar["h"]),
+                             float(bar["l"]), float(bar["c"]), max(0.0, float(bar["v"])),
+                             float(bar.get("n", 0) or 0)))
+            token = page.get("next_page_token")
+            if not token:
+                break
+        frame = pd.DataFrame(rows, columns=["at", "open", "high", "low", "close",
+                                            "volume", "trade_count"])
+        if frame.empty:
+            return pd.DataFrame()
+        frame = frame.set_index("at").sort_index()
+        frame.index = pd.DatetimeIndex(frame.index)
+        return frame[frame.index >= start]
+
+    def close(self) -> None:
+        pass
+
+
+def night_source(symbol: str):
+    """The overnight feed .env asks for: Alpaca unless OVERNIGHT_SOURCE=ibkr."""
+    choice = os.getenv("OVERNIGHT_SOURCE", OVERNIGHT_SOURCE_DEFAULT).strip().lower()
+    return Gateway(symbol) if choice == "ibkr" else AlpacaNight(symbol)
+
+
 class Gateway:
     """IB Gateway, read-only: one-minute bars on the OVERNIGHT route.
 
@@ -2510,6 +2586,12 @@ class Gateway:
     #: Status chatter, not failures: data farms connecting, and so on.
     QUIET = (300, 2104, 2106, 2107, 2108, 2119, 2158)
     TIMEOUT = 30
+    name = "IB Gateway"
+    advice = ("Log IB Gateway back in. A login to IBKR on the phone or in DAS "
+              "with the same username logs it out.")
+
+    def describe(self) -> str:
+        return f"IB Gateway {IBKR_HOST}:{IBKR_PORT}, client {IBKR_CLIENT_ID}, read-only"
 
     def __init__(self, symbol: str):
         self.symbol = symbol
@@ -2646,7 +2728,8 @@ def run_overnight(symbol: str, night_start: datetime, night_end: datetime,
                   clock=None, sleep=None, send=None,
                   loud_percent: float = LOUD_PERCENT,
                   loud_evening: float = LOUD_PERCENT_EVENING) -> int:
-    """One overnight session, read from IB Gateway, rung like the day.
+    """One overnight session, read from Alpaca's overnight feed (or IB
+    Gateway, see night_source), rung like the day.
 
     Every minute goes through the same Alarms, Trend and Persist the day
     uses, and a ring goes out on the first bar that earns it. Only rings
@@ -2654,18 +2737,19 @@ def run_overnight(symbol: str, night_start: datetime, night_end: datetime,
     noise. No volume gate -- Alarms drops it outside regular hours -- and
     no market alarm, because the S&P does not trade overnight.
 
-    If IB Gateway stops answering for GATEWAY_BLIND_MINUTES the phone is
+    If the feed stops answering for GATEWAY_BLIND_MINUTES the phone is
     told once that the alarms are blind, and again when they can see.
     """
     clock = clock or (lambda: datetime.now(ET))
     sleep = sleep or time_mod.sleep
     send = send or deliver
-    gateway = gateway or Gateway(symbol)
+    gateway = gateway or night_source(symbol)
+    source = getattr(gateway, "name", "The overnight feed")
     day = reference if reference is not None else overnight_reference(symbol, night_start)
     upmove = UpMove(symbol=symbol)
 
     print(f"\n{symbol} OVERNIGHT · {night_start:%a %H:%M} – {night_end:%a %H:%M} ET "
-          f"· IB Gateway {IBKR_HOST}:{IBKR_PORT}, client {IBKR_CLIENT_ID}, read-only")
+          f"· {gateway.describe() if hasattr(gateway, 'describe') else source}")
     print(f"  alarm bands: {alarm_policy(alarms)}")
     if day is not None:
         print(f"  measured from the {REGULAR_CLOSE:%H:%M} close, {money(day.last)}")
@@ -2692,21 +2776,20 @@ def run_overnight(symbol: str, night_start: datetime, night_end: datetime,
                 last_ok = now
                 if blind:
                     blind = False
-                    status = send(f"IB Gateway is answering again. Overnight "
+                    status = send(f"{source} is answering again. Overnight "
                                   f"{symbol} alarms are back on.",
                                   f"{symbol} overnight", PRIORITY_UPDATE, dry_run)
                     print(f"  {now:%H:%M}  gateway back  [{status}]")
             except Exception as exc:  # noqa: BLE001 -- one bad pass is not the night
                 reason = f"{type(exc).__name__}: {str(exc)[:100]}"
-                print(f"  {now:%H:%M}  IB Gateway: {reason}")
+                print(f"  {now:%H:%M}  {source}: {reason}")
                 frame = pd.DataFrame()
                 if not blind and now - last_ok >= timedelta(minutes=GATEWAY_BLIND_MINUTES):
                     blind = True
                     status = send(
-                        f"IB Gateway has not answered for {GATEWAY_BLIND_MINUTES} "
+                        f"{source} has not answered for {GATEWAY_BLIND_MINUTES} "
                         f"minutes ({reason}). Overnight {symbol} alarms are BLIND "
-                        f"until it does. Log IB Gateway back in. A login to IBKR "
-                        f"on the phone or in DAS with the same username logs it out.",
+                        f"until it does. {getattr(gateway, 'advice', '')}".rstrip(),
                         f"{symbol} overnight BLIND", PRIORITY_UPDATE, dry_run)
                     print(f"  {now:%H:%M}  ** overnight alarms blind **  [{status}]")
 
@@ -2764,7 +2847,7 @@ def run_overnight(symbol: str, night_start: datetime, night_end: datetime,
 
 def run_around_the_clock(start: time, end: time, day_run, night_run,
                          clock=None, sleep=None, sessions: Optional[int] = None) -> int:
-    """Day on Alpaca, night on IB Gateway, for as long as it is left running.
+    """Day on Alpaca, night on night_source(), for as long as it is left running.
 
     `day_run()` runs one day window; `night_run(start, end, started)` one
     overnight session. Between them it waits -- Friday 20:00 to Sunday
@@ -2898,7 +2981,7 @@ def overnight_checks() -> List[str]:
             self.closed = True
 
     def night(prices, started_at, start=None, end_minutes=30, down=(), anchor=reference,
-              forming=None, loud=LOUD_PERCENT, evening=1.0):
+              forming=None, loud=LOUD_PERCENT, evening=1.0, like=None):
         start = start or at(*sun, 20, 0)
         clock = Clock(start)
         sent = []
@@ -2911,6 +2994,8 @@ def overnight_checks() -> List[str]:
         db = sqlite3.connect(":memory:")
         ensure_schema(db)
         gateway = FakeGateway(tape(start, prices), clock, down, forming)
+        if like is not None:            # wear a real source's name and advice
+            gateway.name, gateway.advice = like.name, like.advice
         with contextlib.redirect_stdout(io.StringIO()):
             run_overnight("SPCX", start, start + timedelta(minutes=end_minutes), True, db,
                           Alarms(), Trend(), Persist(gap=30),
@@ -3117,6 +3202,73 @@ def overnight_checks() -> List[str]:
             or "again" not in sent[1].message):
         failures.append(f"gateway down should be one BLIND alarm at ~20:10 and one "
                         f"recovery note: {notes}")
+
+    import json
+    import urllib.error
+    # 27 Oct: the night reads Alpaca. Blind, it says so by name, with
+    # advice that fits -- no "log IB Gateway back in".
+    sent = night([close] * 30, started_at=at(*sun, 20, 0),
+                 down=[(at(*sun, 20, 0), at(*sun, 20, 25))], like=AlpacaNight)
+    if (len(sent) != 2 or "Alpaca's overnight data has not answered for 10 minutes"
+            not in sent[0].message or AlpacaNight.advice not in sent[0].message
+            or "IB Gateway" in sent[0].message
+            or not sent[1].message.startswith("Alpaca's overnight data is answering again")):
+        failures.append(f"a blind Alpaca night names Alpaca: {[s.message for s in sent]}")
+
+    # Alpaca's answer, two pages of it, read into the frame the loop uses.
+    asked = []
+
+    class Answer(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    pages = [{"bars": {"SPCX": [{"t": "2026-10-19T00:00:00Z", "o": 147.5, "h": 147.6,
+                                  "l": 147.4, "c": 147.55, "v": 900, "n": 12},
+                                 {"t": "2026-10-19T00:01:00Z", "o": 147.55, "h": 147.7,
+                                  "l": 147.5, "c": 147.68, "v": 1200, "n": 20}]},
+              "next_page_token": "p2"},
+             {"bars": {"SPCX": [{"t": "2026-10-19T00:02:00Z", "o": 147.68, "h": 147.8,
+                                  "l": 147.6, "c": 147.75, "v": 700, "n": 9}]},
+              "next_page_token": None}]
+
+    def opener(request, timeout=None):
+        asked.append((request.full_url, request.get_header("Apca-api-key-id")))
+        return Answer(json.dumps(pages[len(asked) - 1]).encode())
+    saved = {k: os.environ.get(k) for k in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY",
+                                            "OVERNIGHT_SOURCE")}
+    os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"] = "id", "secret"
+    try:
+        frame = AlpacaNight("SPCX", opener=opener).minutes(at(*sun, 20, 1), at(*sun, 20, 5))
+        if (list(frame.index.strftime("%H:%M")) != ["20:01", "20:02"]
+                or frame["close"].tolist() != [147.68, 147.75]
+                or frame["trade_count"].tolist() != [20.0, 9.0]):
+            failures.append(f"Alpaca's overnight bars, in Eastern time, from the start on: {frame}")
+        if (len(asked) != 2 or "feed=boats" not in asked[0][0] or "page_token=p2" not in asked[1][0]
+                or "start=2026-10-19T00%3A01%3A00Z" not in asked[0][0] or asked[0][1] != "id"):
+            failures.append(f"asks the boats feed, in UTC, signed, page by page: {asked}")
+
+        def refused(request, timeout=None):
+            raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
+        try:
+            AlpacaNight("SPCX", opener=refused).minutes(at(*sun, 20, 0), at(*sun, 20, 5))
+            failures.append("a refused request must raise, so the night counts it as blind")
+        except urllib.error.HTTPError:
+            pass
+        os.environ.pop("OVERNIGHT_SOURCE", None)
+        if not isinstance(night_source("SPCX"), AlpacaNight):
+            failures.append("the night reads Alpaca unless told otherwise")
+        os.environ["OVERNIGHT_SOURCE"] = "ibkr"
+        if not isinstance(night_source("SPCX"), Gateway):
+            failures.append("OVERNIGHT_SOURCE=ibkr goes back to IB Gateway")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     # Around the clock: wait out the weekend, run the night, then the day,
     # then the next night -- which follows on, so it is not a late start.
@@ -4195,8 +4347,8 @@ def self_test() -> int:
           "the first alarm")
     print(f"  S&P opening call               : once a day at {OPEN_CALL_AT:%H:%M}, "
           f"up or down from yesterday's close")
-    print("  Overnight, IB Gateway          : rings on the first bar, from "
-          "the 16:00 close; blind after 10 min says so")
+    print(f"  Overnight, {night_source(SYMBOL).name:<19} : rings on the first bar, from "
+          f"the 16:00 close; blind after 10 min says so")
     print("  Trading client in this file    : none")
 
     if failures:
@@ -4354,9 +4506,10 @@ def main() -> int:
                              f"spikes do (default {DETAIL_UNTIL:%H:%M})")
     parser.add_argument("--overnight", action="store_true",
                         help="Also watch the overnight session (20:00-03:50, "
-                             "Sunday to Thursday nights) through IB Gateway, "
-                             "and keep running day and night. Needs IB Gateway "
-                             "logged in on port 4001 and ib_async installed")
+                             "Sunday to Thursday nights) on Alpaca's overnight "
+                             "feed, and keep running day and night. "
+                             "OVERNIGHT_SOURCE=ibkr in .env reads IB Gateway "
+                             "instead (port 4001, ib_async installed)")
     parser.add_argument("--dry-run", action="store_true", help="Print, do not send")
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--test-push", action="store_true",
@@ -4444,12 +4597,13 @@ def main() -> int:
         raise SystemExit(f"--overnight needs the day inside "
                          f"{OVERNIGHT_END:%H:%M}-{OVERNIGHT_START:%H:%M}; "
                          f"got {start:%H:%M}-{end:%H:%M}")
-    try:
-        import ib_async  # noqa: F401 -- only the night needs it
-    except ImportError:
-        raise SystemExit("--overnight reads IB Gateway through ib_async, which "
-                         "is not installed for this Python. Install it with:\n"
-                         "    python -m pip install ib_async")
+    if isinstance(night_source(symbol), Gateway):
+        try:
+            import ib_async  # noqa: F401 -- only an IBKR night needs it
+        except ImportError:
+            raise SystemExit("OVERNIGHT_SOURCE=ibkr reads IB Gateway through ib_async, "
+                             "which is not installed for this Python. Install it with:\n"
+                             "    python -m pip install ib_async")
 
     def night_run(night_start: datetime, night_end: datetime,
                   started: datetime) -> int:
@@ -4478,8 +4632,8 @@ def main() -> int:
                                  started=datetime.now(ET))
         _watch.beat(datetime.now(ET))
         print("Watchdog: heartbeat on; the phone hears if the merger watch stops.")
-    print("Around the clock: the day on Alpaca, the overnight session on "
-          "IB Gateway.")
+    print(f"Around the clock: the day on Alpaca, the overnight session on "
+          f"{night_source(symbol).describe()}.")
     try:
         return run_around_the_clock(start, end, day_run, night_run)
     except KeyboardInterrupt:
