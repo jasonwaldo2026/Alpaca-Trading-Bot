@@ -28,7 +28,8 @@ and at 9:20; no repeating emergency alarms):
   NORMAL     - the 9:00 to-do list (todo_watch.py)
              - the day plan's sounds (day_plan.py): 9:20 set-up, the flush
                buy (LOUD), and a final set-up that takes the dip buy away
-  SUMMARY    two quiet merger summaries a day, 08:30 and 16:15 ET (27 Oct):
+  SUMMARY    two merger summaries a day, 08:30 and 16:15 ET (27 Oct), written
+             to merger_watch.log, not sent, since 2 Nov (SUMMARIES_TO_PHONE):
              the odds by date and their change since the last summary,
              and, held for it rather than sent one by one:
              - odds up or down 15+ points in a day, or 10+ in an hour
@@ -171,6 +172,10 @@ BLIND_AFTER = timedelta(minutes=30)
 #: started more than SUMMARY_LATE after a summary's time skips it; what it
 #: held goes in the next one.
 SUMMARIES = (("morning", time(8, 30)), ("afternoon", time(16, 15)))
+#: 2 Nov (Jason: "stop the merger news from going to my phone"): the two
+#: summaries are still built, on time, but written to merger_watch.log
+#: instead of sent. MAJOR events still ring. True sends them again.
+SUMMARIES_TO_PHONE = False
 SUMMARY_LATE = timedelta(hours=2)
 #: The sources whose minor findings wait for a summary.
 MERGER_SOURCES = ("polymarket", "halts", "sec")
@@ -545,6 +550,9 @@ def summary_alert(state: dict, now: datetime, sec_on: bool,
     head = f"Merger summary, {name}:\n"
     if len(head) + len(body) > SUMMARY_MAX:
         body = body[:SUMMARY_MAX - len(head) - 25].rsplit("\n", 1)[0] + "\n(more in merger_watch.log)"
+    if not SUMMARIES_TO_PHONE:
+        log(f"{head}{body}".replace("\n", " | ") + "  (log only: SUMMARIES_TO_PHONE is off)")
+        return []
     return [Alert(PRIORITY_SILENT, head + body)]
 
 
@@ -984,8 +992,10 @@ def self_test() -> int:
         failures.append("recovery should be one quiet note")
 
     # Merger summaries: 08:30 and 16:15, quiet; minor findings wait for them.
-    global LOG_PATH
+    # The build is tested as if they were sent; as shipped they are logged.
+    global LOG_PATH, SUMMARIES_TO_PHONE
     saved_log, LOG_PATH = LOG_PATH, os.devnull
+    saved_phone, SUMMARIES_TO_PHONE = SUMMARIES_TO_PHONE, True
     try:
         s = new_state()
         s["labels"] = {"m": "Jan 31, 2027", "n": "Dec 31, 2026"}
@@ -1023,8 +1033,25 @@ def self_test() -> int:
         a = summary_alert(s, morning.replace(hour=16, minute=15), True)
         if not a or len(a[0].message) > SUMMARY_MAX or "(more in merger_watch.log)" not in a[0].message:
             failures.append(f"a long summary is cut to Pushover's limit: {len(a[0].message) if a else a}")
+        SUMMARIES_TO_PHONE = False
+        logged = []
+        real_log = globals()["log"]
+        globals()["log"] = logged.append
+        try:
+            s2 = new_state()
+            s2["held"] = [[_iso(noon), "Tesla filed an 8-K (2.02 earnings)."]]
+            a = summary_alert(s2, noon.replace(hour=16, minute=15), True)
+        finally:
+            globals()["log"] = real_log
+        if a or len(logged) != 1 or "Merger summary, afternoon:" not in logged[0] \
+                or "Tesla filed an 8-K" not in logged[0] or s2["held"] \
+                or s2["summaries_sent"].get("afternoon") is None:
+            failures.append(f"as shipped, a summary is logged, not sent, and still clears what it held: "
+                            f"{a} {logged}")
     finally:
-        LOG_PATH = saved_log
+        LOG_PATH, SUMMARIES_TO_PHONE = saved_log, saved_phone
+    if saved_phone:
+        failures.append("as shipped, merger summaries stay off the phone (SUMMARIES_TO_PHONE)")
 
     # A dry run prints and queues nothing. Its log line goes nowhere, so
     # the self-test leaves no file behind.
