@@ -15,6 +15,7 @@ line is your call.
 
     python drop_alert.py --entry 138.65                 # SPCX, 0.625% under the entry
     python drop_alert.py --entry 138.65 --from high     # 0.625% under the high since now
+    python drop_alert.py --entry 133.64 --from high --dollars 0.50   # 50 cents under the high
     python drop_alert.py --symbol TSLA --entry 250 --pct 1
     python drop_alert.py --entry 138.65 --dry-run       # print, do not send
     python drop_alert.py --self-test
@@ -42,16 +43,19 @@ def feed_for(now: datetime) -> str:
     return "boats" if t >= dtime(20, 0) or t < dtime(4, 0) else "sip"
 
 
-def alarm_line(entry: float, high: float, pct: float, mode: str) -> float:
-    """The price that rings: under the entry, or under the highest price seen."""
+def alarm_line(entry: float, high: float, pct: float, mode: str,
+               dollars: Optional[float] = None) -> float:
+    """The price that rings: under the entry, or under the highest price seen,
+    by `dollars` if given (5 Nov: "Lets do 50 cents"), else by `pct` percent."""
     base = max(entry, high) if mode == "high" else entry
-    return round(base * (1 - pct / 100.0), 2)
+    return round(base - dollars, 2) if dollars else round(base * (1 - pct / 100.0), 2)
 
 
 def message(symbol: str, price: float, entry: float, high: float, pct: float,
-            mode: str, line: float) -> str:
+            mode: str, line: float, dollars: Optional[float] = None) -> str:
     base = f"the high ${high:,.2f}" if mode == "high" else f"your entry ${entry:,.2f}"
-    return (f"{symbol} DOWN {pct:g}%: now ${price:,.2f}, from {base} "
+    size = f"${dollars:.2f}" if dollars else f"{pct:g}%"
+    return (f"{symbol} DOWN {size}: now ${price:,.2f}, from {base} "
             f"(alarm line ${line:,.2f}). Prices only - your call.")
 
 
@@ -65,7 +69,8 @@ def latest_price(symbol: str, now: datetime) -> float:
 
 
 def watch(symbol: str, entry: float, pct: float, mode: str, every: float,
-          dry_run: bool, read=latest_price, send=None, clock=None, sleep=time.sleep) -> int:
+          dry_run: bool, read=latest_price, send=None, clock=None, sleep=time.sleep,
+          dollars: Optional[float] = None) -> int:
     clock = clock or (lambda: datetime.now(ET))
     if send is None:
         from spcx_alert import PRIORITY_EMERGENCY, send_pushover
@@ -73,9 +78,10 @@ def watch(symbol: str, entry: float, pct: float, mode: str, every: float,
         def send(text):
             return send_pushover(text, title=f"{symbol} drop alarm", priority=PRIORITY_EMERGENCY)
     high = entry
-    print(f"Watching {symbol}: alarm {pct:g}% under "
+    size = f"${dollars:.2f}" if dollars else f"{pct:g}%"
+    print(f"Watching {symbol}: alarm {size} under "
           f"{'the highest price from now' if mode == 'high' else f'your entry ${entry:,.2f}'}"
-          f" -> ${alarm_line(entry, high, pct, mode):,.2f} now. Ctrl+C stops it.")
+          f" -> ${alarm_line(entry, high, pct, mode, dollars):,.2f} now. Ctrl+C stops it.")
     shown: Optional[str] = None
     while True:
         now = clock()
@@ -86,13 +92,13 @@ def watch(symbol: str, entry: float, pct: float, mode: str, every: float,
             sleep(every)
             continue
         high = max(high, price)
-        line = alarm_line(entry, high, pct, mode)
+        line = alarm_line(entry, high, pct, mode, dollars)
         row = f"  {now:%H:%M:%S}  {symbol} ${price:,.2f}   alarm at ${line:,.2f}"
         if row != shown:
             print(row)
             shown = row
         if price <= line:
-            text = message(symbol, price, entry, high, pct, mode, line)
+            text = message(symbol, price, entry, high, pct, mode, line, dollars)
             if dry_run:
                 print(f"  [dry run] would send: {text}")
             else:
@@ -116,11 +122,14 @@ def self_test() -> int:
     ok(alarm_line(138.65, 140.00, 0.625, "entry") == 137.78, "from the entry, the line never moves")
     ok(alarm_line(138.65, 140.00, 0.625, "high") == 139.12, "from the high, the line trails it up")
     ok(alarm_line(138.65, 137.00, 0.625, "high") == 137.78, "from the high, it starts at the entry")
+    ok(alarm_line(133.64, 133.64, 0.625, "high", 0.50) == 133.14
+       and alarm_line(133.64, 136.00, 0.625, "high", 0.50) == 135.50
+       and alarm_line(133.64, 136.00, 0.625, "entry", 0.50) == 133.14, "50 cents under the high, or the entry")
     ok(feed_for(datetime(2026, 11, 5, 21, 0, tzinfo=ET)) == "boats"
        and feed_for(datetime(2026, 11, 5, 3, 59, tzinfo=ET)) == "boats"
        and feed_for(datetime(2026, 11, 5, 4, 0, tzinfo=ET)) == "sip", "overnight reads Blue Ocean")
 
-    def run(prices, mode, fail_first=False):
+    def run(prices, mode, fail_first=False, dollars=None):
         sent, it = [], iter(prices)
         state = {"fail": fail_first}
 
@@ -137,7 +146,8 @@ def self_test() -> int:
         import io
         with contextlib.redirect_stdout(io.StringIO()):
             watch("SPCX", 138.65, 0.625, mode, 0, False, read=read, send=send,
-                  clock=lambda: datetime(2026, 11, 5, 10, 0, tzinfo=ET), sleep=lambda s: None)
+                  clock=lambda: datetime(2026, 11, 5, 10, 0, tzinfo=ET), sleep=lambda s: None,
+                  dollars=dollars)
         return sent
 
     sent = run([138.9, 138.2, 137.79, 137.78, 137.0], "entry")
@@ -146,6 +156,9 @@ def self_test() -> int:
     sent = run([139.5, 140.0, 139.2, 139.12, 138.0], "high")
     ok(len(sent) == 1 and "now $139.12" in sent[0] and "the high $140.00" in sent[0],
        f"trailing: 0.625% off the $140 high rings at $139.12: {sent}")
+    sent = run([139.0, 140.0, 139.60, 139.50, 139.0], "high", dollars=0.50)
+    ok(len(sent) == 1 and "DOWN $0.50: now $139.50" in sent[0] and "the high $140.00" in sent[0],
+       f"50 cents off the $140 high rings at $139.50, not $139.60: {sent}")
     sent = run([137.5, 137.4], "entry", fail_first=True)
     ok(len(sent) == 2, f"a failed send is retried on the next read: {sent}")
 
@@ -172,6 +185,7 @@ def main() -> int:
     parser.add_argument("--symbol", default="SPCX")
     parser.add_argument("--entry", type=float, help="your entry price")
     parser.add_argument("--pct", type=float, default=0.625, help="percent drop that rings (0.625)")
+    parser.add_argument("--dollars", type=float, help="ring this many dollars under, instead of --pct")
     parser.add_argument("--from", dest="mode", choices=("entry", "high"), default="entry")
     parser.add_argument("--every", type=float, default=5.0, help="seconds between reads (5)")
     parser.add_argument("--dry-run", action="store_true")
@@ -182,7 +196,8 @@ def main() -> int:
     if not args.entry:
         parser.error("--entry is required, e.g. --entry 138.65")
     load_env()
-    return watch(args.symbol.upper(), args.entry, args.pct, args.mode, args.every, args.dry_run)
+    return watch(args.symbol.upper(), args.entry, args.pct, args.mode, args.every, args.dry_run,
+                 dollars=args.dollars)
 
 
 if __name__ == "__main__":
