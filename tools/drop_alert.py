@@ -4,7 +4,9 @@ drop_alert.py -- one alarm when a position's stock falls a set percent (5 Nov 20
 Jason: "I just got in and I want to know when the stock price goes down
 .625%". Every few seconds it reads the latest trade from Alpaca (the full
 market; Blue Ocean overnight) and, the first time the price is at or under
-the line, sends ONE Pushover alarm that repeats until you tap Acknowledge.
+the line, sends ONE Pushover alarm at HIGH priority (5 Nov: "send the alarm
+as high priority"): it sounds once, through quiet hours and Focus.
+--repeat makes it an emergency that repeats until you tap Acknowledge.
 Then it stops.
 
   --from entry   the line is fixed: entry x (1 - pct)            (default)
@@ -15,7 +17,7 @@ line is your call.
 
     python drop_alert.py --entry 138.65                 # SPCX, 0.625% under the entry
     python drop_alert.py --entry 138.65 --from high     # 0.625% under the high since now
-    python drop_alert.py --entry 133.64 --from high --dollars 0.50   # 50 cents under the high
+    python drop_alert.py --entry 133.64 --from high --dollars 0.51   # 51 cents under the high
     python drop_alert.py --symbol TSLA --entry 250 --pct 1
     python drop_alert.py --entry 138.65 --dry-run       # print, do not send
     python drop_alert.py --self-test
@@ -70,13 +72,15 @@ def latest_price(symbol: str, now: datetime) -> float:
 
 def watch(symbol: str, entry: float, pct: float, mode: str, every: float,
           dry_run: bool, read=latest_price, send=None, clock=None, sleep=time.sleep,
-          dollars: Optional[float] = None) -> int:
+          dollars: Optional[float] = None, repeat: bool = False) -> int:
     clock = clock or (lambda: datetime.now(ET))
     if send is None:
-        from spcx_alert import PRIORITY_EMERGENCY, send_pushover
+        from spcx_alert import PRIORITY_EMERGENCY, PRIORITY_SUMMARY, send_pushover
 
+        # PRIORITY_SUMMARY is Pushover's high priority (1): loud, once.
         def send(text):
-            return send_pushover(text, title=f"{symbol} drop alarm", priority=PRIORITY_EMERGENCY)
+            return send_pushover(text, title=f"{symbol} drop alarm",
+                                 priority=PRIORITY_EMERGENCY if repeat else PRIORITY_SUMMARY)
     high = entry
     size = f"${dollars:.2f}" if dollars else f"{pct:g}%"
     print(f"Watching {symbol}: alarm {size} under "
@@ -93,9 +97,9 @@ def watch(symbol: str, entry: float, pct: float, mode: str, every: float,
             continue
         high = max(high, price)
         line = alarm_line(entry, high, pct, mode, dollars)
-        row = f"  {now:%H:%M:%S}  {symbol} ${price:,.2f}   alarm at ${line:,.2f}"
-        if row != shown:
-            print(row)
+        row = f"{symbol} ${price:,.2f}   alarm at ${line:,.2f}"
+        if row != shown:              # a line when the price or the alarm moves
+            print(f"  {now:%H:%M:%S}  {row}")
             shown = row
         if price <= line:
             text = message(symbol, price, entry, high, pct, mode, line, dollars)
@@ -134,7 +138,10 @@ def self_test() -> int:
         state = {"fail": fail_first}
 
         def read(symbol, now):
-            return next(it)
+            try:
+                return next(it)
+            except StopIteration:        # out of prices: it never rang
+                raise KeyboardInterrupt from None
 
         def send(text):
             sent.append(text)
@@ -145,9 +152,12 @@ def self_test() -> int:
         import contextlib
         import io
         with contextlib.redirect_stdout(io.StringIO()):
-            watch("SPCX", 138.65, 0.625, mode, 0, False, read=read, send=send,
-                  clock=lambda: datetime(2026, 11, 5, 10, 0, tzinfo=ET), sleep=lambda s: None,
-                  dollars=dollars)
+            try:
+                watch("SPCX", 138.65, 0.625, mode, 0, False, read=read, send=send,
+                      clock=lambda: datetime(2026, 11, 5, 10, 0, tzinfo=ET), sleep=lambda s: None,
+                      dollars=dollars)
+            except KeyboardInterrupt:
+                pass
         return sent
 
     sent = run([138.9, 138.2, 137.79, 137.78, 137.0], "entry")
@@ -159,6 +169,13 @@ def self_test() -> int:
     sent = run([139.0, 140.0, 139.60, 139.50, 139.0], "high", dollars=0.50)
     ok(len(sent) == 1 and "DOWN $0.50: now $139.50" in sent[0] and "the high $140.00" in sent[0],
        f"50 cents off the $140 high rings at $139.50, not $139.60: {sent}")
+    sent = run([138.65, 139.20, 138.70, 138.69, 138.0], "high", dollars=0.51)
+    ok(len(sent) == 1 and "DOWN $0.51: now $138.69" in sent[0] and "the high $139.20" in sent[0],
+       f"51 cents off the $139.20 high rings at $138.69, not $138.70: {sent}")
+    import inspect
+    src = inspect.getsource(watch)
+    ok("PRIORITY_EMERGENCY if repeat else PRIORITY_SUMMARY" in src and "repeat: bool = False" in src,
+       "high priority by default; --repeat for an emergency")
     sent = run([137.5, 137.4], "entry", fail_first=True)
     ok(len(sent) == 2, f"a failed send is retried on the next read: {sent}")
 
@@ -188,6 +205,8 @@ def main() -> int:
     parser.add_argument("--dollars", type=float, help="ring this many dollars under, instead of --pct")
     parser.add_argument("--from", dest="mode", choices=("entry", "high"), default="entry")
     parser.add_argument("--every", type=float, default=5.0, help="seconds between reads (5)")
+    parser.add_argument("--repeat", action="store_true",
+                        help="emergency: repeat until acknowledged (default: high priority, once)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -197,7 +216,7 @@ def main() -> int:
         parser.error("--entry is required, e.g. --entry 138.65")
     load_env()
     return watch(args.symbol.upper(), args.entry, args.pct, args.mode, args.every, args.dry_run,
-                 dollars=args.dollars)
+                 dollars=args.dollars, repeat=args.repeat)
 
 
 if __name__ == "__main__":
