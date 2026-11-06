@@ -4,10 +4,13 @@ drop_alarm_web.py -- the drop alarm, started from the phone (5 Nov 2026).
 Jason: "I would like it to be able to be run from my cell phone". A small
 web page served by the PC, reached over Tailscale like Scanner Studio:
 
-  Start   watches the symbol from its live price at that moment; the alarm
-          line trails `trail` dollars under the highest price since then
-          (drop_alert.py's math, unchanged). The first time the price is at
-          or under the line, ONE high-priority Pushover alarm, then it stops.
+  Start   watches the symbol from its live price at that moment, or from
+          "Your price" if typed and higher (6 Nov: a buy the PC never saw);
+          the alarm line trails `trail` dollars under the highest price
+          since then (drop_alert.py's math). At the line: ONE high-priority
+          Pushover alarm -- and it keeps watching (6 Nov: "it should keep
+          going"). The high at the alarm is the marker ("zero"); no further
+          alarm however far it falls, until a new high re-arms it.
   Stop    ends the watch (you sold first).
   Status  price, high, line and the distance to it, every 2 seconds.
 
@@ -86,7 +89,8 @@ class Watch:
         self.thread: Optional[threading.Thread] = None
         self.state = {"running": False, "symbol": None, "trail": None, "start": None,
                       "high": None, "line": None, "price": None, "updated": None,
-                      "alarm": None, "error": None, "started": None}
+                      "alarm": None, "error": None, "started": None,
+                      "your_price": None, "armed": False, "alarms": 0}
 
     @staticmethod
     def _pushover(symbol: str, text: str) -> Optional[str]:
@@ -97,20 +101,25 @@ class Watch:
         with self.lock:
             return dict(self.state)
 
-    def start(self, symbol: str, trail: float) -> dict:
-        """Read the live price now and begin trailing from it."""
+    def start(self, symbol: str, trail: float, your_price: Optional[float] = None) -> dict:
+        """Read the live price now and begin trailing from it, or from
+        `your_price` when that is higher."""
         self.stop()
         symbol = symbol.strip().upper()
         if not symbol.replace(".", "").isalnum() or not 0.01 <= trail <= 50:
             raise ValueError("a symbol like SPCX and a trail between $0.01 and $50")
+        if your_price is not None and not 0.01 <= your_price <= 100000:
+            raise ValueError("your price must be a price, like 138.50")
         now = self.clock()
         price = self.read(symbol, now)          # raises if the price cannot be read
+        high = max(price, your_price or 0)
         with self.lock:
-            self.state.update(running=True, symbol=symbol, trail=trail, start=price, high=price,
-                              line=drop_alert.alarm_line(price, price, 0, "high", trail),
-                              price=price, updated=f"{now:%H:%M:%S}", alarm=None, error=None,
-                              started=f"{now:%H:%M:%S}")
-        log(f"start {symbol} at ${price:,.2f}, trail ${trail:.2f}")
+            self.state.update(running=True, symbol=symbol, trail=trail, start=your_price or price,
+                              high=high, line=round(high - trail, 2), price=price,
+                              updated=f"{now:%H:%M:%S}", alarm=None, error=None,
+                              started=f"{now:%H:%M:%S}", your_price=your_price, armed=True, alarms=0)
+        log(f"start {symbol} at ${price:,.2f}"
+            + (f", your price ${your_price:,.2f}" if your_price else "") + f", trail ${trail:.2f}")
         self.stop_event = threading.Event()
         self.wait = self.custom_wait or self.stop_event.wait
         return self.snapshot()
@@ -127,11 +136,16 @@ class Watch:
             with self.lock:
                 self.state["error"] = f"{now:%H:%M:%S} could not read the price ({type(exc).__name__})"
             return True
-        high = max(s["high"], price)
-        line = drop_alert.alarm_line(s["start"], high, 0, "high", s["trail"])
+        armed = s["armed"]
+        if price > s["high"]:                   # a new high: the line follows, and re-arms
+            high, armed = price, True
+        else:
+            high = s["high"]                    # the marker ("zero") holds
+        line = round(high - s["trail"], 2)
         with self.lock:
-            self.state.update(price=price, high=high, line=line, updated=f"{now:%H:%M:%S}", error=None)
-        if price > line:
+            self.state.update(price=price, high=high, line=line, armed=armed,
+                              updated=f"{now:%H:%M:%S}", error=None)
+        if not armed or price > line:
             return True
         text = drop_alert.message(s["symbol"], price, s["start"], high, 0, "high", line, s["trail"])
         error = self.send(s["symbol"], text)
@@ -140,18 +154,19 @@ class Watch:
                 self.state["error"] = f"alarm not sent yet ({error}); retrying"
             log(f"NOT SENT ({error}): {text}")
             return True
-        with self.lock:
-            self.state.update(running=False, alarm=f"{now:%H:%M:%S}  {text}")
+        with self.lock:                         # keep watching; quiet until a new high
+            self.state.update(armed=False, alarms=s["alarms"] + 1, alarm=f"{now:%H:%M:%S}  {text}")
         log(f"ALARM SENT: {text}")
-        return False
+        return True
 
     def run(self, every: float = EVERY) -> None:
         while self.step():
             if self.wait(every):            # Stop pressed
                 break
 
-    def start_thread(self, symbol: str, trail: float, every: float = EVERY) -> dict:
-        snap = self.start(symbol, trail)
+    def start_thread(self, symbol: str, trail: float, your_price: Optional[float] = None,
+                     every: float = EVERY) -> dict:
+        snap = self.start(symbol, trail, your_price)
         self.thread = threading.Thread(target=self.run, args=(every,), daemon=True)
         self.thread.start()
         return snap
@@ -187,7 +202,8 @@ button{width:100%;font-size:20px;font-weight:600;padding:14px;border:0;border-ra
 <div class="card">
 <label for="sym">Symbol</label><input id="sym" value="SPCX" autocapitalize="characters">
 <label for="trail">Trail ($ under the highest price)</label><input id="trail" value="0.35" inputmode="decimal">
-<button id="go">Start from the live price</button><button id="halt">Stop</button>
+<label for="mine">Your price (optional: start from it if higher than the live price)</label><input id="mine" placeholder="e.g. 138.50" inputmode="decimal">
+<button id="go">Start</button><button id="halt">Stop</button>
 <div id="msg"></div></div>
 <div class="card" id="status">
 <div class="row"><span>Status</span><b id="s_state">-</b></div>
@@ -195,6 +211,9 @@ button{width:100%;font-size:20px;font-weight:600;padding:14px;border:0;border-ra
 <div class="row"><span>Highest since start</span><b id="s_high">-</b></div>
 <div class="row"><span>Alarm line</span><b id="s_line">-</b></div>
 <div class="row"><span>Room before the alarm</span><b id="s_room">-</b></div>
+<div class="row"><span>vs the high ("zero")</span><b id="s_vshigh">-</b></div>
+<div class="row"><span>vs your price</span><b id="s_vsmine">-</b></div>
+<div class="row"><span>Alarms sent</span><b id="s_alarms">-</b></div>
 <div class="row"><span>Started at</span><b id="s_start">-</b></div>
 <div class="row"><span>Updated</span><b id="s_upd">-</b></div>
 </div>
@@ -206,15 +225,21 @@ const usd=v=>v==null?"-":"$"+Number(v).toFixed(2);
 async function call(path,body){const r=await fetch(path+"?t="+encodeURIComponent(t),
  body?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{});
  const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j}
-function show(s){$("s_state").textContent=s.running?("Watching "+s.symbol+", trail "+usd(s.trail)):
- (s.alarm?"Alarm sent":"Not watching");$("s_state").className=s.alarm&&!s.running?"alarm":"";
+const sgn=v=>v==null?"-":(v>=0?"+":"-")+"$"+Math.abs(v).toFixed(2);
+function show(s){const quiet=s.running&&!s.armed;
+ $("s_state").textContent=!s.running?"Not watching":(quiet?"Alarm sent - still watching (rings again after a new high)":
+  "Watching "+s.symbol+", trail "+usd(s.trail));$("s_state").className=quiet?"alarm":"";
  $("s_price").textContent=usd(s.price);$("s_high").textContent=usd(s.high);$("s_line").textContent=usd(s.line);
- $("s_room").textContent=s.price!=null&&s.line!=null?usd(s.price-s.line):"-";
+ $("s_room").textContent=s.price!=null&&s.line!=null&&s.armed?usd(s.price-s.line):(quiet?"waiting for a new high":"-");
+ $("s_vshigh").textContent=s.price!=null&&s.high!=null?sgn(s.price-s.high):"-";
+ $("s_vsmine").textContent=s.your_price!=null&&s.price!=null?sgn(s.price-s.your_price):"-";
+ $("s_alarms").textContent=s.running||s.alarms?String(s.alarms):"-";
  $("s_start").textContent=s.start!=null?usd(s.start)+" at "+s.started:"-";$("s_upd").textContent=s.updated||"-";
- $("msg").textContent=s.alarm&&!s.running?s.alarm:(s.error||"");$("msg").className=s.alarm&&!s.running?"alarm":""}
+ $("msg").textContent=s.error||(s.alarm?"Last alarm: "+s.alarm:"");$("msg").className=s.alarm&&!s.error?"alarm":""}
 async function poll(){try{show(await call("/api/state"))}catch(e){$("msg").textContent="Cannot reach the PC: "+e.message}}
-$("go").onclick=async()=>{$("msg").textContent="Starting...";try{show(await call("/api/start",
- {symbol:$("sym").value,trail:parseFloat($("trail").value)}))}catch(e){$("msg").textContent="Not started: "+e.message}};
+$("go").onclick=async()=>{$("msg").textContent="Starting...";const mine=$("mine").value.trim();
+ try{show(await call("/api/start",{symbol:$("sym").value,trail:parseFloat($("trail").value),
+ price:mine?parseFloat(mine):null}))}catch(e){$("msg").textContent="Not started: "+e.message}};
 $("halt").onclick=async()=>{try{show(await call("/api/stop",{}))}catch(e){$("msg").textContent=e.message}};
 poll();setInterval(poll,2000);
 </script></body></html>"""
@@ -265,7 +290,10 @@ def make_handler(watch: Watch, code: str):
             if path == "/api/start":
                 try:
                     trail = float(body.get("trail", DEFAULT_TRAIL))
-                    return self._json(200, watch.start_thread(str(body.get("symbol") or DEFAULT_SYMBOL), trail))
+                    mine = body.get("price")
+                    mine = float(mine) if mine not in (None, "") else None
+                    return self._json(200, watch.start_thread(str(body.get("symbol") or DEFAULT_SYMBOL),
+                                                              trail, mine))
                 except ValueError as exc:
                     return self._json(400, {"error": str(exc)})
                 except Exception as exc:  # noqa: BLE001 -- the price could not be read
@@ -319,10 +347,35 @@ def self_test() -> int:
         prices[:] = [138.60, 139.00, 138.70, 138.66, 138.65]
         steps = [w.step() for _ in range(5)]
         s = w.snapshot()
-        ok(steps == [True, True, True, True, False] and len(sent) == 1
+        ok(steps == [True] * 5 and len(sent) == 1
            and "DOWN $0.35: now $138.65" in sent[0] and "the high $139.00" in sent[0]
-           and not s["running"] and s["alarm"], f"35 cents off the $139 high rings once, then stops: {steps} {sent}")
-        ok(w.step() is False and len(sent) == 1, "nothing more after the alarm")
+           and s["running"] and not s["armed"] and s["alarms"] == 1 and s["alarm"],
+           f"35 cents off the $139 high rings once and keeps watching: {steps} {sent} {s}")
+        # Jason's walk: further down, a bounce under the marker, then a new high and a new drop.
+        prices[:] = [138.20, 138.90, 139.00]
+        [w.step() for _ in range(3)]
+        s = w.snapshot()
+        ok(len(sent) == 1 and s["high"] == 139.00 and not s["armed"],
+           f"no more alarms below the marker, nor at it: {sent} {s}")
+        prices[:] = [139.40, 139.06, 139.05, 138.00]
+        [w.step() for _ in range(4)]
+        s = w.snapshot()
+        ok(len(sent) == 2 and "now $139.05" in sent[1] and "the high $139.40" in sent[1]
+           and s["alarms"] == 2 and s["running"], f"a new high re-arms; the next 35 cents rings once: {sent} {s}")
+        ok(w.stop()["running"] is False and w.step() is False, "Stop ends it")
+
+        prices[:] = [138.20]
+        s = Watch(read=read, send=lambda *a: None, clock=fixed).start("SPCX", 0.35, 138.50)
+        ok(s["start"] == 138.50 and s["high"] == 138.50 and s["line"] == 138.15 and s["your_price"] == 138.50,
+           f"your price above the live price sets the line at once: {s}")
+        prices[:] = [139.00]
+        s = Watch(read=read, send=lambda *a: None, clock=fixed).start("SPCX", 0.35, 138.50)
+        ok(s["high"] == 139.00 and s["line"] == 138.65, f"the live price above yours: trail from it: {s}")
+        try:
+            Watch(read=read, clock=fixed).start("SPCX", 0.35, -5.0)
+            failures.append("a negative price must be refused")
+        except ValueError:
+            pass
 
         failed = {"n": 1}
 
@@ -337,7 +390,7 @@ def self_test() -> int:
         w2.start("SPCX", 0.35)
         prices[:] = [99.60, 99.60]
         ok(w2.step() is True and "retrying" in (w2.snapshot()["error"] or "")
-           and w2.step() is False and w2.snapshot()["alarm"], "a failed send is retried")
+           and w2.step() is True and w2.snapshot()["alarms"] == 1, "a failed send is retried")
 
         def broken(symbol, now):
             raise OSError("no net")
@@ -387,15 +440,19 @@ def self_test() -> int:
         ok(st == 200 and s["running"] and s["start"] == 138.20, f"started from the phone: {st} {s}")
         st, s = post("/api/start?t=secret-code", {"symbol": "SPCX", "trail": -1})
         ok(st == 400, f"a bad trail is refused: {st}")
+        st, s = post("/api/start?t=secret-code", {"symbol": "SPCX", "trail": 0.35, "price": "abc"})
+        ok(st == 400, f"a bad price is refused: {st}")
         web.custom_wait = lambda seconds: web.stop_event.wait(0.01)
         st, s = post("/api/start?t=secret-code", {"symbol": "SPCX", "trail": 0.35})
         for _ in range(300):
             s = json.loads(get("/api/state?t=secret-code")[1])
-            if not s["running"]:
+            if s["alarms"]:
                 break
             time.sleep(0.01)
-        ok(not s["running"] and s["alarm"] and "now $138.10" in s["alarm"] and "the high $138.50" in s["alarm"],
-           f"the alarm reaches the page: {s}")
+        ok(s["running"] and s["alarms"] == 1 and "now $138.10" in s["alarm"] and "the high $138.50" in s["alarm"],
+           f"the alarm reaches the page, still watching: {s}")
+        time.sleep(0.1)
+        ok(json.loads(get("/api/state?t=secret-code")[1])["alarms"] == 1, "no repeat while below the marker")
         st, s = post("/api/stop?t=secret-code", {})
         ok(st == 200 and not s["running"], "stop answers")
         server.shutdown()
