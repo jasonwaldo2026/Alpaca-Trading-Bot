@@ -1,0 +1,76 @@
+{
+  "_comment": [
+    "Notable SpaceX launches only. Routine Starlink and rideshare missions",
+    "are excluded on purpose: SpaceX flew 42 times in the 104 days after",
+    "SPCX listed, and a calendar that lists all of them buries the share",
+    "unlocks. What qualifies: Starship flights, crewed missions, Falcon",
+    "Heavy, first-of-type.",
+    "",
+    "status is the source's own word and is never upgraded here.",
+    "  Go  = confirmed for that date",
+    "  TBC = date expected, not confirmed",
+    "  TBD = no date; stored with date null so it is never drawn as one.",
+    "",
+    "The schedule prints placeholders like 2026-12-31T00:00:00Z to mean",
+    "'sometime in 2026'. Those are recorded as null, not as 31 December.",
+    "",
+    "time_et is Eastern, to match the trading day. Launch times slip more",
+    "than almost any scheduled time in industry.",
+    "",
+    "Nothing in this file claims a launch moves the price."
+  ],
+  "SPCX": {
+    "company": "SpaceX",
+    "source": "Launch Library 2 (ll.thespacedevs.com), read 24 Sep 2026. spacex.com/launches renders in JavaScript and cannot be read directly.",
+    "events": [
+      {
+        "date": "2026-07-24",
+        "time_et": "18:51",
+        "mission": "Starship Flight 13",
+        "vehicle": "Starship",
+        "status": "Go",
+        "note": "Flown. The only Starship flight in SPCX's trading history."
+      },
+      {
+        "date": "2026-09-28",
+        "time_et": "08:15",
+        "mission": "Starship Flight 14",
+        "vehicle": "Starship",
+        "status": "TBC",
+        "note": "Carries Starlink Group 31-1."
+      },
+      {
+        "date": "2026-10-01",
+        "time_et": "11:10",
+        "mission": "Crew-13",
+        "vehicle": "Falcon 9",
+        "status": "Go",
+        "note": "Crewed."
+      },
+      {
+        "date": null,
+        "time_et": null,
+        "mission": "NROL-97",
+        "vehicle": "Falcon Heavy",
+        "status": "TBD",
+        "note": "Schedule says October 2026, no date."
+      },
+      {
+        "date": null,
+        "time_et": null,
+        "mission": "Griffin Mission One",
+        "vehicle": "Falcon Heavy",
+        "status": "TBD",
+        "note": "Schedule says November 2026, no date."
+      },
+      {
+        "date": null,
+        "time_et": null,
+        "mission": "Starship Flight 15",
+        "vehicle": "Starship",
+        "status": "TBD",
+        "note": "Schedule says 2026, no date."
+      }
+    ]
+  }
+}
